@@ -34,6 +34,62 @@ func TestLoadEmptyFileAndEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadIgnoresUnsupportedEnvironmentOverrides(t *testing.T) {
+	t.Setenv("CSP_ARTIFACTS_TYPE", "s3")
+	t.Setenv("CSP_STREAMING_DRAIN_DEADLINE", "not-a-duration")
+	t.Setenv("CSP_RETENTION_METADATA_DAYS", "not-an-integer")
+	t.Setenv("CSP_PRICING_SUBSCRIPTION_MONTHLY_USD", "not-a-number")
+
+	if _, err := Load(""); err != nil {
+		t.Fatalf("load with unsupported environment values: %v", err)
+	}
+}
+
+func TestCredentialFileAvailableRequiresReadableNonEmptyRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.enc")
+	if CredentialFileAvailable(missing) {
+		t.Fatal("missing credential reported as available")
+	}
+
+	empty := filepath.Join(dir, "empty.enc")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if CredentialFileAvailable(empty) {
+		t.Fatal("empty credential reported as available")
+	}
+
+	invalid := filepath.Join(dir, "credential-dir")
+	if err := os.Mkdir(invalid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if CredentialFileAvailable(invalid) {
+		t.Fatal("non-regular credential reported as available")
+	}
+
+	unreadable := filepath.Join(dir, "unreadable.enc")
+	if err := os.WriteFile(unreadable, []byte("encrypted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadable, 0); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		t.Log("running as root; permission bits do not make the file unreadable")
+	} else if CredentialFileAvailable(unreadable) {
+		t.Fatal("unreadable credential reported as available")
+	}
+
+	valid := filepath.Join(dir, "valid.enc")
+	if err := os.WriteFile(valid, []byte("encrypted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !CredentialFileAvailable(valid) {
+		t.Fatal("readable credential reported as unavailable")
+	}
+}
+
 func TestKeysAvailableRequiresEveryConfiguredKey(t *testing.T) {
 	keys := SecurityConfig{
 		PayloadEncryptionKeyEnv:    "PAYLOAD_KEY",
@@ -50,18 +106,5 @@ func TestKeysAvailableRequiresEveryConfiguredKey(t *testing.T) {
 	}
 	if keys.KeysAvailable(lookup) {
 		t.Fatal("incomplete keys reported as available")
-	}
-}
-
-func TestCredentialFileAvailableRequiresNonEmptyRegularFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "credential.enc")
-	if CredentialFileAvailable(path) {
-		t.Fatal("missing credential reported as available")
-	}
-	if err := os.WriteFile(path, []byte("encrypted"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if !CredentialFileAvailable(path) {
-		t.Fatal("credential file reported as unavailable")
 	}
 }

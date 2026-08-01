@@ -7,6 +7,12 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
+)
+
+const (
+	readHeaderTimeout = 5 * time.Second
+	idleTimeout       = 60 * time.Second
 )
 
 type Config struct {
@@ -42,11 +48,19 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 	}
 
 	servers := &Servers{
-		dataServer:  &http.Server{Handler: NewHealthHandler(readiness)},
-		adminServer: &http.Server{Handler: NewHealthHandler(readiness)},
-		dataAddr:    dataListener.Addr().String(),
-		adminAddr:   adminListener.Addr().String(),
-		errors:      make(chan error, 2),
+		dataServer: &http.Server{
+			Handler:           NewHealthHandler(readiness),
+			ReadHeaderTimeout: readHeaderTimeout,
+			IdleTimeout:       idleTimeout,
+		},
+		adminServer: &http.Server{
+			Handler:           NewHealthHandler(readiness),
+			ReadHeaderTimeout: readHeaderTimeout,
+			IdleTimeout:       idleTimeout,
+		},
+		dataAddr:  dataListener.Addr().String(),
+		adminAddr: adminListener.Addr().String(),
+		errors:    make(chan error, 2),
 	}
 	servers.waitGroup.Add(2)
 	go servers.serve(servers.dataServer, dataListener)

@@ -34,6 +34,35 @@ func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 	checkReadiness(t, client, "http://"+servers.AdminAddr()+"/readyz", http.StatusOK, "ready")
 }
 
+func TestStartBoundsHeaderAndIdleConnections(t *testing.T) {
+	servers, err := Start(Config{
+		Listen:      "127.0.0.1:0",
+		AdminListen: "127.0.0.1:0",
+	}, NewReadiness())
+	if err != nil {
+		t.Fatalf("start servers: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := servers.Shutdown(ctx); err != nil {
+			t.Fatalf("shutdown servers: %v", err)
+		}
+	}()
+
+	for name, server := range map[string]*http.Server{
+		"data":  servers.dataServer,
+		"admin": servers.adminServer,
+	} {
+		if server.ReadHeaderTimeout != readHeaderTimeout {
+			t.Errorf("%s ReadHeaderTimeout = %s, want %s", name, server.ReadHeaderTimeout, readHeaderTimeout)
+		}
+		if server.IdleTimeout != idleTimeout {
+			t.Errorf("%s IdleTimeout = %s, want %s", name, server.IdleTimeout, idleTimeout)
+		}
+	}
+}
+
 func checkHealth(t *testing.T, client *http.Client, url string) {
 	t.Helper()
 	response, err := client.Get(url)
