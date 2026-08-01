@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -87,6 +88,27 @@ func TestCredentialFileAvailableRequiresReadableNonEmptyRegularFile(t *testing.T
 	}
 	if !CredentialFileAvailable(valid) {
 		t.Fatal("readable credential reported as unavailable")
+	}
+}
+
+func TestCredentialFileAvailableRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("create credential FIFO: %v", err)
+	}
+
+	available := make(chan bool, 1)
+	go func() {
+		available <- CredentialFileAvailable(path)
+	}()
+
+	select {
+	case got := <-available:
+		if got {
+			t.Fatal("FIFO credential reported as available")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FIFO credential check blocked")
 	}
 }
 

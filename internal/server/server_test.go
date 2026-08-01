@@ -57,6 +57,9 @@ func TestStartBoundsHeaderAndIdleConnections(t *testing.T) {
 		if server.ReadHeaderTimeout != readHeaderTimeout {
 			t.Errorf("%s ReadHeaderTimeout = %s, want %s", name, server.ReadHeaderTimeout, readHeaderTimeout)
 		}
+		if server.WriteTimeout != writeTimeout {
+			t.Errorf("%s WriteTimeout = %s, want %s", name, server.WriteTimeout, writeTimeout)
+		}
 		if server.IdleTimeout != idleTimeout {
 			t.Errorf("%s IdleTimeout = %s, want %s", name, server.IdleTimeout, idleTimeout)
 		}

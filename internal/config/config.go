@@ -133,12 +133,16 @@ func CredentialFileAvailable(path string) bool {
 	if err != nil || expanded == "" {
 		return false
 	}
+	info, err := os.Stat(expanded)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return false
+	}
 	file, err := os.Open(expanded)
 	if err != nil {
 		return false
 	}
 	defer file.Close()
-	info, err := file.Stat()
+	info, err = file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}

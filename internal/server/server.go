@@ -12,6 +12,7 @@ import (
 
 const (
 	readHeaderTimeout = 5 * time.Second
+	writeTimeout      = 10 * time.Second
 	idleTimeout       = 60 * time.Second
 )
 
@@ -51,11 +52,13 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 		dataServer: &http.Server{
 			Handler:           NewHealthHandler(readiness),
 			ReadHeaderTimeout: readHeaderTimeout,
+			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
 		},
 		adminServer: &http.Server{
 			Handler:           NewHealthHandler(readiness),
 			ReadHeaderTimeout: readHeaderTimeout,
+			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
 		},
 		dataAddr:  dataListener.Addr().String(),
