@@ -2,8 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
+
+	"github.com/kataras/iris/v12"
 )
 
 type Readiness struct {
@@ -45,22 +48,22 @@ func (s ReadinessSnapshot) Ready() bool {
 	return s.Storage && s.Keys && s.UpstreamAuth
 }
 
-func NewHealthHandler(readiness *Readiness) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func newHealthApplication(readiness *Readiness) (*iris.Application, error) {
+	app := iris.New()
+	app.Any("/healthz", func(ctx iris.Context) {
+		if ctx.Method() != http.MethodGet {
+			ctx.Header("Allow", http.MethodGet)
+			http.Error(ctx.ResponseWriter(), "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, http.StatusOK, struct {
+		writeJSON(ctx, http.StatusOK, struct {
 			Status string `json:"status"`
 		}{Status: "live"})
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	app.Any("/readyz", func(ctx iris.Context) {
+		if ctx.Method() != http.MethodGet {
+			ctx.Header("Allow", http.MethodGet)
+			http.Error(ctx.ResponseWriter(), "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		snapshot := ReadinessSnapshot{}
@@ -73,16 +76,19 @@ func NewHealthHandler(readiness *Readiness) http.Handler {
 			status = http.StatusOK
 			name = "ready"
 		}
-		writeJSON(w, status, struct {
+		writeJSON(ctx, status, struct {
 			Status string            `json:"status"`
 			Checks ReadinessSnapshot `json:"checks"`
 		}{Status: name, Checks: snapshot})
 	})
-	return mux
+	if err := app.Build(); err != nil {
+		return nil, fmt.Errorf("build health application: %w", err)
+	}
+	return app, nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+func writeJSON(ctx iris.Context, status int, value any) {
+	ctx.Header("Content-Type", "application/json")
+	ctx.StatusCode(status)
+	_ = json.NewEncoder(ctx.ResponseWriter()).Encode(value)
 }

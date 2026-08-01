@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +13,7 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/server"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -39,7 +39,7 @@ func run(args []string) error {
 	}
 
 	readiness := server.NewReadiness()
-	var db *sql.DB
+	var db *gorm.DB
 	storageReady := false
 	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
 	if err != nil {
@@ -53,7 +53,13 @@ func run(args []string) error {
 		}
 	}
 	if db != nil {
-		defer db.Close()
+		sqlDB, dbErr := db.DB()
+		if dbErr != nil {
+			return fmt.Errorf("get sqlite database: %w", dbErr)
+		}
+		defer func() {
+			_ = sqlDB.Close()
+		}()
 	}
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)

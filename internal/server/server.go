@@ -38,6 +38,15 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
 
+	dataHandler, err := newHealthApplication(readiness)
+	if err != nil {
+		return nil, fmt.Errorf("build data health application: %w", err)
+	}
+	adminHandler, err := newHealthApplication(readiness)
+	if err != nil {
+		return nil, fmt.Errorf("build admin health application: %w", err)
+	}
+
 	dataListener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("listen for data plane on %q: %w", cfg.Listen, err)
@@ -50,13 +59,13 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 
 	servers := &Servers{
 		dataServer: &http.Server{
-			Handler:           NewHealthHandler(readiness),
+			Handler:           dataHandler,
 			ReadHeaderTimeout: readHeaderTimeout,
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
 		},
 		adminServer: &http.Server{
-			Handler:           NewHealthHandler(readiness),
+			Handler:           adminHandler,
 			ReadHeaderTimeout: readHeaderTimeout,
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,

@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,10 +9,11 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-func Open(ctx context.Context, path string, busyTimeout time.Duration) (*sql.DB, error) {
+func Open(ctx context.Context, path string, busyTimeout time.Duration) (*gorm.DB, error) {
 	if path == "" {
 		return nil, fmt.Errorf("sqlite path is empty")
 	}
@@ -24,24 +24,28 @@ func Open(ctx context.Context, path string, busyTimeout time.Duration) (*sql.DB,
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("get sqlite database: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 
 	milliseconds := busyTimeout / time.Millisecond
 	if milliseconds < 1 {
 		milliseconds = 1
 	}
 	pragma := "PRAGMA busy_timeout = " + strconv.FormatInt(int64(milliseconds), 10)
-	if _, err := db.ExecContext(ctx, pragma); err != nil {
-		db.Close()
+	if _, err := sqlDB.ExecContext(ctx, pragma); err != nil {
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("set sqlite busy timeout: %w", err)
 	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("ping sqlite database: %w", err)
 	}
 	return db, nil
