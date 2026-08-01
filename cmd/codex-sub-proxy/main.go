@@ -8,9 +8,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/server"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
@@ -25,6 +27,14 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "import":
+			return runImport(args[1:])
+		case "login":
+			return runLogin(args[1:])
+		}
+	}
 	flags := flag.NewFlagSet("codex-sub-proxy", flag.ContinueOnError)
 	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
 	if err := flags.Parse(args); err != nil {
@@ -64,7 +74,12 @@ func run(args []string) error {
 	}
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
-	upstreamAuthReady := config.CredentialFileAvailable(cfg.Codex.CredentialFile)
+	upstreamAuthReady := false
+	if key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv); ok {
+		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
+			upstreamAuthReady = codex.CredentialAvailable(credentialPath, []byte(key))
+		}
+	}
 	readiness.Set(storageReady, keysReady, upstreamAuthReady)
 
 	servers, err := server.Start(server.Config{
@@ -83,6 +98,75 @@ func run(args []string) error {
 	case <-ctx.Done():
 		return shutdownServers(servers)
 	}
+}
+
+func runImport(args []string) error {
+	flags := flag.NewFlagSet("codex-sub-proxy import", flag.ContinueOnError)
+	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
+	sourcePath := flags.String("source", "", "path to Codex auth.json, Codex home, or OMP agent.db")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected command-line argument")
+	}
+	if *sourcePath == "" {
+		return fmt.Errorf("credential source path is required")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv)
+	if !ok || strings.TrimSpace(key) == "" {
+		return fmt.Errorf("credential encryption key is unavailable")
+	}
+	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
+	if err != nil {
+		return err
+	}
+	_, err = codex.ImportCredential(context.Background(), *sourcePath, destinationPath, []byte(key))
+	return err
+}
+
+func runLogin(args []string) error {
+	flags := flag.NewFlagSet("codex-sub-proxy login", flag.ContinueOnError)
+	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
+	issuer := flags.String("issuer", "", "OAuth issuer URL")
+	port := flags.Int("port", 0, "local OAuth callback port")
+	device := flags.Bool("device", false, "use device-code login")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected command-line argument")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv)
+	if !ok || strings.TrimSpace(key) == "" {
+		return fmt.Errorf("credential encryption key is unavailable")
+	}
+	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	_, err = codex.LoginAndSave(ctx, codex.LoginOptions{
+		Issuer:       *issuer,
+		CallbackPort: *port,
+		Device:       *device,
+		OnAuthorizationURL: func(url string) {
+			fmt.Fprintln(os.Stdout, url)
+		},
+		OnDeviceCode: func(url, code string) {
+			fmt.Fprintf(os.Stdout, "Open %s and enter code %s.\n", url, code)
+		},
+	}, destinationPath, []byte(key))
+	return err
 }
 
 func serverStoppedError(serveErr, shutdownErr error) error {
