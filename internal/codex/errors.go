@@ -147,10 +147,10 @@ func parseErrorDetail(body []byte) errorDetail {
 					detail.Status = strings.TrimSpace(nestedStatus)
 				}
 			}
-			if len(envelope.RetryAfter) == 0 {
+			if len(envelope.RetryAfter) == 0 || string(envelope.RetryAfter) == "null" {
 				envelope.RetryAfter = nested.RetryAfter
 			}
-			if len(envelope.ResetsAt) == 0 {
+			if len(envelope.ResetsAt) == 0 || string(envelope.ResetsAt) == "null" {
 				envelope.ResetsAt = nested.ResetsAt
 			}
 		}

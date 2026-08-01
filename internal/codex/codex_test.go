@@ -200,6 +200,25 @@ const (
 			"message": "This content was flagged for possible cybersecurity risk."
 		}
 	}`
+	wrappedWebSocketNullOuterRetryFixture = `{
+		"type": "error",
+		"status": 429,
+		"retry_after": null,
+		"resets_at": null,
+		"error": {
+			"type": "rate_limit_exceeded",
+			"retry_after": 17
+		}
+	}`
+	wrappedWebSocketOuterRetryFixture = `{
+		"type": "error",
+		"status": 429,
+		"retry_after": 5,
+		"error": {
+			"type": "rate_limit_exceeded",
+			"retry_after": 17
+		}
+	}`
 )
 
 func TestMapUpstreamErrorParsesWrappedWebSocketCategories(t *testing.T) {
@@ -224,6 +243,25 @@ func TestMapUpstreamErrorParsesWrappedWebSocketCategories(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), test.message) {
 				t.Fatal("private provider message reached safe error")
+			}
+		})
+	}
+}
+
+func TestMapUpstreamErrorMergesNestedRetryDataByOuterPrecedence(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want time.Duration
+	}{
+		{"nested retry after when outer is null", wrappedWebSocketNullOuterRetryFixture, 17 * time.Second},
+		{"outer retry after takes precedence", wrappedWebSocketOuterRetryFixture, 5 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := MapUpstreamError(http.StatusTooManyRequests, nil, []byte(test.body))
+			if err.RetryAfter != test.want {
+				t.Fatalf("retry after = %s, want %s", err.RetryAfter, test.want)
 			}
 		})
 	}
