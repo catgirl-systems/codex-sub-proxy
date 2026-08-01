@@ -3,8 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -75,6 +78,123 @@ func TestStartBoundsHeaderAndIdleConnections(t *testing.T) {
 			t.Errorf("%s IdleTimeout = %s, want %s", name, server.IdleTimeout, idleTimeout)
 		}
 	}
+}
+
+func TestShutdownStartsBothServersAndBoundsListenerWait(t *testing.T) {
+	dataListener := newShutdownTestListener()
+	adminListener := newShutdownTestListener()
+	servers := &Servers{
+		dataServer:    &http.Server{},
+		adminServer:   &http.Server{},
+		dataListener:  dataListener,
+		adminListener: adminListener,
+		errors:        make(chan error, 2),
+	}
+	servers.waitGroup.Add(2)
+	go servers.serve(servers.dataServer, dataListener)
+	go servers.serve(servers.adminServer, adminListener)
+	for name, listener := range map[string]*shutdownTestListener{
+		"data":  dataListener,
+		"admin": adminListener,
+	} {
+		select {
+		case <-listener.started:
+		case <-time.After(time.Second):
+			t.Fatalf("%s listener did not start", name)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	startedAt := time.Now()
+	go func() {
+		shutdownDone <- servers.Shutdown(ctx)
+	}()
+	for name, listener := range map[string]*shutdownTestListener{
+		"data":  dataListener,
+		"admin": adminListener,
+	} {
+		select {
+		case <-listener.firstClose:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("%s server shutdown did not start", name)
+		}
+	}
+
+	var shutdownErr error
+	select {
+	case shutdownErr = <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return")
+	}
+	if !errors.Is(shutdownErr, context.DeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want deadline exceeded", shutdownErr)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("shutdown took %s after deadline", elapsed)
+	}
+
+	serveDone := make(chan struct{})
+	go func() {
+		servers.waitGroup.Wait()
+		close(serveDone)
+	}()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("listener goroutines did not stop after force close")
+	}
+}
+
+type shutdownTestListener struct {
+	addr           net.Addr
+	started        chan struct{}
+	firstClose     chan struct{}
+	unblock        chan struct{}
+	startOnce      sync.Once
+	firstCloseOnce sync.Once
+	closeOnce      sync.Once
+	closeMu        sync.Mutex
+	closeCalls     int
+}
+
+func newShutdownTestListener() *shutdownTestListener {
+	return &shutdownTestListener{
+		addr:       &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		started:    make(chan struct{}),
+		firstClose: make(chan struct{}),
+		unblock:    make(chan struct{}),
+	}
+}
+
+func (l *shutdownTestListener) Accept() (net.Conn, error) {
+	l.startOnce.Do(func() {
+		close(l.started)
+	})
+	<-l.unblock
+	return nil, net.ErrClosed
+}
+
+func (l *shutdownTestListener) Close() error {
+	l.closeMu.Lock()
+	l.closeCalls++
+	call := l.closeCalls
+	l.closeMu.Unlock()
+	if call == 1 {
+		l.firstCloseOnce.Do(func() {
+			close(l.firstClose)
+		})
+		return nil
+	}
+	l.closeOnce.Do(func() {
+		close(l.unblock)
+	})
+	return nil
+}
+
+func (l *shutdownTestListener) Addr() net.Addr {
+	return l.addr
 }
 
 func TestHealthEndpointsRejectNonGet(t *testing.T) {

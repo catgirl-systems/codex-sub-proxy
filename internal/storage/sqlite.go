@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,8 +24,12 @@ func Open(ctx context.Context, path string, busyTimeout time.Duration) (*gorm.DB
 	if err := makeParentDirectory(path); err != nil {
 		return nil, err
 	}
+	dsn, err := sqliteDSN(path, busyTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("build sqlite DSN: %w", err)
+	}
 
-	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -49,6 +54,28 @@ func Open(ctx context.Context, path string, busyTimeout time.Duration) (*gorm.DB
 		return nil, fmt.Errorf("ping sqlite database: %w", err)
 	}
 	return db, nil
+}
+
+func sqliteDSN(path string, busyTimeout time.Duration) (string, error) {
+	milliseconds := busyTimeout / time.Millisecond
+	if milliseconds < 1 {
+		milliseconds = 1
+	}
+
+	busyTimeoutValue := strconv.FormatInt(int64(milliseconds), 10)
+	queryIndex := strings.IndexByte(path, '?')
+	if queryIndex < 0 {
+		return path + "?_busy_timeout=" + busyTimeoutValue, nil
+	}
+
+	query, err := url.ParseQuery(path[queryIndex+1:])
+	if err != nil {
+		return "", fmt.Errorf("parse query parameters: %w", err)
+	}
+	query.Del("_busy_timeout")
+	query.Del("_timeout")
+	query.Set("_busy_timeout", busyTimeoutValue)
+	return path[:queryIndex] + "?" + query.Encode(), nil
 }
 
 func makeParentDirectory(path string) error {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -78,11 +79,18 @@ func run(args []string) error {
 	defer stop()
 	select {
 	case err := <-servers.Errors():
-		shutdownServers(servers)
-		return fmt.Errorf("server stopped: %w", err)
+		return serverStoppedError(err, shutdownServers(servers))
 	case <-ctx.Done():
 		return shutdownServers(servers)
 	}
+}
+
+func serverStoppedError(serveErr, shutdownErr error) error {
+	serverErr := fmt.Errorf("server stopped: %w", serveErr)
+	if shutdownErr == nil {
+		return serverErr
+	}
+	return errors.Join(serverErr, fmt.Errorf("shutdown servers: %w", shutdownErr))
 }
 
 func shutdownServers(servers *server.Servers) error {

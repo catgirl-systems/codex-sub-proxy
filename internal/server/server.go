@@ -22,12 +22,14 @@ type Config struct {
 }
 
 type Servers struct {
-	dataServer  *http.Server
-	adminServer *http.Server
-	dataAddr    string
-	adminAddr   string
-	errors      chan error
-	waitGroup   sync.WaitGroup
+	dataServer    *http.Server
+	adminServer   *http.Server
+	dataListener  net.Listener
+	adminListener net.Listener
+	dataAddr      string
+	adminAddr     string
+	errors        chan error
+	waitGroup     sync.WaitGroup
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
@@ -70,9 +72,11 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
 		},
-		dataAddr:  dataListener.Addr().String(),
-		adminAddr: adminListener.Addr().String(),
-		errors:    make(chan error, 2),
+		dataListener:  dataListener,
+		adminListener: adminListener,
+		dataAddr:      dataListener.Addr().String(),
+		adminAddr:     adminListener.Addr().String(),
+		errors:        make(chan error, 2),
 	}
 	servers.waitGroup.Add(2)
 	go servers.serve(servers.dataServer, dataListener)
@@ -93,15 +97,53 @@ func (s *Servers) Errors() <-chan error {
 }
 
 func (s *Servers) Shutdown(ctx context.Context) error {
-	var first error
-	if err := s.dataServer.Shutdown(ctx); err != nil {
-		first = err
+	shutdownErrors := make(chan error, 2)
+	go func() {
+		shutdownErrors <- s.dataServer.Shutdown(ctx)
+	}()
+	go func() {
+		shutdownErrors <- s.adminServer.Shutdown(ctx)
+	}()
+
+	var errs []error
+	for range 2 {
+		select {
+		case err := <-shutdownErrors:
+			if err != nil {
+				errs = append(errs, err)
+			}
+		case <-ctx.Done():
+			s.forceClose()
+			return errors.Join(append(errs, ctx.Err())...)
+		}
 	}
-	if err := s.adminServer.Shutdown(ctx); err != nil && first == nil {
-		first = err
+	if len(errs) > 0 {
+		s.forceClose()
 	}
-	s.waitGroup.Wait()
-	return first
+
+	serveDone := make(chan struct{})
+	go func() {
+		s.waitGroup.Wait()
+		close(serveDone)
+	}()
+	select {
+	case <-serveDone:
+		return errors.Join(errs...)
+	case <-ctx.Done():
+		s.forceClose()
+		return errors.Join(append(errs, ctx.Err())...)
+	}
+}
+
+func (s *Servers) forceClose() {
+	if s.dataListener != nil {
+		_ = s.dataListener.Close()
+	}
+	if s.adminListener != nil {
+		_ = s.adminListener.Close()
+	}
+	_ = s.dataServer.Close()
+	_ = s.adminServer.Close()
 }
 
 func (s *Servers) serve(server *http.Server, listener net.Listener) {

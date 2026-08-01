@@ -1,6 +1,22 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+func TestServerStoppedErrorPreservesShutdownFailure(t *testing.T) {
+	serveErr := errors.New("serve failed")
+	shutdownErr := errors.New("shutdown failed")
+
+	err := serverStoppedError(serveErr, shutdownErr)
+	if !errors.Is(err, serveErr) {
+		t.Fatalf("server error = %v, want %v", err, serveErr)
+	}
+	if !errors.Is(err, shutdownErr) {
+		t.Fatalf("shutdown error = %v, want %v", err, shutdownErr)
+	}
+}
 
 func TestRunRejectsSecretCommandLineFlagsAndArguments(t *testing.T) {
 	for name, args := range map[string][]string{
