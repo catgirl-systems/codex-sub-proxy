@@ -10,17 +10,18 @@ import (
 
 func TestBuildHeadersMatchesCodexFixture(t *testing.T) {
 	headers, err := BuildHeaders(HeaderConfig{
-		AccessToken:    "access-token",
-		AccountID:      "account-123",
-		InstallationID: "installation-123",
-		SessionID:      "session-123",
-		ThreadID:       "thread-123",
-		WindowID:       "window-123",
-		TurnID:         "turn-123",
-		RequestKind:    "turn",
-		ImageTurnID:    "image-turn-123",
-		Attestation:    `{"v":1,"s":0,"t":"opaque"}`,
-		FedRAMP:        true,
+		AccessToken:         "access-token",
+		AccountID:           "account-123",
+		InstallationID:      "installation-123",
+		SessionID:           "session-123",
+		ThreadID:            "thread-123",
+		WindowID:            "window-123",
+		TurnID:              "turn-123",
+		TurnStartedAtUnixMs: 1738888888123,
+		RequestKind:         "turn",
+		ImageTurnID:         "image-turn-123",
+		Attestation:         `{"v":1,"s":0,"t":"opaque"}`,
+		FedRAMP:             true,
 	})
 	if err != nil {
 		t.Fatalf("BuildHeaders returned error: %v", err)
@@ -38,7 +39,7 @@ func TestBuildHeadersMatchesCodexFixture(t *testing.T) {
 		"x-client-request-id": "thread-123",
 		ThreadIDHeader:        "thread-123",
 		WindowIDHeader:        "window-123",
-		TurnMetadataHeader:    `{"installation_id":"installation-123","session_id":"session-123","thread_id":"thread-123","turn_id":"turn-123","window_id":"window-123","request_kind":"turn"}`,
+		TurnMetadataHeader:    `{"installation_id":"installation-123","session_id":"session-123","thread_id":"thread-123","turn_id":"turn-123","window_id":"window-123","request_kind":"turn","turn_started_at_unix_ms":1738888888123}`,
 		ImageTurnIDHeader:     "image-turn-123",
 		AttestationHeader:     `{"v":1,"s":0,"t":"opaque"}`,
 		FedRAMPHeader:         "true",
@@ -264,6 +265,7 @@ func TestMapUpstreamErrorUsesTypedCategories(t *testing.T) {
 		{"entity too large context code", http.StatusRequestEntityTooLarge, `{"error":{"code":"context_length_exceeded"}}`, nil, CategoryContextWindow, false},
 		{"policy", http.StatusBadRequest, `{"error":{"code":"cyber_policy"}}`, http.Header{"Retry-After": []string{"17"}}, CategoryPolicy, false},
 		{"usage limit", http.StatusTooManyRequests, `{"error":{"code":"usage_limit_reached"}}`, http.Header{"Retry-After": []string{"17"}}, CategoryUsageLimit, false},
+		{"insufficient quota", http.StatusTooManyRequests, `{"error":{"code":"insufficient_quota"}}`, http.Header{"Retry-After": []string{"17"}}, CategoryUsageLimit, false},
 		{"overloaded", http.StatusServiceUnavailable, `{"error":{"code":"server_is_overloaded"}}`, nil, CategoryOverloaded, true},
 	}
 	for _, test := range cases {

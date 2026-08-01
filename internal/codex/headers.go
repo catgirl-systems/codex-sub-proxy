@@ -42,14 +42,15 @@ type HeaderConfig struct {
 	Originator string
 	Version    string
 
-	InstallationID string
-	SessionID      string
-	ConversationID string
-	ThreadID       string
-	WindowID       string
-	TurnID         string
-	RequestKind    string
-	ImageTurnID    string
+	InstallationID      string
+	SessionID           string
+	ConversationID      string
+	ThreadID            string
+	WindowID            string
+	TurnID              string
+	TurnStartedAtUnixMs int64
+	RequestKind         string
+	ImageTurnID         string
 
 	Attestation string
 	FedRAMP     bool
@@ -156,7 +157,8 @@ func NewRequest(
 
 func buildTurnMetadata(config HeaderConfig) (string, error) {
 	if config.InstallationID == "" && config.SessionID == "" && config.ThreadID == "" &&
-		config.WindowID == "" && config.TurnID == "" && config.RequestKind == "" {
+		config.WindowID == "" && config.TurnID == "" && config.RequestKind == "" &&
+		config.TurnStartedAtUnixMs == 0 {
 		return "", nil
 	}
 	requestKind := config.RequestKind
@@ -164,19 +166,21 @@ func buildTurnMetadata(config HeaderConfig) (string, error) {
 		requestKind = DefaultRequestKind
 	}
 	metadata, err := json.Marshal(struct {
-		InstallationID string `json:"installation_id,omitempty"`
-		SessionID      string `json:"session_id,omitempty"`
-		ThreadID       string `json:"thread_id,omitempty"`
-		TurnID         string `json:"turn_id,omitempty"`
-		WindowID       string `json:"window_id,omitempty"`
-		RequestKind    string `json:"request_kind,omitempty"`
+		InstallationID      string `json:"installation_id,omitempty"`
+		SessionID           string `json:"session_id,omitempty"`
+		ThreadID            string `json:"thread_id,omitempty"`
+		TurnID              string `json:"turn_id,omitempty"`
+		WindowID            string `json:"window_id,omitempty"`
+		RequestKind         string `json:"request_kind,omitempty"`
+		TurnStartedAtUnixMs int64  `json:"turn_started_at_unix_ms,omitempty"`
 	}{
-		InstallationID: config.InstallationID,
-		SessionID:      config.SessionID,
-		ThreadID:       config.ThreadID,
-		TurnID:         config.TurnID,
-		WindowID:       config.WindowID,
-		RequestKind:    requestKind,
+		InstallationID:      config.InstallationID,
+		SessionID:           config.SessionID,
+		ThreadID:            config.ThreadID,
+		TurnID:              config.TurnID,
+		WindowID:            config.WindowID,
+		RequestKind:         requestKind,
+		TurnStartedAtUnixMs: config.TurnStartedAtUnixMs,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode turn metadata: %w", err)

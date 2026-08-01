@@ -206,7 +206,8 @@ func classifyError(status int, code string) ErrorCategory {
 		return CategoryContextWindow
 	case code == "cyber_policy":
 		return CategoryPolicy
-	case code == "usage_limit_reached" || code == "usage_not_included":
+	case code == "usage_limit_reached" || code == "usage_not_included" ||
+		code == "insufficient_quota":
 		return CategoryUsageLimit
 	case code == "rate_limit_exceeded" || status == http.StatusTooManyRequests:
 		return CategoryRateLimit
