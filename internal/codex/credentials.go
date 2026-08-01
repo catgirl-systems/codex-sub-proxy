@@ -422,11 +422,15 @@ func readCodexKeyring(ctx context.Context, codexHome string) ([]byte, error) {
 	if runtime.GOOS != "darwin" {
 		return nil, errors.New("Codex keyring import is not supported on this platform")
 	}
-	canonical, err := filepath.EvalSymlinks(codexHome)
+	absolute, err := filepath.Abs(codexHome)
 	if err != nil {
-		canonical, err = filepath.Abs(codexHome)
+		return nil, errors.New("resolve Codex home")
 	}
+	canonical, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
+		canonical = absolute
+	}
+	if canonical == "" {
 		return nil, errors.New("resolve Codex home")
 	}
 	digest := sha256.Sum256([]byte(canonical))
@@ -466,7 +470,9 @@ func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.T
 		Email:            strings.TrimSpace(email),
 	}
 	if credential.ExpiresAt.IsZero() {
-		if tokenExpiry, ok := jwtExpiry(idToken); ok {
+		if tokenExpiry, ok := jwtExpiry(credential.AccessToken); ok {
+			credential.ExpiresAt = tokenExpiry
+		} else if tokenExpiry, ok := jwtExpiry(idToken); ok {
 			credential.ExpiresAt = tokenExpiry
 		}
 	}

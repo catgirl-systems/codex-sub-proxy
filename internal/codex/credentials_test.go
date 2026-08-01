@@ -2,10 +2,13 @@ package codex
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -136,6 +139,68 @@ func TestImportCredentialReadsOMPDatabase(t *testing.T) {
 	}
 	if credential.AccessToken != "omp-access" || credential.RefreshToken != "omp-refresh" || credential.AccountID != "omp-account" || credential.WorkspaceID != "omp-workspace" || credential.PlanType != "pro" {
 		t.Fatalf("credential = %#v", credential)
+	}
+}
+
+func TestReadCodexKeyringHashesAbsoluteCanonicalHome(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Codex keyring import is only available on macOS")
+	}
+	workingDir := t.TempDir()
+	realHome := filepath.Join(workingDir, "real-codex")
+	if err := os.Mkdir(realHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	relativeHome := filepath.Join(workingDir, "relative-codex")
+	if err := os.Symlink("real-codex", relativeHome); err != nil {
+		t.Fatal(err)
+	}
+	capturePath := filepath.Join(workingDir, "account")
+	securityPath := filepath.Join(workingDir, "security")
+	script := "#!/bin/sh\nprintf '%s' \"$5\" > \"$CAPTURE\"\nprintf '%s' '{\"tokens\":{\"access_token\":\"access\",\"refresh_token\":\"refresh\"}}'\n"
+	if err := os.WriteFile(securityPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", workingDir)
+	t.Setenv("CAPTURE", capturePath)
+	t.Chdir(workingDir)
+	if _, err := readCodexKeyring(context.Background(), "relative-codex"); err != nil {
+		t.Fatalf("read Codex keyring: %v", err)
+	}
+	canonical, err := filepath.EvalSymlinks(realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(canonical))
+	want := "cli|" + hex.EncodeToString(digest[:])[:16]
+	got, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("keyring account = %q, want %q", got, want)
+	}
+}
+
+func TestImportedCredentialUsesAccessTokenExpiryBeforeIDToken(t *testing.T) {
+	accessExpiry := time.Unix(1_800_000_000, 0)
+	idExpiry := time.Unix(1_700_000_000, 0)
+	data, err := json.Marshal(map[string]any{
+		"tokens": map[string]string{
+			"access_token":  testJWT(t, map[string]any{"exp": accessExpiry.Unix()}),
+			"refresh_token": "refresh",
+			"id_token":      testJWT(t, map[string]any{"exp": idExpiry.Unix()}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := parseCredentialJSON(data)
+	if err != nil {
+		t.Fatalf("parse credential: %v", err)
+	}
+	if !credential.ExpiresAt.Equal(accessExpiry) {
+		t.Fatalf("credential expiry = %s, want %s", credential.ExpiresAt, accessExpiry)
 	}
 }
 

@@ -125,7 +125,9 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	_, err = codex.ImportCredential(context.Background(), *sourcePath, destinationPath, []byte(key))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	_, err = codex.ImportCredential(ctx, *sourcePath, destinationPath, []byte(key))
 	return err
 }
 

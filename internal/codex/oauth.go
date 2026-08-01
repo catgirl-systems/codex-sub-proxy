@@ -15,23 +15,25 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	defaultIssuer       = "https://auth.openai.com"
-	defaultClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
-	defaultCallbackPort = 1455
-	oauthCallbackPath   = "/auth/callback"
-	deviceRedirectPath  = "/deviceauth/callback"
-	oauthScope          = "openid profile email offline_access api.connectors.read api.connectors.invoke"
-	maxOAuthURLBytes    = 8 << 10
-	maxOAuthValueBytes  = 64 << 10
-	maxOAuthBodyBytes   = 64 << 10
-	oauthRequestTimeout = 15 * time.Second
-	devicePollInterval  = 5 * time.Second
-	devicePollMax       = 120
+	defaultIssuer            = "https://auth.openai.com"
+	defaultClientID          = "app_EMoamEEZ73f0CkXaXp7hrann"
+	defaultCallbackPort      = 1455
+	oauthCallbackPath        = "/auth/callback"
+	deviceRedirectPath       = "/deviceauth/callback"
+	oauthScope               = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+	maxOAuthURLBytes         = 8 << 10
+	maxOAuthValueBytes       = 64 << 10
+	maxOAuthBodyBytes        = 64 << 10
+	oauthRequestTimeout      = 15 * time.Second
+	devicePollInterval       = 5 * time.Second
+	devicePollLifetime       = 15 * time.Minute
+	maxDeviceLifetimeSeconds = int64((1<<63 - 1) / int64(time.Second))
 )
 
 // PKCE contains the verifier and S256 challenge for one OAuth attempt.
@@ -66,10 +68,34 @@ type tokenResponse struct {
 	Email            string `json:"email"`
 }
 
+type deviceInterval int64
+
+func (interval *deviceInterval) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(string(data))
+	if value == "" || value == "null" {
+		*interval = 0
+		return nil
+	}
+	if strings.HasPrefix(value, `"`) {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return errors.New("invalid device polling interval")
+		}
+		value = strings.TrimSpace(text)
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return errors.New("invalid device polling interval")
+	}
+	*interval = deviceInterval(parsed)
+	return nil
+}
+
 type deviceCodeResponse struct {
-	DeviceAuthID string `json:"device_auth_id"`
-	UserCode     string `json:"user_code"`
-	Interval     *int64 `json:"interval"`
+	DeviceAuthID string         `json:"device_auth_id"`
+	UserCode     string         `json:"user_code"`
+	Interval     deviceInterval `json:"interval"`
+	ExpiresIn    int64          `json:"expires_in"`
 }
 
 type deviceTokenResponse struct {
@@ -300,8 +326,8 @@ func normalizeLoginOptions(options LoginOptions) LoginOptions {
 	if options.PollInterval > time.Minute {
 		options.PollInterval = time.Minute
 	}
-	if options.MaxPolls <= 0 || options.MaxPolls > devicePollMax {
-		options.MaxPolls = devicePollMax
+	if options.MaxPolls < 0 {
+		options.MaxPolls = 0
 	}
 	return options
 }
@@ -420,13 +446,25 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 	if err := json.Unmarshal(body, &device); err != nil || strings.TrimSpace(device.DeviceAuthID) == "" || strings.TrimSpace(device.UserCode) == "" {
 		return Credential{}, errors.New("invalid device authorization response")
 	}
-	interval := options.PollInterval
-	if device.Interval != nil {
-		if *device.Interval < 0 || *device.Interval > 60 {
-			return Credential{}, errors.New("device polling interval is out of range")
-		}
-		interval = time.Duration(*device.Interval) * time.Second
+	if device.ExpiresIn < 0 || device.ExpiresIn > maxDeviceLifetimeSeconds {
+		return Credential{}, errors.New("device authorization lifetime is out of range")
 	}
+	interval := options.PollInterval
+	if device.Interval > 60 {
+		return Credential{}, errors.New("device polling interval is out of range")
+	}
+	if device.Interval > 0 {
+		interval = time.Duration(device.Interval) * time.Second
+	}
+	if interval <= 0 {
+		interval = devicePollInterval
+	}
+	lifetime := devicePollLifetime
+	if device.ExpiresIn > 0 {
+		lifetime = time.Duration(device.ExpiresIn) * time.Second
+	}
+	pollContext, cancel := context.WithTimeout(ctx, lifetime)
+	defer cancel()
 	if options.OnDeviceCode != nil {
 		options.OnDeviceCode(issuer+"/codex/device", device.UserCode)
 	} else {
@@ -434,19 +472,27 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 		fmt.Fprintln(os.Stdout, device.UserCode)
 	}
 
-	for range options.MaxPolls {
+	polls := 0
+	for {
+		if options.MaxPolls > 0 && polls >= options.MaxPolls {
+			return Credential{}, errors.New("device authorization timed out")
+		}
 		timer := time.NewTimer(interval)
 		select {
 		case <-timer.C:
-		case <-ctx.Done():
+		case <-pollContext.Done():
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
 				default:
 				}
 			}
-			return Credential{}, ctx.Err()
+			if err := ctx.Err(); err != nil {
+				return Credential{}, err
+			}
+			return Credential{}, errors.New("device authorization timed out")
 		}
+		polls++
 		pollBody, err := json.Marshal(struct {
 			DeviceAuthID string `json:"device_auth_id"`
 			UserCode     string `json:"user_code"`
@@ -454,17 +500,29 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 		if err != nil {
 			return Credential{}, errors.New("encode device token request")
 		}
-		pollRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, issuer+"/api/accounts/deviceauth/token", bytes.NewReader(pollBody))
+		pollRequest, err := http.NewRequestWithContext(pollContext, http.MethodPost, issuer+"/api/accounts/deviceauth/token", bytes.NewReader(pollBody))
 		if err != nil {
 			return Credential{}, fmt.Errorf("build device token request: %w", err)
 		}
 		pollRequest.Header.Set("Content-Type", "application/json")
 		pollResponse, err := oauthClient(options.HTTPClient).Do(pollRequest)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Credential{}, ctxErr
+			}
+			if pollContext.Err() != nil {
+				return Credential{}, errors.New("device authorization timed out")
+			}
 			return Credential{}, fmt.Errorf("device token request: %w", err)
 		}
 		pollBodyBytes, bodyErr := readAndCloseOAuthBody(pollResponse)
 		if bodyErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Credential{}, ctxErr
+			}
+			if pollContext.Err() != nil {
+				return Credential{}, errors.New("device authorization timed out")
+			}
 			return Credential{}, bodyErr
 		}
 		if pollResponse.StatusCode == http.StatusForbidden || pollResponse.StatusCode == http.StatusNotFound {
@@ -477,9 +535,8 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 		if err := json.Unmarshal(pollBodyBytes, &token); err != nil || strings.TrimSpace(token.AuthorizationCode) == "" || strings.TrimSpace(token.CodeVerifier) == "" {
 			return Credential{}, errors.New("invalid device token response")
 		}
-		return ExchangeCode(ctx, options.HTTPClient, issuer, options.ClientID, issuer+deviceRedirectPath, token.AuthorizationCode, token.CodeVerifier)
+		return ExchangeCode(pollContext, options.HTTPClient, issuer, options.ClientID, issuer+deviceRedirectPath, token.AuthorizationCode, token.CodeVerifier)
 	}
-	return Credential{}, errors.New("device authorization timed out")
 }
 
 func validateIssuer(issuer string) (string, error) {

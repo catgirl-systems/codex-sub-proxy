@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,56 @@ func TestGeneratePKCEUsesS256Challenge(t *testing.T) {
 	want := base64.RawURLEncoding.EncodeToString(digest[:])
 	if pkce.Challenge != want {
 		t.Fatalf("challenge = %q, want %q", pkce.Challenge, want)
+	}
+}
+
+func TestDeviceIntervalDecodesStringAndNumber(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want deviceInterval
+	}{
+		{name: "number", raw: `{"device_auth_id":"id","user_code":"code","interval":7}`, want: 7},
+		{name: "string", raw: `{"device_auth_id":"id","user_code":"code","interval":"7"}`, want: 7},
+		{name: "zero", raw: `{"device_auth_id":"id","user_code":"code","interval":"0"}`, want: 0},
+		{name: "absent", raw: `{"device_auth_id":"id","user_code":"code"}`, want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var response deviceCodeResponse
+			if err := json.Unmarshal([]byte(test.raw), &response); err != nil {
+				t.Fatalf("decode device response: %v", err)
+			}
+			if response.Interval != test.want {
+				t.Fatalf("interval = %d, want %d", response.Interval, test.want)
+			}
+		})
+	}
+}
+
+func TestDeviceLoginHonorsContextCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/accounts/deviceauth/usercode" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"device_auth_id":"device-id","user_code":"ABCD-1234","interval":0,"expires_in":900}`)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err := Login(ctx, LoginOptions{
+		Issuer:       server.URL,
+		Device:       true,
+		HTTPClient:   server.Client(),
+		PollInterval: 1 * time.Millisecond,
+		OnDeviceCode: func(string, string) {
+			cancel()
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("device login error = %v, want context cancellation", err)
 	}
 }
 
@@ -171,7 +222,7 @@ func TestDeviceLoginPollsPendingAndSavesIdentity(t *testing.T) {
 		switch request.URL.Path {
 		case "/api/accounts/deviceauth/usercode":
 			writer.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(writer, `{"device_auth_id":"device-id","user_code":"ABCD-1234","interval":0}`)
+			_, _ = io.WriteString(writer, `{"device_auth_id":"device-id","user_code":"ABCD-1234","interval":"0","expires_in":900}`)
 		case "/api/accounts/deviceauth/token":
 			if polls.Add(1) == 1 {
 				writer.WriteHeader(http.StatusForbidden)
@@ -191,7 +242,7 @@ func TestDeviceLoginPollsPendingAndSavesIdentity(t *testing.T) {
 		Issuer:       server.URL,
 		Device:       true,
 		HTTPClient:   server.Client(),
-		PollInterval: 0,
+		PollInterval: 1 * time.Millisecond,
 		MaxPolls:     3,
 		OnDeviceCode: func(string, string) {},
 	})
