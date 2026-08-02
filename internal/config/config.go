@@ -1,15 +1,16 @@
 package config
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"crypto/subtle"
 	"github.com/BurntSushi/toml"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/go-playground/validator/v10"
 )
 
 const (
@@ -28,26 +29,26 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen      string `toml:"listen"`
-	AdminListen string `toml:"admin_listen"`
+	Listen      string `toml:"listen" validate:"required"`
+	AdminListen string `toml:"admin_listen" validate:"required"`
 }
 
 type StorageConfig struct {
-	SQLitePath  string        `toml:"sqlite_path"`
-	BusyTimeout time.Duration `toml:"busy_timeout"`
+	SQLitePath  string        `toml:"sqlite_path" validate:"required"`
+	BusyTimeout time.Duration `toml:"busy_timeout" validate:"gt=0"`
 }
 
 type SecurityConfig struct {
-	PayloadEncryptionKeyEnv                 string   `toml:"payload_encryption_key_env"`
-	PayloadEncryptionKeyVersion             uint32   `toml:"payload_encryption_key_version"`
-	PayloadEncryptionPreviousKeyEnvs        []string `toml:"payload_encryption_previous_key_envs"`
-	PayloadEncryptionPreviousKeyVersions    []uint32 `toml:"payload_encryption_previous_key_versions"`
-	CredentialEncryptionKeyEnv              string   `toml:"credential_encryption_key_env"`
-	CredentialEncryptionKeyVersion          uint32   `toml:"credential_encryption_key_version"`
-	CredentialEncryptionPreviousKeyEnvs     []string `toml:"credential_encryption_previous_key_envs"`
-	CredentialEncryptionPreviousKeyVersions []uint32 `toml:"credential_encryption_previous_key_versions"`
-	APIKeyHMACKeyEnv                        string   `toml:"api_key_hmac_key_env"`
-	AdminTokenHMACKeyEnv                    string   `toml:"admin_token_hmac_key_env"`
+	PayloadEncryptionKeyEnv                 string   `toml:"payload_encryption_key_env" validate:"required"`
+	PayloadEncryptionKeyVersion             uint32   `toml:"payload_encryption_key_version" validate:"gt=0"`
+	PayloadEncryptionPreviousKeyEnvs        []string `toml:"payload_encryption_previous_key_envs" validate:"max=4,dive,required"`
+	PayloadEncryptionPreviousKeyVersions    []uint32 `toml:"payload_encryption_previous_key_versions" validate:"max=4,dive,gt=0"`
+	CredentialEncryptionKeyEnv              string   `toml:"credential_encryption_key_env" validate:"required"`
+	CredentialEncryptionKeyVersion          uint32   `toml:"credential_encryption_key_version" validate:"gt=0"`
+	CredentialEncryptionPreviousKeyEnvs     []string `toml:"credential_encryption_previous_key_envs" validate:"max=4,dive,required"`
+	CredentialEncryptionPreviousKeyVersions []uint32 `toml:"credential_encryption_previous_key_versions" validate:"max=4,dive,gt=0"`
+	APIKeyHMACKeyEnv                        string   `toml:"api_key_hmac_key_env" validate:"required"`
+	AdminTokenHMACKeyEnv                    string   `toml:"admin_token_hmac_key_env" validate:"required"`
 }
 
 type ResponsesTransport string
@@ -58,8 +59,8 @@ const (
 )
 
 type CodexConfig struct {
-	CredentialFile     string             `toml:"credential_file"`
-	ResponsesTransport ResponsesTransport `toml:"responses_transport"`
+	CredentialFile     string             `toml:"credential_file" validate:"required"`
+	ResponsesTransport ResponsesTransport `toml:"responses_transport" validate:"oneof=websocket_preferred sse"`
 }
 
 func (c CodexConfig) Validate() error {
@@ -119,6 +120,12 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if err := c.Codex.Validate(); err != nil {
+		return fmt.Errorf("codex configuration: %w", err)
+	}
+	if err := validator.New().Struct(c); err != nil {
+		return fmt.Errorf("validate configuration: %w", err)
+	}
 	if strings.TrimSpace(c.Server.Listen) == "" {
 		return fmt.Errorf("server listen address is empty")
 	}
@@ -130,9 +137,6 @@ func (c Config) Validate() error {
 	}
 	if c.Storage.BusyTimeout <= 0 {
 		return fmt.Errorf("storage busy timeout must be positive")
-	}
-	if err := c.Codex.Validate(); err != nil {
-		return fmt.Errorf("codex configuration: %w", err)
 	}
 	if c.Storage.BusyTimeout > 24*time.Hour {
 		return fmt.Errorf("storage busy timeout is too large")
@@ -249,11 +253,8 @@ func (s SecurityConfig) APIKeyHMACKey(lookup func(string) (string, bool)) ([]byt
 		return nil, fmt.Errorf("API-key HMAC key environment name is empty")
 	}
 	value, ok := lookup(name)
-	if !ok || strings.TrimSpace(value) == "" {
+	if !ok || value == "" {
 		return nil, fmt.Errorf("API-key HMAC key is unavailable")
-	}
-	if len(value) > 4096 {
-		return nil, fmt.Errorf("API-key HMAC key is too large")
 	}
 	return []byte(value), nil
 }

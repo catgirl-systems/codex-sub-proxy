@@ -137,7 +137,6 @@ func (f *listFlag) String() string {
 func (f *listFlag) Set(value string) error {
 	parts := strings.Split(value, ",")
 	for _, part := range parts {
-		part = strings.TrimSpace(part)
 		if part == "" {
 			return fmt.Errorf("list value is empty")
 		}
@@ -162,7 +161,7 @@ func runAPIKeyCreate(args []string) error {
 	flags := flag.NewFlagSet("codex-sub-proxy api-key create", flag.ContinueOnError)
 	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
 	name := flags.String("name", "", "API-key name")
-	owner := flags.String("owner", "local", "API-key owner")
+	owner := flags.String("owner", "", "API-key owner")
 	var endpoints listFlag
 	var models listFlag
 	flags.Var(&endpoints, "endpoint", "allowed endpoint; repeat or use a comma-separated list")
@@ -188,15 +187,12 @@ func runAPIKeyCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	policy, err := apikey.ValidatePolicy(apikey.Policy{
+	policy := apikey.Policy{
 		Name:             *name,
 		Owner:            *owner,
 		AllowedEndpoints: endpoints,
 		AllowedModels:    models,
 		ExpiresAt:        expiry,
-	})
-	if err != nil {
-		return err
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {

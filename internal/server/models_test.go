@@ -13,7 +13,7 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 )
 
-func TestModelsListsSortedUniqueAllowedModels(t *testing.T) {
+func TestModelsListsAllowedModelsInPolicyOrder(t *testing.T) {
 	db, err := storage.Open(context.Background(), ":memory:", time.Second)
 	if err != nil {
 		t.Fatalf("open database: %v", err)
@@ -29,8 +29,9 @@ func TestModelsListsSortedUniqueAllowedModels(t *testing.T) {
 	hmacKey := []byte("01234567890123456789012345678901")
 	rawKey, _, err := apikey.Create(context.Background(), db, hmacKey, apikey.Policy{
 		Name:             "models",
+		Owner:            "owner",
 		AllowedEndpoints: []string{"/v1/models"},
-		AllowedModels:    []string{"gpt-z", "gpt-a", "gpt-z"},
+		AllowedModels:    []string{"gpt-z", "gpt-a"},
 	})
 	if err != nil {
 		t.Fatalf("create API key: %v", err)
@@ -62,7 +63,7 @@ func TestModelsListsSortedUniqueAllowedModels(t *testing.T) {
 	if result.Object != "list" || len(result.Data) != 2 {
 		t.Fatalf("models response = %+v", result)
 	}
-	if result.Data[0].ID != "gpt-a" || result.Data[1].ID != "gpt-z" {
+	if result.Data[0].ID != "gpt-z" || result.Data[1].ID != "gpt-a" {
 		t.Fatalf("model order = %+v", result.Data)
 	}
 	for _, model := range result.Data {
@@ -88,6 +89,7 @@ func TestModelsRejectsMalformedOversizeAndDeniedRequests(t *testing.T) {
 	hmacKey := []byte("01234567890123456789012345678901")
 	rawKey, _, err := apikey.Create(context.Background(), db, hmacKey, apikey.Policy{
 		Name:             "denied",
+		Owner:            "owner",
 		AllowedEndpoints: []string{"/v1/responses"},
 		AllowedModels:    []string{"gpt-a"},
 	})

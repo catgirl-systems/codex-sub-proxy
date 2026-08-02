@@ -3,7 +3,6 @@ package server
 import (
 	"errors"
 	"net/http"
-	"sort"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/kataras/iris/v12"
@@ -38,9 +37,8 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte) (*iri
 			writeAPIKeyError(ctx, err)
 			return
 		}
-		modelIDs := uniqueSorted(principal.AllowedModels)
-		models := make([]modelObject, 0, len(modelIDs))
-		for _, id := range modelIDs {
+		models := make([]modelObject, 0, len(principal.AllowedModels))
+		for _, id := range principal.AllowedModels {
 			models = append(models, modelObject{
 				ID:      id,
 				Object:  "model",
@@ -54,23 +52,6 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte) (*iri
 		return nil, err
 	}
 	return app, nil
-}
-
-func uniqueSorted(values []string) []string {
-	result := append([]string(nil), values...)
-	sort.Strings(result)
-	if len(result) < 2 {
-		return result
-	}
-	write := 1
-	for read := 1; read < len(result); read++ {
-		if result[read] == result[write-1] {
-			continue
-		}
-		result[write] = result[read]
-		write++
-	}
-	return result[:write]
 }
 
 func writeAPIKeyError(ctx iris.Context, err error) {

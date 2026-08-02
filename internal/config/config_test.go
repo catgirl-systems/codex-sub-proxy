@@ -277,14 +277,14 @@ func TestValidateActiveKeyIndependenceRejectsEqualBytes(t *testing.T) {
 	}
 }
 
-func TestAPIKeyHMACKeyLoadsConfiguredValue(t *testing.T) {
+func TestAPIKeyHMACKeyLoadsConfiguredValueWithoutLengthValidation(t *testing.T) {
 	security := Default().Security
-	t.Setenv(security.APIKeyHMACKeyEnv, "01234567890123456789012345678901")
+	t.Setenv(security.APIKeyHMACKeyEnv, " x ")
 	key, err := security.APIKeyHMACKey(os.LookupEnv)
 	if err != nil {
 		t.Fatalf("load API-key HMAC key: %v", err)
 	}
-	if got := string(key); got != "01234567890123456789012345678901" {
+	if got := string(key); got != " x " {
 		t.Fatalf("HMAC key = %q", got)
 	}
 	t.Setenv(security.APIKeyHMACKeyEnv, "")
