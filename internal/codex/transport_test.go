@@ -2,9 +2,15 @@ package codex
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -52,6 +58,49 @@ func TestResponsesTransportWebSocketSuccessPreservesEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesTransportWebSocketWireContract(t *testing.T) {
+	messageReceived := make(chan string, 1)
+	betaReceived := make(chan string, 1)
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		betaReceived <- request.Header.Get(BetaHeader)
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		_, message, err := connection.ReadMessage()
+		if err != nil {
+			return
+		}
+		messageReceived <- string(message)
+		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+	request := CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}
+	if _, err := transport.Do(context.Background(), request); err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	select {
+	case got := <-betaReceived:
+		if got != responsesWebSocketBeta {
+			t.Fatalf("OpenAI-Beta = %q, want %q", got, responsesWebSocketBeta)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket handshake was not received")
+	}
+	select {
+	case got := <-messageReceived:
+		want := `{"type":"response.create","model":"gpt-5.6-sol","stream":true}`
+		if got != want {
+			t.Fatalf("WebSocket request = %s, want %s", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket request was not received")
+	}
+}
+
 func TestResponsesTransportFallsBackOnUnsupportedWebSocket(t *testing.T) {
 	var sseRequests atomic.Int32
 	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -78,6 +127,65 @@ func TestResponsesTransportFallsBackOnUnsupportedWebSocket(t *testing.T) {
 	}
 }
 
+func TestResponsesTransportFallsBackAfterReplaySafeWebSocketEvents(t *testing.T) {
+	var sseRequests atomic.Int32
+	sseBodyReceived := make(chan []byte, 1)
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			connection, err := transportUpgrader.Upgrade(writer, request, nil)
+			if err != nil {
+				return
+			}
+			defer connection.Close()
+			if _, _, err := connection.ReadMessage(); err != nil {
+				return
+			}
+			frames := [][]byte{
+				[]byte(`{"type":"response.created","response":{"status":"in_progress"}}`),
+				[]byte(`{"type":"response.metadata","metadata":{"state":"ready"}}`),
+			}
+			for _, frame := range frames {
+				if err := connection.WriteMessage(websocket.TextMessage, frame); err != nil {
+					return
+				}
+			}
+			_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+			return
+		}
+		sseRequests.Add(1)
+		body, err := io.ReadAll(request.Body)
+		if err == nil {
+			sseBodyReceived <- body
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write(transportSSEFixture(t))
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+	request := CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}
+	result, err := transport.Do(context.Background(), request)
+	if err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	if result.TerminalType != CodexEventResponseCompleted || sseRequests.Load() != 1 {
+		t.Fatalf("result = %#v, SSE requests = %d", result, sseRequests.Load())
+	}
+	select {
+	case got := <-sseBodyReceived:
+		want, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("SSE request = %s, want %s", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE request was not received")
+	}
+}
+
 func TestResponsesTransportDoesNotReplayAfterPartialWebSocketOutput(t *testing.T) {
 	var sseRequests atomic.Int32
 	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -95,6 +203,42 @@ func TestResponsesTransportDoesNotReplayAfterPartialWebSocketOutput(t *testing.T
 		if _, _, err := connection.ReadMessage(); err == nil {
 			frame := []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}`)
 			_ = connection.WriteMessage(websocket.TextMessage, frame)
+		}
+		_ = connection.Close()
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+	_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	if err == nil || !errors.Is(err, ErrCodexStreamAbruptClose) {
+		t.Fatalf("error = %v, want abrupt close", err)
+	}
+	if sseRequests.Load() != 0 {
+		t.Fatalf("SSE requests = %d, want 0", sseRequests.Load())
+	}
+}
+
+func TestResponsesTransportDoesNotReplayAfterWebSocketToolOutput(t *testing.T) {
+	var sseRequests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			sseRequests.Add(1)
+			writer.Header().Set("Content-Type", "text/event-stream")
+			writer.WriteHeader(http.StatusOK)
+			_, _ = writer.Write(transportSSEFixture(t))
+			return
+		}
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		frame := []byte(`{"type":"response.output_item.added","item":{"type":"function_call","name":"lookup","arguments":"{}"}}`)
+		if err := connection.WriteMessage(websocket.TextMessage, frame); err != nil {
+			return
 		}
 		_ = connection.Close()
 	})
@@ -250,6 +394,139 @@ func TestResponsesTransportErrorsDoNotExposeSecrets(t *testing.T) {
 	}
 }
 
+func TestResponsesTransportUsesHTTPTransportProxy(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxy := newTransportConnectProxy(t, &proxyRequests)
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	})
+	defer server.Close()
+
+	httpTransport := server.Client().Transport.(*http.Transport).Clone()
+	httpTransport.Proxy = http.ProxyURL(proxyURL)
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+	if _, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}); err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	if proxyRequests.Load() == 0 {
+		t.Fatal("WebSocket did not use the configured HTTP proxy")
+	}
+}
+
+func TestResponsesTransportUsesCustomTLSRoots(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	}))
+	defer server.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	httpTransport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+	if _, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}); err != nil {
+		t.Fatalf("transport.Do with custom TLS roots: %v", err)
+	}
+}
+
+func TestResponsesTransportUsesEnvironmentProxy(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxy := newTransportConnectProxy(t, &proxyRequests)
+	defer proxy.Close()
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("HTTPS_PROXY", proxy.URL)
+	t.Setenv("NO_PROXY", "")
+
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	})
+	defer server.Close()
+
+	httpTransport := server.Client().Transport.(*http.Transport).Clone()
+	httpTransport.Proxy = func(*http.Request) (*url.URL, error) {
+		return url.Parse(os.Getenv("HTTP_PROXY"))
+	}
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+	if _, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}); err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	if proxyRequests.Load() == 0 {
+		t.Fatal("WebSocket did not use the proxy from the environment")
+	}
+}
+
+func newTransportConnectProxy(t *testing.T, requests *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodConnect {
+			http.Error(writer, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		target, err := net.Dial("tcp", request.Host)
+		if err != nil {
+			http.Error(writer, "proxy dial failed", http.StatusBadGateway)
+			return
+		}
+		hijacker, ok := writer.(http.Hijacker)
+		if !ok {
+			_ = target.Close()
+			http.Error(writer, "hijacking is not supported", http.StatusInternalServerError)
+			return
+		}
+		client, buffered, err := hijacker.Hijack()
+		if err != nil {
+			_ = target.Close()
+			return
+		}
+		requests.Add(1)
+		defer client.Close()
+		defer target.Close()
+		if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+		if err := buffered.Flush(); err != nil {
+			return
+		}
+		go func() {
+			_, _ = io.Copy(target, client)
+			_ = target.Close()
+		}()
+		_, _ = io.Copy(client, target)
+	}))
+}
+
 var transportUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 
 func newTransportServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
@@ -258,6 +535,11 @@ func newTransportServer(t *testing.T, handler http.HandlerFunc) *httptest.Server
 }
 
 func newTestResponsesTransport(t *testing.T, server *httptest.Server, policy ResponsesTransportPolicy) *ResponsesTransport {
+	t.Helper()
+	return newTestResponsesTransportWithClient(t, server, policy, server.Client())
+}
+
+func newTestResponsesTransportWithClient(t *testing.T, server *httptest.Server, policy ResponsesTransportPolicy, client *http.Client) *ResponsesTransport {
 	t.Helper()
 	keys := testCredentialKeys(t)
 	credentialPath := t.TempDir() + "/credential.enc"
@@ -278,7 +560,7 @@ func newTestResponsesTransport(t *testing.T, server *httptest.Server, policy Res
 		Policy:       policy,
 		ResponsesURL: server.URL,
 		WebSocketURL: webSocketURL,
-		HTTPClient:   server.Client(),
+		HTTPClient:   client,
 		Refresher:    refresher,
 	})
 	if err != nil {
