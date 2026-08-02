@@ -32,6 +32,7 @@ const (
 // SaveCredential encrypts the credential before it writes it to disk.
 type Credential struct {
 	AccessToken      string    `json:"access_token"`
+	IDToken          string    `json:"id_token,omitempty"`
 	RefreshToken     string    `json:"refresh_token"`
 	ExpiresAt        time.Time `json:"expires_at"`
 	AccountID        string    `json:"account_id"`
@@ -482,6 +483,7 @@ func readCodexKeyring(ctx context.Context, codexHome string) ([]byte, error) {
 func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.Time, accountID, userID, workspaceID, planType string, fedramp bool, email string, requireIdentity bool) (Credential, error) {
 	credential := Credential{
 		AccessToken:      strings.TrimSpace(accessToken),
+		IDToken:          strings.TrimSpace(idToken),
 		RefreshToken:     strings.TrimSpace(refreshToken),
 		ExpiresAt:        expiresAt,
 		AccountID:        strings.TrimSpace(accountID),
@@ -587,15 +589,18 @@ func (claims identityClaims) ProfileEmail() string {
 	}
 	return claims.Profile.Email
 }
-
 func validateCredential(credential Credential, requireIdentity bool) error {
 	if credential.AccessToken == "" || credential.RefreshToken == "" {
 		return errors.New("credential is missing OAuth tokens")
 	}
-	if len(credential.AccessToken) > maxTokenBytes || len(credential.RefreshToken) > maxTokenBytes {
+	if len(credential.AccessToken) > maxTokenBytes ||
+		len(credential.IDToken) > maxTokenBytes ||
+		len(credential.RefreshToken) > maxTokenBytes {
 		return errors.New("credential token is too large")
 	}
-	if strings.ContainsAny(credential.AccessToken, "\r\n") || strings.ContainsAny(credential.RefreshToken, "\r\n") {
+	if strings.ContainsAny(credential.AccessToken, "\r\n") ||
+		strings.ContainsAny(credential.IDToken, "\r\n") ||
+		strings.ContainsAny(credential.RefreshToken, "\r\n") {
 		return errors.New("credential token contains invalid characters")
 	}
 	if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.Before(time.Unix(0, 0)) {

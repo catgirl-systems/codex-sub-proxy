@@ -14,12 +14,14 @@ type Readiness struct {
 	storage             bool
 	keys                bool
 	credentialAvailable func() bool
+	credentialStatus    func() string
 }
 
 type ReadinessSnapshot struct {
-	Storage      bool `json:"storage"`
-	Keys         bool `json:"keys"`
-	UpstreamAuth bool `json:"upstream_auth"`
+	Storage         bool   `json:"storage"`
+	Keys            bool   `json:"keys"`
+	UpstreamAuth    bool   `json:"upstream_auth"`
+	CredentialState string `json:"credential_state,omitempty"`
 }
 
 func NewReadiness() *Readiness {
@@ -27,10 +29,16 @@ func NewReadiness() *Readiness {
 }
 
 func (r *Readiness) Set(storage, keys bool, credentialAvailable func() bool) {
+	r.SetWithStatus(storage, keys, credentialAvailable, nil)
+}
+
+// SetWithStatus sets health checks and a non-secret credential state callback.
+func (r *Readiness) SetWithStatus(storage, keys bool, credentialAvailable func() bool, credentialStatus func() string) {
 	r.mu.Lock()
 	r.storage = storage
 	r.keys = keys
 	r.credentialAvailable = credentialAvailable
+	r.credentialStatus = credentialStatus
 	r.mu.Unlock()
 }
 
@@ -41,9 +49,13 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 		Keys:    r.keys,
 	}
 	credentialAvailable := r.credentialAvailable
+	credentialStatus := r.credentialStatus
 	r.mu.RUnlock()
 	if credentialAvailable != nil {
 		snapshot.UpstreamAuth = credentialAvailable()
+	}
+	if credentialStatus != nil {
+		snapshot.CredentialState = credentialStatus()
 	}
 	return snapshot
 }

@@ -53,6 +53,16 @@ func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 		UpstreamAuth: true,
 	})
 }
+func TestReadinessReportsCredentialState(t *testing.T) {
+	readiness := NewReadiness()
+	readiness.SetWithStatus(true, true, func() bool { return true }, func() string {
+		return "refreshing"
+	})
+	snapshot := readiness.Snapshot()
+	if snapshot.CredentialState != "refreshing" || !snapshot.Ready() {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
 
 func TestReadinessReflectsCredentialChanges(t *testing.T) {
 	credentialPath := filepath.Join(t.TempDir(), "credential.enc")
