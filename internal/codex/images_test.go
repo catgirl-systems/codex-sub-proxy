@@ -36,10 +36,11 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		assertExactImageJSONKeys(t, body, "model", "prompt", "n", "size", "quality")
+		assertExactImageJSONKeys(t, body, "model", "prompt", "n", "size", "quality", "output_compression", "output_format", "moderation", "user")
 		for key, want := range map[string]string{
 			"model": `"gpt-image-2"`, "prompt": `"fixture generated icon"`,
 			"n": "1", "size": `"1024x1024"`, "quality": `"auto"`,
+			"output_compression": "75", "output_format": `"webp"`, "moderation": `"low"`, "user": `"fixture-user"`,
 		} {
 			if got := string(body[key]); got != want {
 				t.Errorf("body[%q] = %s, want %s", key, got, want)
@@ -52,7 +53,8 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 	client := newTestImagesClient(t, server, "access-token", "account-123")
 	result, err := client.Generate(context.Background(), CodexImageGenerationRequest{
 		Model: "gpt-image-2", Prompt: "fixture generated icon", N: 1,
-		Size: "1024x1024", Quality: "auto",
+		Size: "1024x1024", Quality: "auto", OutputCompression: 75,
+		OutputFormat: "webp", Moderation: "low", User: "fixture-user",
 	})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
@@ -85,10 +87,11 @@ func TestImagesClientEditWireAndDecode(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		assertExactImageJSONKeys(t, body, "model", "prompt", "images", "n", "size", "quality")
+		assertExactImageJSONKeys(t, body, "model", "prompt", "images", "n", "size", "quality", "output_compression", "output_format", "user")
 		for key, want := range map[string]string{
 			"model": `"gpt-image-2"`, "prompt": `"fixture edited icon"`,
 			"n": "1", "size": `"1024x1024"`, "quality": `"auto"`,
+			"output_compression": "80", "output_format": `"jpeg"`, "user": `"fixture-user"`,
 		} {
 			if got := string(body[key]); got != want {
 				t.Errorf("body[%q] = %s, want %s", key, got, want)
@@ -109,7 +112,8 @@ func TestImagesClientEditWireAndDecode(t *testing.T) {
 	client := newTestImagesClient(t, server, "access-token", "account-123")
 	result, err := client.Edit(context.Background(), CodexImageEditRequest{
 		Model: "gpt-image-2", Prompt: "fixture edited icon", N: 1,
-		Size: "1024x1024", Quality: "auto",
+		Size: "1024x1024", Quality: "auto", OutputCompression: 80,
+		OutputFormat: "jpeg", User: "fixture-user",
 		Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}},
 	})
 	if err != nil {

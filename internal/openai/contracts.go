@@ -704,11 +704,15 @@ type Usage struct {
 // InputTokenDetails gives the public input token breakdown.
 type InputTokenDetails struct {
 	CachedTokens int `json:"cached_tokens,omitempty"`
+	ImageTokens  int `json:"image_tokens,omitempty"`
+	TextTokens   int `json:"text_tokens,omitempty"`
 }
 
 // OutputTokenDetails gives the public output token breakdown.
 type OutputTokenDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	ImageTokens     int `json:"image_tokens,omitempty"`
+	TextTokens      int `json:"text_tokens,omitempty"`
 }
 
 // Error is one public OpenAI error object.
@@ -726,34 +730,42 @@ type ErrorResponse struct {
 
 // ImageGenerationRequest is a public Images generation request.
 type ImageGenerationRequest struct {
-	Model          string `json:"model"`
-	Prompt         string `json:"prompt"`
-	N              int    `json:"n,omitempty"`
-	Size           string `json:"size,omitempty"`
-	Quality        string `json:"quality,omitempty"`
-	ResponseFormat string `json:"response_format,omitempty"`
-	User           string `json:"user,omitempty"`
+	Model             string `json:"model" validate:"required,max=64"`
+	Prompt            string `json:"prompt" validate:"required,max=65536"`
+	N                 int    `json:"n,omitempty" validate:"omitempty,min=1,max=5"`
+	Size              string `json:"size,omitempty" validate:"omitempty,max=32"`
+	Quality           string `json:"quality,omitempty" validate:"omitempty,oneof=low medium high auto"`
+	Background        string `json:"background,omitempty" validate:"omitempty,oneof=auto opaque transparent"`
+	OutputCompression int    `json:"output_compression,omitempty" validate:"omitempty,min=0,max=100"`
+	OutputFormat      string `json:"output_format,omitempty" validate:"omitempty,oneof=png jpeg webp"`
+	Moderation        string `json:"moderation,omitempty" validate:"omitempty,oneof=low auto"`
+	ResponseFormat    string `json:"response_format,omitempty" validate:"omitempty,oneof=b64_json"`
+	User              string `json:"user,omitempty" validate:"max=65536"`
 }
 
-// ImageEditRequest is the JSON form used by the private image adapter after multipart decoding.
+// ImageEditRequest is the typed request assembled from an Images multipart form.
 type ImageEditRequest struct {
-	Model          string   `json:"model"`
-	Prompt         string   `json:"prompt"`
-	Images         []string `json:"images"`
-	N              int      `json:"n,omitempty"`
-	Size           string   `json:"size,omitempty"`
-	Quality        string   `json:"quality,omitempty"`
-	ResponseFormat string   `json:"response_format,omitempty"`
-	User           string   `json:"user,omitempty"`
+	Model             string   `json:"model" validate:"required,max=64"`
+	Prompt            string   `json:"prompt" validate:"required,max=65536"`
+	Images            []string `json:"images" validate:"-"`
+	N                 int      `json:"n,omitempty" validate:"omitempty,min=1,max=5"`
+	Size              string   `json:"size,omitempty" validate:"omitempty,max=32"`
+	Quality           string   `json:"quality,omitempty" validate:"omitempty,oneof=low medium high auto"`
+	Background        string   `json:"background,omitempty" validate:"omitempty,oneof=auto opaque transparent"`
+	OutputCompression int      `json:"output_compression,omitempty" validate:"omitempty,min=0,max=100"`
+	OutputFormat      string   `json:"output_format,omitempty" validate:"omitempty,oneof=png jpeg webp"`
+	ResponseFormat    string   `json:"response_format,omitempty" validate:"omitempty,oneof=b64_json"`
+	User              string   `json:"user,omitempty" validate:"max=65536"`
 }
 
 // ImageResponse is a public Images result.
 type ImageResponse struct {
 	Created int64       `json:"created"`
 	Data    []ImageData `json:"data"`
+	Usage   *Usage      `json:"usage,omitempty"`
 }
 
-// ImageData is one public image result.
+// ImageData is one public Images result.
 type ImageData struct {
 	B64JSON       string `json:"b64_json,omitempty"`
 	URL           string `json:"url,omitempty"`

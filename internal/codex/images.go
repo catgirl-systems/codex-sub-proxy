@@ -3,7 +3,9 @@ package codex
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,8 +22,8 @@ const (
 	maxCodexImageCount         = 5
 	maxCodexImagePromptBytes   = 64 << 10
 	maxCodexImageBytes         = 4 << 20
-	maxCodexImageRequestBytes  = maxCodexRequestBytes
-	maxCodexImageResponseBytes = maxCodexStreamPayloadBytes
+	maxCodexImageRequestBytes  = 32 << 20
+	maxCodexImageResponseBytes = 32 << 20
 	maxCodexImageDimension     = 3840
 	maxCodexImagePixels        = 3840 * 2160
 )
@@ -77,8 +79,10 @@ func NewImagesClient(options ImagesClientOptions) (*ImagesClient, error) {
 	if options.Refresher == nil {
 		return nil, errors.New("Codex Images credential refresher is required")
 	}
-	if err := validateImageTurnID(options.Headers.ImageTurnID); err != nil {
-		return nil, err
+	if options.Headers.ImageTurnID != "" {
+		if err := validateImageTurnID(options.Headers.ImageTurnID); err != nil {
+			return nil, err
+		}
 	}
 	client := options.HTTPClient
 	if client == nil {
@@ -137,8 +141,17 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n in
 	if edit {
 		endpoint = client.editsURL
 	}
+	imageTurnID := client.headers.ImageTurnID
+	if imageTurnID == "" {
+		var turnIDErr error
+		imageTurnID, turnIDErr = newCodexImageTurnID()
+		if turnIDErr != nil {
+			return CodexImageResult{}, turnIDErr
+		}
+	}
 	response, err := client.refresher.Do(operationContext, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
 		headers := client.headers
+		headers.ImageTurnID = imageTurnID
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
 		if credential.AccountIsFedRAMP {
@@ -236,9 +249,31 @@ func validateImagesCall(ctx context.Context, client *ImagesClient) error {
 	if client == nil {
 		return errors.New("Codex Images client is nil")
 	}
-	return validateImageTurnID(client.headers.ImageTurnID)
+	if client.headers.ImageTurnID != "" {
+		return validateImageTurnID(client.headers.ImageTurnID)
+	}
+	return nil
 }
 
+func newCodexImageTurnID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate Codex Images turn identity: %w", err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	var encoded [36]byte
+	hex.Encode(encoded[0:8], value[0:4])
+	encoded[8] = '-'
+	hex.Encode(encoded[9:13], value[4:6])
+	encoded[13] = '-'
+	hex.Encode(encoded[14:18], value[6:8])
+	encoded[18] = '-'
+	hex.Encode(encoded[19:23], value[8:10])
+	encoded[23] = '-'
+	hex.Encode(encoded[24:36], value[10:16])
+	return string(encoded[:]), nil
+}
 func validateImageTurnID(imageTurnID string) error {
 	if strings.TrimSpace(imageTurnID) == "" {
 		return errors.New("Codex Images image-turn identity is required")
@@ -250,14 +285,36 @@ func validateImageTurnID(imageTurnID string) error {
 }
 
 func validateCodexImageGenerationRequest(request CodexImageGenerationRequest) error {
-	if err := validateCodexImageParameters(request.Model, request.Prompt, request.N, request.Size, request.Quality, request.Background); err != nil {
+	if err := validateCodexImageParameters(
+		request.Model,
+		request.Prompt,
+		request.N,
+		request.Size,
+		request.Quality,
+		request.Background,
+		request.OutputCompression,
+		request.OutputFormat,
+		request.Moderation,
+		request.User,
+	); err != nil {
 		return err
 	}
 	return nil
 }
 
 func validateCodexImageEditRequest(request CodexImageEditRequest) error {
-	if err := validateCodexImageParameters(request.Model, request.Prompt, request.N, request.Size, request.Quality, request.Background); err != nil {
+	if err := validateCodexImageParameters(
+		request.Model,
+		request.Prompt,
+		request.N,
+		request.Size,
+		request.Quality,
+		request.Background,
+		request.OutputCompression,
+		request.OutputFormat,
+		"",
+		request.User,
+	); err != nil {
 		return err
 	}
 	if len(request.Images) == 0 || len(request.Images) > maxCodexImageCount {
@@ -274,7 +331,10 @@ func validateCodexImageEditRequest(request CodexImageEditRequest) error {
 	return nil
 }
 
-func validateCodexImageParameters(model, prompt string, n int, size, quality, background string) error {
+func validateCodexImageParameters(
+	model, prompt string, n int, size, quality, background string,
+	outputCompression int, outputFormat, moderation, user string,
+) error {
 	if model != "gpt-image-2" {
 		return errors.New("Codex Images model must be gpt-image-2")
 	}
@@ -305,6 +365,26 @@ func validateCodexImageParameters(model, prompt string, n int, size, quality, ba
 		default:
 			return errors.New("Codex Images background is invalid")
 		}
+	}
+	if outputCompression < 0 || outputCompression > 100 {
+		return errors.New("Codex Images output compression is invalid")
+	}
+	if outputFormat != "" {
+		switch outputFormat {
+		case "png", "jpeg", "webp":
+		default:
+			return errors.New("Codex Images output format is invalid")
+		}
+	}
+	if moderation != "" {
+		switch moderation {
+		case "low", "auto":
+		default:
+			return errors.New("Codex Images moderation is invalid")
+		}
+	}
+	if len(user) > maxCodexImagePromptBytes {
+		return errors.New("Codex Images user is too large")
 	}
 	return nil
 }

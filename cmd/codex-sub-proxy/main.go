@@ -94,6 +94,7 @@ func run(args []string) error {
 	keysReady = keysReady && payloadErr == nil && credentialErr == nil && apiKeyHMACErr == nil
 	var credentialSnapshot func() server.CredentialSnapshot
 	var responsesTransport *codex.ResponsesTransport
+	var imagesClient *codex.ImagesClient
 	if credentialErr == nil {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
 			if refresher, refreshErr := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{
@@ -115,17 +116,25 @@ func run(args []string) error {
 				if err != nil {
 					return fmt.Errorf("build Responses transport: %w", err)
 				}
+				imagesClient, err = codex.NewImagesClient(codex.ImagesClientOptions{
+					Refresher: refresher,
+					Headers:   codex.HeaderConfig{},
+				})
+				if err != nil {
+					return fmt.Errorf("build Images client: %w", err)
+				}
 			}
 		}
 	}
-	readiness.Set(storageReady, keysReady, credentialSnapshot)
 
+	readiness.Set(storageReady, keysReady, credentialSnapshot)
 	servers, err := server.Start(server.Config{
 		Listen:             cfg.Server.Listen,
 		AdminListen:        cfg.Server.AdminListen,
 		Database:           db,
 		APIKeyHMACKey:      apiKeyHMACKey,
 		ResponsesTransport: responsesTransport,
+		ImagesClient:       imagesClient,
 	}, readiness)
 	if err != nil {
 		return err

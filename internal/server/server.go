@@ -25,6 +25,7 @@ type Config struct {
 	Database           *gorm.DB
 	APIKeyHMACKey      []byte
 	ResponsesTransport *codex.ResponsesTransport
+	ImagesClient       *codex.ImagesClient
 }
 
 type Servers struct {
@@ -45,8 +46,7 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 	if cfg.AdminListen == "" {
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
-
-	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport)
+	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient)
 	if err != nil {
 		return nil, fmt.Errorf("build data application: %w", err)
 	}

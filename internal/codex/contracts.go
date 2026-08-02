@@ -433,23 +433,30 @@ type CodexErrorEnvelope struct {
 
 // CodexImageGenerationRequest is the exact private generation request body.
 type CodexImageGenerationRequest struct {
-	Model      string `json:"model"`
-	Prompt     string `json:"prompt"`
-	N          int    `json:"n,omitempty"`
-	Size       string `json:"size,omitempty"`
-	Quality    string `json:"quality,omitempty"`
-	Background string `json:"background,omitempty"`
+	Model             string `json:"model"`
+	Prompt            string `json:"prompt"`
+	N                 int    `json:"n,omitempty"`
+	Size              string `json:"size,omitempty"`
+	Quality           string `json:"quality,omitempty"`
+	Background        string `json:"background,omitempty"`
+	OutputCompression int    `json:"output_compression,omitempty"`
+	OutputFormat      string `json:"output_format,omitempty"`
+	Moderation        string `json:"moderation,omitempty"`
+	User              string `json:"user,omitempty"`
 }
 
 // CodexImageEditRequest is the exact private edit request body.
 type CodexImageEditRequest struct {
-	Model      string                `json:"model"`
-	Prompt     string                `json:"prompt"`
-	Images     []CodexImageEditInput `json:"images"`
-	N          int                   `json:"n,omitempty"`
-	Size       string                `json:"size,omitempty"`
-	Quality    string                `json:"quality,omitempty"`
-	Background string                `json:"background,omitempty"`
+	Model             string                `json:"model"`
+	Prompt            string                `json:"prompt"`
+	Images            []CodexImageEditInput `json:"images"`
+	N                 int                   `json:"n,omitempty"`
+	Size              string                `json:"size,omitempty"`
+	Quality           string                `json:"quality,omitempty"`
+	Background        string                `json:"background,omitempty"`
+	OutputCompression int                   `json:"output_compression,omitempty"`
+	OutputFormat      string                `json:"output_format,omitempty"`
+	User              string                `json:"user,omitempty"`
 }
 
 // CodexImageEditInput is one image_url object in a private edit request.
