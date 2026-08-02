@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "status": 400,
+  "error": {
+    "type": "cyber_policy",
+    "code": "cyber_policy",
+    "message": "request blocked by policy"
+  }
+}

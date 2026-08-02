@@ -1,0 +1,35 @@
+{
+  "id": "resp_fixture_public_002",
+  "object": "response",
+  "created_at": 1738888902,
+  "model": "gpt-5.6-sol",
+  "status": "incomplete",
+  "incomplete_details": {
+    "reason": "max_output_tokens"
+  },
+  "output": [
+    {
+      "id": "msg_public_002",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "public incomplete fixture"
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 6,
+    "output_tokens": 2,
+    "total_tokens": 8,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  }
+}

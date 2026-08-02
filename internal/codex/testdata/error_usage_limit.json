@@ -1,0 +1,16 @@
+{
+  "type": "error",
+  "status": 429,
+  "error": {
+    "type": "usage_limit_reached",
+    "code": "usage_limit_reached",
+    "message": "usage limit reached for fixture",
+    "plan_type": "pro",
+    "resets_at": 1738888999
+  },
+  "headers": {
+    "x-codex-primary-used-percent": 100,
+    "x-codex-primary-window-minutes": 300,
+    "x-codex-primary-reset-at": 1738888999
+  }
+}

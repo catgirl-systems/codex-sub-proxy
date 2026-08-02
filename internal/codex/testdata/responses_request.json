@@ -1,0 +1,27 @@
+{
+  "model": "gpt-5.6-sol",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "fixture image request"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "image_generation",
+      "action": "generate",
+      "output_format": "png",
+      "size": "1024x1024"
+    }
+  ],
+  "tool_choice": {
+    "type": "image_generation"
+  },
+  "store": false,
+  "stream": true
+}

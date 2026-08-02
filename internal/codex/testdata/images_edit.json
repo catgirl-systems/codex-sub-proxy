@@ -1,0 +1,20 @@
+{
+  "created": 1738888895,
+  "data": [
+    {
+      "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "revised_prompt": "a synthetic edited icon"
+    }
+  ],
+  "usage": {
+    "input_tokens": 16,
+    "output_tokens": 3,
+    "total_tokens": 19,
+    "input_tokens_details": {
+      "cached_tokens": 4
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 1
+    }
+  }
+}

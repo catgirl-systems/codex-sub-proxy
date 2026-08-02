@@ -1,0 +1,4 @@
+data: {"type":"response.created","response":{"id":"resp_fixture_004","status":"in_progress"}}
+
+data: {"type":"response.output_text.delta","delta":"broken fixture"
+
