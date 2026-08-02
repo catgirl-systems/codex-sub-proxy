@@ -701,8 +701,12 @@ func responsesTestJSONMetadata(count int) string {
 	return builder.String()
 }
 
-func newResponsesTestServer(t *testing.T, upstreamURL string, policy *apikey.Policy) (*Servers, string) {
+func newResponsesTestServer(t *testing.T, upstreamURL string, policy *apikey.Policy, serverWriteTimeout ...time.Duration) (*Servers, string) {
 	t.Helper()
+	timeout := writeTimeout
+	if len(serverWriteTimeout) == 1 {
+		timeout = serverWriteTimeout[0]
+	}
 	databasePath := filepath.Join(t.TempDir(), "test.sqlite3")
 	database, err := storage.Open(context.Background(), databasePath, time.Second)
 	if err != nil {
@@ -744,7 +748,7 @@ func newResponsesTestServer(t *testing.T, upstreamURL string, policy *apikey.Pol
 	if err != nil {
 		t.Fatal(err)
 	}
-	servers, err := Start(Config{Listen: "127.0.0.1:0", AdminListen: "127.0.0.1:0", Database: database, APIKeyHMACKey: hmacKey, ResponsesTransport: transport}, NewReadiness())
+	servers, err := startWithWriteTimeout(Config{Listen: "127.0.0.1:0", AdminListen: "127.0.0.1:0", Database: database, APIKeyHMACKey: hmacKey, ResponsesTransport: transport}, NewReadiness(), timeout)
 	if err != nil {
 		t.Fatal(err)
 	}

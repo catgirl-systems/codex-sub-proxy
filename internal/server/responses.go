@@ -100,6 +100,11 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			serveResponsesStream(ctx, requestContext, transport, privateRequest)
 			return
 		}
+		if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Now().Add(imagesWriteTimeout)); err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+
 		result, err := transport.Do(requestContext, privateRequest)
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {

@@ -520,6 +520,27 @@ func TestImagesClientCancellation(t *testing.T) {
 	}
 }
 
+func TestImagesClientGenerateRejectsNilContext(t *testing.T) {
+	var client ImagesClient
+	var nilContext context.Context
+	_, err := client.Generate(nilContext, CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
+	if err == nil || err.Error() != "Codex Images context is nil" {
+		t.Fatalf("nil context error = %v", err)
+	}
+}
+
+func TestImagesClientEditRejectsNilContext(t *testing.T) {
+	var client ImagesClient
+	var nilContext context.Context
+	_, err := client.Edit(nilContext, CodexImageEditRequest{
+		Model: "gpt-image-2", Prompt: "x",
+		Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}},
+	})
+	if err == nil || err.Error() != "Codex Images context is nil" {
+		t.Fatalf("nil context error = %v", err)
+	}
+}
+
 func TestImagesClientBoundsStalledHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		select {

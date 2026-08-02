@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	sdk "github.com/openai/openai-go"
@@ -72,6 +73,71 @@ func TestOfficialOpenAISDKUsesOnlyBaseURLAndAPIKey(t *testing.T) {
 	}
 	if eventCount == 0 || terminalCount != 1 || !sawTypedCompleted {
 		t.Fatalf("official SDK stream events = %d, terminals = %d, typed completed = %t", eventCount, terminalCount, sawTypedCompleted)
+	}
+}
+
+func TestOfficialOpenAISDKNonstreamSurvivesWriteTimeout(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		close(upstreamStarted)
+		<-releaseUpstream
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	testWriteTimeout := 100 * time.Millisecond
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil, testWriteTimeout)
+	defer shutdownResponsesTestServer(t, servers)
+
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	params := responses.ResponseNewParams{
+		Model: shared.ResponsesModel("gpt-5.6-sol"),
+		Input: responses.ResponseNewParamsInputUnion{OfString: sdk.String("fixture input")},
+	}
+	type responseResult struct {
+		value *responses.Response
+		err   error
+	}
+	resultCh := make(chan responseResult, 1)
+	requestContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() {
+		value, requestErr := client.Responses.New(requestContext, params)
+		resultCh <- responseResult{value: value, err: requestErr}
+	}()
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	releaseTimer := time.NewTimer(testWriteTimeout + 100*time.Millisecond)
+	defer releaseTimer.Stop()
+	select {
+	case result := <-resultCh:
+		t.Fatalf("nonstream response completed before upstream release: value=%#v err=%v", result.value, result.err)
+	case <-releaseTimer.C:
+	}
+	close(releaseUpstream)
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("official SDK delayed JSON call: %v", result.err)
+		}
+		if result.value == nil || result.value.Status != "completed" || len(result.value.Output) == 0 {
+			t.Fatalf("official SDK delayed JSON result = %#v", result.value)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("official SDK delayed JSON response did not arrive")
 	}
 }
 

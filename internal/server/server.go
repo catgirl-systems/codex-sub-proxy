@@ -40,6 +40,10 @@ type Servers struct {
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
+	return startWithWriteTimeout(cfg, readiness, writeTimeout)
+}
+
+func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout time.Duration) (*Servers, error) {
 	if cfg.Listen == "" {
 		return nil, fmt.Errorf("data listener address is empty")
 	}
@@ -68,14 +72,14 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 		dataServer: &http.Server{
 			Handler:           dataHandler,
 			ReadHeaderTimeout: readHeaderTimeout,
-			WriteTimeout:      writeTimeout,
+			WriteTimeout:      serverWriteTimeout,
 			IdleTimeout:       idleTimeout,
 			MaxHeaderBytes:    64 * 1024,
 		},
 		adminServer: &http.Server{
 			Handler:           adminHandler,
 			ReadHeaderTimeout: readHeaderTimeout,
-			WriteTimeout:      writeTimeout,
+			WriteTimeout:      serverWriteTimeout,
 			IdleTimeout:       idleTimeout,
 			MaxHeaderBytes:    64 * 1024,
 		},

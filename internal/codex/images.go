@@ -136,6 +136,9 @@ func (client *ImagesClient) Edit(ctx context.Context, request CodexImageEditRequ
 }
 
 func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n *int) (CodexImageResult, error) {
+	if ctx == nil {
+		return CodexImageResult{}, errors.New("Codex Images context is nil")
+	}
 	operationContext, cancel := codexSSEContext(ctx, client.httpClient.Timeout)
 	defer cancel()
 
