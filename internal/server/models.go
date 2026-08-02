@@ -33,7 +33,10 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
 			return
 		}
-		principal, err := authorizer.AuthorizeHeader(ctx.Request().Context(), headers[0], modelsEndpoint, "")
+		principal, err := authorizer.AuthenticateHeader(ctx.Request().Context(), headers[0])
+		if err == nil {
+			err = authorizer.AuthorizePrincipal(ctx.Request().Context(), principal, modelsEndpoint, "")
+		}
 		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return

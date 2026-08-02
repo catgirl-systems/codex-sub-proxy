@@ -549,6 +549,10 @@ func (e *CodexStreamFailureError) Unwrap() error {
 
 // ParseCodexResponsesSSE parses one Responses SSE body and requires one terminal event.
 func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
+	return parseCodexResponsesSSE(reader, nil)
+}
+
+func parseCodexResponsesSSE(reader io.Reader, onEvent func(CodexResponseStreamEvent) error) (CodexStreamResult, error) {
 	if reader == nil {
 		return CodexStreamResult{}, fmt.Errorf("parse Codex SSE: reader is nil")
 	}
@@ -556,6 +560,13 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 	var decoder codexStreamDecoder
 	stream := bufio.NewReaderSize(reader, maxCodexStreamLineBytes+1)
 	var data bytes.Buffer
+	snapshot := func() CodexStreamResult {
+		return CodexStreamResult{
+			Events:       decoder.events,
+			TerminalType: decoder.terminalType,
+			Response:     decoder.response,
+		}
+	}
 	flush := func() error {
 		if data.Len() == 0 {
 			return nil
@@ -577,6 +588,11 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 			return err
 		}
 		data.Reset()
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	consumeLine := func(line []byte) error {
@@ -604,14 +620,14 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 	for {
 		line, isPrefix, err := stream.ReadLine()
 		if isPrefix || len(line) > maxCodexStreamLineBytes {
-			return CodexStreamResult{}, fmt.Errorf("%w: SSE line is too large", ErrCodexStreamMalformed)
+			return snapshot(), fmt.Errorf("%w: SSE line is too large", ErrCodexStreamMalformed)
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
-			return CodexStreamResult{}, fmt.Errorf("read Codex SSE: %w", err)
+			return snapshot(), fmt.Errorf("read Codex SSE: %w", err)
 		}
 		if len(line) > 0 || err == nil {
 			if consumeErr := consumeLine(line); consumeErr != nil {
-				return CodexStreamResult{}, consumeErr
+				return snapshot(), consumeErr
 			}
 		}
 		if errors.Is(err, io.EOF) {
@@ -619,7 +635,7 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 		}
 	}
 	if err := flush(); err != nil {
-		return CodexStreamResult{}, err
+		return snapshot(), err
 	}
 	return decoder.finish()
 }

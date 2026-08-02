@@ -178,6 +178,130 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 	return state.result, nil
 }
 
+// Stream sends one request and delivers validated events in arrival order.
+func (transport *ResponsesTransport) Stream(ctx context.Context, request CodexResponseRequest, onEvent func(CodexResponseStreamEvent) error) error {
+	if ctx == nil {
+		return errors.New("codex transport context is nil")
+	}
+	if onEvent == nil {
+		return errors.New("codex transport stream callback is nil")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("encode codex Responses request: %w", err)
+	}
+	if len(body) == 0 || len(body) > maxCodexRequestBytes {
+		return fmt.Errorf("%w: request message exceeds limit", ErrCodexStreamMalformed)
+	}
+	var webSocketBody []byte
+	if transport.policy != ResponsesTransportSSE {
+		webSocketBody, err = json.Marshal(codexWebSocketRequest{
+			Type:                 "response.create",
+			CodexResponseRequest: request,
+		})
+		if err != nil {
+			return fmt.Errorf("encode Codex WebSocket request: %w", err)
+		}
+		if len(webSocketBody) == 0 || len(webSocketBody) > maxCodexRequestBytes {
+			return fmt.Errorf("%w: WebSocket request message exceeds limit", ErrCodexStreamMalformed)
+		}
+	}
+
+	var state struct {
+		result CodexStreamResult
+		err    error
+		ready  bool
+	}
+	response, err := transport.refresher.Do(ctx, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
+		headers := transport.headers
+		headers.AccessToken = credential.AccessToken
+		headers.AccountID = credential.AccountID
+		if credential.AccountIsFedRAMP {
+			headers.FedRAMP = true
+		}
+		result, authResponse, attemptErr := transport.streamAttempt(attemptContext, body, webSocketBody, headers, onEvent)
+		if authResponse != nil {
+			return authResponse, nil
+		}
+		state.result = result
+		if attemptErr != nil {
+			state.err = attemptErr
+			if context.Cause(ctx) != nil {
+				return nil, attemptErr
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		}
+		state.ready = true
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	})
+	if err != nil {
+		if response != nil {
+			closeHTTPResponse(response)
+		}
+		if contextErr := context.Cause(ctx); contextErr != nil {
+			return contextErr
+		}
+		return err
+	}
+	if response != nil {
+		closeHTTPResponse(response)
+	}
+	if state.err != nil {
+		return state.err
+	}
+	if !state.ready {
+		return errors.New("codex transport returned no stream")
+	}
+	return nil
+}
+
+func (transport *ResponsesTransport) streamAttempt(ctx context.Context, body, webSocketBody []byte, headers HeaderConfig, onEvent func(CodexResponseStreamEvent) error) (CodexStreamResult, *http.Response, error) {
+	buffer := &codexReplayBuffer{onEvent: onEvent}
+	if transport.policy == ResponsesTransportSSE {
+		return transport.trySSE(ctx, body, headers, buffer.emit)
+	}
+	result, authResponse, err, fallback := transport.tryWebSocket(ctx, webSocketBody, headers, buffer.emit)
+	if authResponse != nil || err == nil {
+		return result, authResponse, err
+	}
+	if contextErr := context.Cause(ctx); contextErr != nil {
+		return CodexStreamResult{}, nil, contextErr
+	}
+	if !fallback || buffer.emitted {
+		return result, nil, err
+	}
+	buffer.discard()
+	sseBuffer := &codexReplayBuffer{onEvent: onEvent}
+	return transport.trySSE(ctx, body, headers, sseBuffer.emit)
+}
+
+type codexReplayBuffer struct {
+	pending []CodexResponseStreamEvent
+	onEvent func(CodexResponseStreamEvent) error
+	emitted bool
+}
+
+func (buffer *codexReplayBuffer) emit(event CodexResponseStreamEvent) error {
+	if !buffer.emitted && codexWebSocketEventReplaySafe(event) {
+		buffer.pending = append(buffer.pending, event)
+		return nil
+	}
+	for _, pending := range buffer.pending {
+		buffer.emitted = true
+		if err := buffer.onEvent(pending); err != nil {
+			buffer.pending = nil
+			return err
+		}
+	}
+	buffer.pending = nil
+	buffer.emitted = true
+	return buffer.onEvent(event)
+}
+
+func (buffer *codexReplayBuffer) discard() {
+	buffer.pending = nil
+}
+
 type transportResultState struct {
 	result CodexStreamResult
 	ready  bool
@@ -185,9 +309,9 @@ type transportResultState struct {
 
 func (transport *ResponsesTransport) attempt(ctx context.Context, body, webSocketBody []byte, headers HeaderConfig) (CodexStreamResult, *http.Response, error) {
 	if transport.policy == ResponsesTransportSSE {
-		return transport.trySSE(ctx, body, headers)
+		return transport.trySSE(ctx, body, headers, nil)
 	}
-	result, authResponse, err, fallback := transport.tryWebSocket(ctx, webSocketBody, headers)
+	result, authResponse, err, fallback := transport.tryWebSocket(ctx, webSocketBody, headers, nil)
 	if authResponse != nil || err == nil {
 		return result, authResponse, err
 	}
@@ -197,10 +321,10 @@ func (transport *ResponsesTransport) attempt(ctx context.Context, body, webSocke
 	if !fallback {
 		return CodexStreamResult{}, nil, err
 	}
-	return transport.trySSE(ctx, body, headers)
+	return transport.trySSE(ctx, body, headers, nil)
 }
 
-func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []byte, headers HeaderConfig) (CodexStreamResult, *http.Response, error, bool) {
+func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []byte, headers HeaderConfig, onEvent func(CodexResponseStreamEvent) error) (CodexStreamResult, *http.Response, error, bool) {
 	attemptContext := ctx
 	cancelAttempt := func() {}
 	if timeout := transport.httpClient.Timeout; timeout > 0 {
@@ -238,7 +362,7 @@ func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []by
 		dialErr, fallback := webSocketDialFailure(transport.httpClient, err)
 		return CodexStreamResult{}, nil, dialErr, fallback
 	}
-	return readCodexWebSocket(ctx, attemptContext, connection, body)
+	return readCodexWebSocketStream(ctx, attemptContext, connection, body, onEvent)
 }
 
 func (transport *ResponsesTransport) webSocketHandshakeFailure(response *http.Response) (CodexStreamResult, *http.Response, error, bool) {
@@ -252,7 +376,7 @@ func (transport *ResponsesTransport) webSocketHandshakeFailure(response *http.Re
 	return CodexStreamResult{}, nil, MapUpstreamError(response.StatusCode, response.Header, body), fallback
 }
 
-func readCodexWebSocket(callerContext, attemptContext context.Context, connection *coderwebsocket.Conn, body []byte) (CodexStreamResult, *http.Response, error, bool) {
+func readCodexWebSocketStream(callerContext, attemptContext context.Context, connection *coderwebsocket.Conn, body []byte, onEvent func(CodexResponseStreamEvent) error) (CodexStreamResult, *http.Response, error, bool) {
 	if connection == nil {
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket connection is nil", ErrCodexTransport), true
 	}
@@ -272,58 +396,67 @@ func readCodexWebSocket(callerContext, attemptContext context.Context, connectio
 	}
 	connection.SetReadLimit(maxCodexStreamLineBytes)
 
-	frames := make([][]byte, 0, 16)
-	aggregateBytes := 0
+	var decoder codexStreamDecoder
 	replayUnsafe := false
+	snapshot := func() CodexStreamResult {
+		return CodexStreamResult{
+			Events:       decoder.events,
+			TerminalType: decoder.terminalType,
+			Response:     decoder.response,
+		}
+	}
 	for {
 		readContext, cancel := context.WithTimeout(attemptContext, codexReadTimeout)
 		messageType, frame, err := connection.Read(readContext)
 		cancel()
 		if err != nil {
 			if contextErr := context.Cause(callerContext); contextErr != nil {
-				return CodexStreamResult{}, nil, contextErr, false
+				return snapshot(), nil, contextErr, false
 			}
 			if contextErr := context.Cause(attemptContext); contextErr != nil {
-				return CodexStreamResult{}, nil, contextErr, false
+				return snapshot(), nil, contextErr, false
 			}
 			if errors.Is(err, coderwebsocket.ErrMessageTooBig) {
-				return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket message exceeds limit", ErrCodexStreamMalformed), false
+				return snapshot(), nil, fmt.Errorf("%w: WebSocket message exceeds limit", ErrCodexStreamMalformed), false
 			}
-			return CodexStreamResult{}, nil, webSocketReadFailure(err), !replayUnsafe && webSocketReadFallback(err)
+			return snapshot(), nil, webSocketReadFailure(err), !replayUnsafe && webSocketReadFallback(err)
 		}
 		if messageType != coderwebsocket.MessageText && messageType != coderwebsocket.MessageBinary {
-			return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket message type is invalid", ErrCodexStreamMalformed), false
+			return snapshot(), nil, fmt.Errorf("%w: WebSocket message type is invalid", ErrCodexStreamMalformed), false
 		}
 		if len(frame) == 0 || len(frame) > maxCodexStreamLineBytes {
-			return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket message size is invalid", ErrCodexStreamMalformed), false
+			return snapshot(), nil, fmt.Errorf("%w: WebSocket message size is invalid", ErrCodexStreamMalformed), false
 		}
-		if len(frames) >= maxCodexStreamEvents || aggregateBytes > maxCodexStreamPayloadBytes-len(frame) {
-			return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket aggregate limit exceeded", ErrCodexStreamMalformed), false
+		if err := decoder.reservePayload(len(frame)); err != nil {
+			return snapshot(), nil, err, false
 		}
 		event, errorResponse, err := decodeCodexWebSocketMessage(frame)
 		if err != nil {
-			return CodexStreamResult{}, nil, err, false
+			return snapshot(), nil, err, false
 		}
 		if errorResponse != nil {
 			if errorResponse.StatusCode == http.StatusUnauthorized && !replayUnsafe {
-				return CodexStreamResult{}, errorResponse, nil, false
+				return snapshot(), errorResponse, nil, false
 			}
 			if replayUnsafe {
-				return CodexStreamResult{}, nil, mapHTTPResponseError(errorResponse), false
+				return snapshot(), nil, mapHTTPResponseError(errorResponse), false
 			}
-			return CodexStreamResult{}, errorResponse, nil, false
+			return snapshot(), errorResponse, nil, false
 		}
-		frames = append(frames, frame)
-		aggregateBytes += len(frame)
 		if !codexWebSocketEventReplaySafe(event) {
 			replayUnsafe = true
 		}
-		if isCodexTerminalEvent(event.Type) {
-			result, parseErr := ParseCodexWebSocketFrames(frames)
-			if parseErr != nil {
-				return result, nil, parseErr, false
+		if err := decoder.add(event); err != nil {
+			return snapshot(), nil, err, false
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return snapshot(), nil, err, false
 			}
-			return result, nil, nil, false
+		}
+		if isCodexTerminalEvent(event.Type) {
+			result, finishErr := decoder.finish()
+			return result, nil, finishErr, false
 		}
 	}
 }
@@ -547,7 +680,7 @@ func webSocketDialFailure(client *http.Client, err error) (error, bool) {
 	return fmt.Errorf("%w: WebSocket dial failed", ErrCodexTransport), true
 }
 
-func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, headers HeaderConfig) (CodexStreamResult, *http.Response, error) {
+func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, headers HeaderConfig, onEvent func(CodexResponseStreamEvent) error) (CodexStreamResult, *http.Response, error) {
 	requestContext, cancel := codexSSEContext(ctx, transport.httpClient.Timeout)
 	defer cancel()
 	request, err := NewRequest(requestContext, http.MethodPost, transport.responsesURL, bytes.NewReader(body), headers)
@@ -590,7 +723,7 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 		reader:    &codexContextReader{ctx: requestContext, reader: response.Body},
 		remaining: maxCodexStreamPayloadBytes + 1,
 	}
-	result, err := ParseCodexResponsesSSE(bounded)
+	result, err := parseCodexResponsesSSE(bounded, onEvent)
 	if err != nil {
 		if errors.Is(err, errCodexAggregateLimit) {
 			return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE aggregate limit exceeded", ErrCodexStreamMalformed)

@@ -101,6 +101,126 @@ func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 		t.Fatal("WebSocket request was not received")
 	}
 }
+func TestResponsesTransportStreamDeliversIncrementally(t *testing.T) {
+	firstEvent := []byte("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"delta\":\"first\"}\n\n")
+	terminalEvent := []byte("data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	firstReceived := make(chan struct{})
+	release := make(chan struct{})
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		flusher, ok := writer.(http.Flusher)
+		if !ok {
+			return
+		}
+		_, _ = writer.Write(firstEvent)
+		flusher.Flush()
+		close(firstReceived)
+		<-release
+		_, _ = writer.Write(terminalEvent)
+		flusher.Flush()
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+	events := make(chan CodexResponseStreamEvent, 2)
+	errorsReturned := make(chan error, 1)
+	go func() {
+		errorsReturned <- transport.Stream(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}, func(event CodexResponseStreamEvent) error {
+			events <- event
+			return nil
+		})
+	}()
+	select {
+	case <-firstReceived:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush first event")
+	}
+	select {
+	case event := <-events:
+		if event.Type != CodexEventResponseOutputTextDelta || event.Delta != "first" {
+			t.Fatalf("first event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first event was not delivered incrementally")
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("terminal event arrived before release: %#v", event)
+	default:
+	}
+	close(release)
+	select {
+	case event := <-events:
+		if event.Type != CodexEventResponseCompleted {
+			t.Fatalf("terminal event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal event was not delivered")
+	}
+	select {
+	case err := <-errorsReturned:
+		if err != nil {
+			t.Fatalf("transport.Stream: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transport.Stream did not finish")
+	}
+}
+func TestResponsesTransportStreamFallbackDiscardsReplayPreamble(t *testing.T) {
+	var sseRequests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			connection, err := transportUpgrader.Upgrade(writer, request, nil)
+			if err != nil {
+				return
+			}
+			defer connection.CloseNow()
+			if _, _, err := connection.Read(context.Background()); err != nil {
+				return
+			}
+			_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.created","sequence_number":0,"response":{"status":"in_progress"}}`))
+			_ = connection.Close(coderwebsocket.StatusNormalClosure, "")
+			return
+		}
+		sseRequests.Add(1)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write(transportSSEFixture(t))
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+	events := make(chan CodexResponseStreamEvent, maxCodexStreamEvents)
+	err := transport.Stream(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}, func(event CodexResponseStreamEvent) error {
+		events <- event
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("transport.Stream: %v", err)
+	}
+	if sseRequests.Load() != 1 {
+		t.Fatalf("SSE requests = %d, want 1", sseRequests.Load())
+	}
+	createdCount := 0
+	terminalCount := 0
+	for {
+		select {
+		case event := <-events:
+			if event.Type == CodexEventResponseCreated {
+				createdCount++
+			}
+			if isCodexTerminalEvent(event.Type) {
+				terminalCount++
+			}
+		default:
+			if createdCount != 1 || terminalCount != 1 {
+				t.Fatalf("created = %d, terminal = %d", createdCount, terminalCount)
+			}
+			return
+		}
+	}
+}
 
 func TestResponsesTransportFallsBackOnUnsupportedWebSocket(t *testing.T) {
 	var sseRequests atomic.Int32

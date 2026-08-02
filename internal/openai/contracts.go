@@ -35,17 +35,22 @@ const (
 
 // ResponseRequest is the public OpenAI Responses request body.
 type ResponseRequest struct {
-	Model              string           `json:"model" validate:"required,max=256"`
-	Input              *Input           `json:"input,omitempty"`
-	Instructions       string           `json:"instructions,omitempty"`
-	Tools              []Tool           `json:"tools,omitempty"`
-	ToolChoice         *ToolChoice      `json:"tool_choice,omitempty"`
-	Store              *bool            `json:"store,omitempty"`
-	Stream             bool             `json:"stream,omitempty"`
-	ParallelToolCalls  *bool            `json:"parallel_tool_calls,omitempty"`
-	PreviousResponseID string           `json:"previous_response_id,omitempty"`
-	Reasoning          *ReasoningConfig `json:"reasoning,omitempty"`
-	Text               *TextConfig      `json:"text,omitempty"`
+	Model              string            `json:"model" validate:"required,max=256"`
+	Input              *Input            `json:"input,omitempty"`
+	Instructions       string            `json:"instructions,omitempty" validate:"max=65536"`
+	Tools              []Tool            `json:"tools,omitempty" validate:"max=128"`
+	ToolChoice         *ToolChoice       `json:"tool_choice,omitempty"`
+	Store              *bool             `json:"store,omitempty"`
+	Stream             bool              `json:"stream,omitempty"`
+	ParallelToolCalls  *bool             `json:"parallel_tool_calls,omitempty"`
+	PreviousResponseID string            `json:"previous_response_id,omitempty" validate:"max=256"`
+	Reasoning          *ReasoningConfig  `json:"reasoning,omitempty"`
+	Text               *TextConfig       `json:"text,omitempty"`
+	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty" validate:"omitempty,min=1"`
+	Include            []string          `json:"include,omitempty" validate:"max=64,dive,max=128"`
+	Metadata           map[string]string `json:"metadata,omitempty" validate:"max=16,dive,keys,max=64,endkeys,max=512"`
+	PromptCacheKey     string            `json:"prompt_cache_key,omitempty" validate:"max=512"`
+	ServiceTier        string            `json:"service_tier,omitempty" validate:"omitempty,oneof=auto default flex scale priority"`
 }
 
 func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
@@ -58,7 +63,9 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 	}{
 		responseRequest: (*responseRequest)(request),
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
 		return err
 	}
 	if wire.Input != nil {
@@ -330,6 +337,15 @@ type ResponseStreamEvent struct {
 	SummaryIndex      int             `json:"summary_index"`
 	PartialImageB64   string          `json:"partial_image_b64,omitempty"`
 	PartialImageIndex int             `json:"partial_image_index"`
+}
+
+// ResponseErrorEvent is the safe public stream error event shape.
+type ResponseErrorEvent struct {
+	Type           string `json:"type"`
+	Code           string `json:"code"`
+	Message        string `json:"message"`
+	Param          string `json:"param"`
+	SequenceNumber int    `json:"sequence_number"`
 }
 
 // Usage records public token counts.

@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
@@ -30,9 +31,21 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		request := ctx.Request()
+		requestContext := request.Context()
 		if request.Method != http.MethodPost {
 			ctx.Header("Allow", http.MethodPost)
 			writeResponsesError(ctx, http.StatusMethodNotAllowed, responsesErrorType, "method_not_allowed", "Only POST is allowed for this endpoint.")
+			return
+		}
+
+		headers := request.Header.Values("Authorization")
+		if len(headers) != 1 {
+			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
+			return
+		}
+		principal, err := authorizer.AuthenticateHeader(requestContext, headers[0])
+		if err != nil {
+			writeAPIKeyError(ctx, err)
 			return
 		}
 
@@ -50,6 +63,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 		defer request.Body.Close()
 		var publicRequest openai.ResponseRequest
 		decoder := json.NewDecoder(request.Body)
+		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&publicRequest); err != nil {
 			writeResponsesDecodeError(ctx, err, "Request body is not valid JSON.")
 			return
@@ -67,14 +81,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
-
-		requestContext := request.Context()
-		headers := request.Header.Values("Authorization")
-		if len(headers) != 1 {
-			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
-			return
-		}
-		if _, err := authorizer.AuthorizeHeader(requestContext, headers[0], responsesEndpoint, publicRequest.Model); err != nil {
+		if err := authorizer.AuthorizePrincipal(requestContext, principal, responsesEndpoint, publicRequest.Model); err != nil {
 			writeAPIKeyError(ctx, err)
 			return
 		}
@@ -88,20 +95,12 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 
-		result, err := transport.Do(requestContext, privateRequest)
 		if publicRequest.Stream {
-			if err != nil && len(result.Events) == 0 && result.Response == nil {
-				if requestContext.Err() != nil {
-					return
-				}
-				status, responseError := responsesError(err)
-				writeResponsesError(ctx, status, responseError.Type, responseError.Code, responseError.Message)
-				return
-			}
-			serveResponsesStream(ctx, requestContext, result, err)
+			serveResponsesStream(ctx, requestContext, transport, privateRequest)
 			return
 		}
-		if err != nil {
+		result, err := transport.Do(requestContext, privateRequest)
+		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
 				return
 			}
@@ -118,7 +117,6 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 		if len(payload) > maxResponsesJSONBytes {
-
 			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_response_too_large", "The upstream response is too large.")
 			return
 		}
@@ -139,67 +137,182 @@ func writeResponsesDecodeError(ctx iris.Context, err error, message string) {
 }
 
 func privateResponseRequest(publicRequest openai.ResponseRequest) (codex.CodexResponseRequest, error) {
-	encoded, err := json.Marshal(publicRequest)
+	privateRequest := codex.CodexResponseRequest{
+		Model:              publicRequest.Model,
+		Instructions:       publicRequest.Instructions,
+		Store:              publicRequest.Store,
+		Stream:             true,
+		ParallelToolCalls:  publicRequest.ParallelToolCalls,
+		ClientMetadata:     publicRequest.Metadata,
+		Include:            append([]string(nil), publicRequest.Include...),
+		PreviousResponseID: publicRequest.PreviousResponseID,
+		PromptCacheKey:     publicRequest.PromptCacheKey,
+		ServiceTier:        publicRequest.ServiceTier,
+	}
+	if publicRequest.MaxOutputTokens != nil {
+		privateRequest.MaxOutputTokens = *publicRequest.MaxOutputTokens
+	}
+	var err error
+	privateRequest.Input, err = privateInput(publicRequest.Input)
 	if err != nil {
-		return codex.CodexResponseRequest{}, fmt.Errorf("encode public Responses request: %w", err)
+		return codex.CodexResponseRequest{}, err
 	}
-	if len(encoded) == 0 || len(encoded) > maxResponsesBodyBytes {
-		return codex.CodexResponseRequest{}, errors.New("public Responses request exceeds limit")
+	privateRequest.Tools, err = privateTools(publicRequest.Tools)
+	if err != nil {
+		return codex.CodexResponseRequest{}, err
 	}
-	var privateRequest codex.CodexResponseRequest
-	if err := json.Unmarshal(encoded, &privateRequest); err != nil {
-		return codex.CodexResponseRequest{}, fmt.Errorf("decode private Responses request: %w", err)
+	privateRequest.ToolChoice, err = privateToolChoice(publicRequest.ToolChoice)
+	if err != nil {
+		return codex.CodexResponseRequest{}, err
 	}
-	privateRequest.Stream = true
+	privateRequest.Reasoning = privateReasoning(publicRequest.Reasoning)
+	privateRequest.Text = privateText(publicRequest.Text)
 	return privateRequest, nil
 }
 
-func serveResponsesStream(ctx iris.Context, requestContext context.Context, result codex.CodexStreamResult, streamErr error) {
+func privateInput(input *openai.Input) (*codex.CodexInput, error) {
+	if input == nil {
+		return nil, nil
+	}
+	switch {
+	case input.String != nil && input.Items == nil:
+		value := *input.String
+		return &codex.CodexInput{String: &value}, nil
+	case input.String == nil && input.Items != nil:
+		items := make([]codex.CodexInputItem, 0, len(input.Items))
+		for _, item := range input.Items {
+			arguments, err := json.Marshal(item.Arguments)
+			if err != nil {
+				return nil, fmt.Errorf("encode private input arguments: %w", err)
+			}
+			items = append(items, codex.CodexInputItem{
+				Type:      item.Type,
+				Role:      item.Role,
+				Content:   append(json.RawMessage(nil), item.Content...),
+				ID:        item.ID,
+				CallID:    item.CallID,
+				Name:      item.Name,
+				Arguments: arguments,
+				Output:    append(json.RawMessage(nil), item.Output...),
+			})
+		}
+		return &codex.CodexInput{Items: items}, nil
+	default:
+		return nil, errors.New("public input must contain exactly one variant")
+	}
+}
+
+func privateTools(tools []openai.Tool) ([]codex.CodexTool, error) {
+	if tools == nil {
+		return nil, nil
+	}
+	result := make([]codex.CodexTool, 0, len(tools))
+	for _, tool := range tools {
+		var mask *codex.CodexInputImageMask
+		if tool.InputImageMask != nil {
+			mask = &codex.CodexInputImageMask{FileID: tool.InputImageMask.FileID, ImageURL: tool.InputImageMask.ImageURL}
+		}
+		result = append(result, codex.CodexTool{
+			Type:              tool.Type,
+			Name:              tool.Name,
+			Description:       tool.Description,
+			Strict:            tool.Strict,
+			Parameters:        append(json.RawMessage(nil), tool.Parameters...),
+			Action:            tool.Action,
+			Background:        tool.Background,
+			InputFidelity:     tool.InputFidelity,
+			InputImageMask:    mask,
+			Model:             tool.Model,
+			Moderation:        tool.Moderation,
+			OutputCompression: tool.OutputCompression,
+			OutputFormat:      tool.OutputFormat,
+			PartialImages:     tool.PartialImages,
+			Quality:           tool.Quality,
+			Size:              tool.Size,
+		})
+	}
+	return result, nil
+}
+
+func privateToolChoice(choice *openai.ToolChoice) (*codex.CodexToolChoice, error) {
+	if choice == nil {
+		return nil, nil
+	}
+	switch {
+	case choice.String != nil && choice.Type == "" && choice.Name == "":
+		value := *choice.String
+		return &codex.CodexToolChoice{String: &value}, nil
+	case choice.String == nil && choice.Type != "":
+		return &codex.CodexToolChoice{Type: choice.Type, Name: choice.Name}, nil
+	default:
+		return nil, errors.New("public tool choice contains exactly one variant")
+	}
+}
+
+func privateReasoning(reasoning *openai.ReasoningConfig) *codex.CodexReasoningConfig {
+	if reasoning == nil {
+		return nil
+	}
+	return &codex.CodexReasoningConfig{Effort: reasoning.Effort, Summary: reasoning.Summary}
+}
+
+func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
+	if text == nil {
+		return nil
+	}
+	return &codex.CodexTextConfig{Verbosity: text.Verbosity}
+}
+
+func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest) {
 	writer := ctx.ResponseWriter()
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
 	writer.Header().Set("X-Accel-Buffering", "no")
-	writer.WriteHeader(http.StatusOK)
-
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		return
 	}
+	writer.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	if err := http.NewResponseController(writer.Naive()).SetWriteDeadline(time.Time{}); err != nil {
+		return
+	}
+
 	terminalWritten := false
-	for _, event := range result.Events {
+	lastSequence := -1
+	streamErr := transport.Stream(requestContext, privateRequest, func(event codex.CodexResponseStreamEvent) error {
 		if requestContext.Err() != nil {
-			return
+			return requestContext.Err()
 		}
-		terminalEvent := isCodexTerminal(event.Type)
-		if terminalEvent && terminalWritten {
-			return
+		if event.SequenceNumber > lastSequence {
+			lastSequence = event.SequenceNumber
 		}
 		payload, keep, err := publicEventPayload(event)
 		if err != nil {
-			streamErr = err
-			break
+			return err
 		}
 		if !keep {
-			continue
+			return nil
 		}
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
-			return
+			return err
 		}
-		if terminalEvent {
+		if isCodexTerminal(event.Type) {
 			terminalWritten = true
 		}
+		return nil
+	})
+	if requestContext.Err() != nil {
+		return
 	}
-
 	if !terminalWritten {
-		if requestContext.Err() != nil {
-			return
-		}
-		sequenceNumber := nextSequenceNumber(result.Events)
-		errorEvent := openai.ResponseStreamEvent{
+		_, responseError := responsesError(streamErr)
+		errorEvent := openai.ResponseErrorEvent{
 			Type:           openai.EventError,
-			SequenceNumber: sequenceNumber,
-			Error:          responsesErrorValue(streamErr),
+			Code:           responseError.Code,
+			Message:        responseError.Message,
+			SequenceNumber: lastSequence + 1,
 		}
 		payload, err := json.Marshal(errorEvent)
 		if err != nil || len(payload) > maxResponsesEventBytes {
@@ -234,13 +347,6 @@ func writeResponsesSSERecord(writer http.ResponseWriter, flusher http.Flusher, p
 	return nil
 }
 
-func nextSequenceNumber(events []codex.CodexResponseStreamEvent) int {
-	if len(events) == 0 {
-		return 0
-	}
-	return events[len(events)-1].SequenceNumber + 1
-}
-
 func isCodexTerminal(eventType string) bool {
 	switch eventType {
 	case codex.CodexEventResponseCompleted, codex.CodexEventResponseDone,
@@ -255,6 +361,25 @@ func isCodexTerminal(eventType string) bool {
 func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, error) {
 	if event.Type == codex.CodexEventResponseMetadata {
 		return nil, false, nil
+	}
+	if event.Type == codex.CodexEventResponseDone {
+		event.Type = codex.CodexEventResponseCompleted
+		event.Raw = normalizeCompletedEvent(event.Raw)
+	}
+	if event.Type == codex.CodexEventError {
+		payload, err := json.Marshal(openai.ResponseErrorEvent{
+			Type:           openai.EventError,
+			Code:           "upstream_error",
+			Message:        "The upstream service returned an error.",
+			SequenceNumber: event.SequenceNumber,
+		})
+		if err != nil {
+			return nil, false, fmt.Errorf("encode public Responses error event: %w", err)
+		}
+		if len(payload) > maxResponsesEventBytes {
+			return nil, false, errors.New("public Responses error event exceeds limit")
+		}
+		return payload, true, nil
 	}
 	if len(event.Raw) != 0 && rawPublicEvent(event.Raw, event.Type) {
 		payload := bytes.TrimSpace(event.Raw)
@@ -287,12 +412,6 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		PartialImageB64:   event.PartialImageB64,
 		PartialImageIndex: event.PartialImageIndex,
 	}
-	if event.Error != nil {
-		publicEvent.Error = publicErrorFromCodex(event.Error)
-	}
-	if publicEvent.Type == openai.EventError && publicEvent.Error == nil {
-		publicEvent.Error = &openai.Error{Type: responsesServerErrorType, Code: "upstream_error", Message: "The upstream service returned an error."}
-	}
 	payload, err := json.Marshal(publicEvent)
 	if err != nil {
 		return nil, false, fmt.Errorf("encode public Responses event: %w", err)
@@ -301,6 +420,22 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		return nil, false, errors.New("public Responses event exceeds limit")
 	}
 	return payload, true, nil
+}
+
+func normalizeCompletedEvent(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil
+	}
+	fields["type"] = json.RawMessage(`"response.completed"`)
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil
+	}
+	return encoded
 }
 
 func rawPublicEvent(raw []byte, eventType string) bool {
@@ -587,11 +722,6 @@ func responsesError(err error) (int, openai.Error) {
 		return http.StatusBadGateway, openai.Error{Type: responsesServerErrorType, Code: "upstream_protocol_error", Message: "The upstream service returned an invalid response."}
 	}
 	return http.StatusBadGateway, openai.Error{Type: responsesServerErrorType, Code: "upstream_error", Message: "The upstream service is unavailable."}
-}
-
-func responsesErrorValue(err error) *openai.Error {
-	_, value := responsesError(err)
-	return &value
 }
 
 func responsesErrorTypeForCategory(category codex.ErrorCategory) string {

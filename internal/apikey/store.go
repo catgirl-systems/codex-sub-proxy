@@ -77,10 +77,10 @@ func NewAuthorizer(db *gorm.DB, hmacKey []byte) *Authorizer {
 	return &Authorizer{db: db, hmacKey: append([]byte(nil), hmacKey...)}
 }
 
-// AuthorizeHeader parses one exact Bearer value and checks endpoint and model policy.
-func (a *Authorizer) AuthorizeHeader(ctx context.Context, header string, endpoint, model string) (Principal, error) {
+// AuthenticateHeader parses one exact Bearer value without granting policy access.
+func (a *Authorizer) AuthenticateHeader(ctx context.Context, header string) (Principal, error) {
 	if a == nil {
-		return Principal{}, fmt.Errorf("authorize API key: %w", ErrUnavailable)
+		return Principal{}, fmt.Errorf("authenticate API key header: %w", ErrUnavailable)
 	}
 	if len(header) > MaxAuthorizationHeaderSize || !strings.HasPrefix(header, "Bearer ") {
 		return Principal{}, ErrInvalidKey
@@ -89,20 +89,25 @@ func (a *Authorizer) AuthorizeHeader(ctx context.Context, header string, endpoin
 	if strings.ContainsAny(rawKey, " \t\r\n") {
 		return Principal{}, ErrInvalidKey
 	}
-	return a.Authorize(ctx, rawKey, endpoint, model)
+	return a.Authenticate(ctx, rawKey)
 }
 
-// Authorize authenticates a key and checks endpoint and model policy.
-func (a *Authorizer) Authorize(ctx context.Context, rawKey, endpoint, model string) (Principal, error) {
-	principal, err := a.Authenticate(ctx, rawKey)
-	if err != nil {
-		return Principal{}, err
+// AuthorizePrincipal applies endpoint and model policy and records successful use.
+func (a *Authorizer) AuthorizePrincipal(ctx context.Context, principal Principal, endpoint, model string) error {
+	if a == nil {
+		return fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
+	}
+	if ctx == nil {
+		return errors.New("API key context is nil")
+	}
+	if a.db == nil {
+		return fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
 	}
 	if !contains(principal.AllowedEndpoints, endpoint) {
-		return Principal{}, ErrForbidden
+		return ErrForbidden
 	}
 	if model != "" && !contains(principal.AllowedModels, model) {
-		return Principal{}, ErrForbidden
+		return ErrForbidden
 	}
 	now := time.Now().UTC()
 	result := a.db.WithContext(ctx).Model(&Record{}).
@@ -113,10 +118,34 @@ func (a *Authorizer) Authorize(ctx context.Context, rawKey, endpoint, model stri
 			now,
 		))
 	if result.Error != nil {
-		return Principal{}, fmt.Errorf("update API key last used time: %w", result.Error)
+		return fmt.Errorf("update API key last used time: %w", result.Error)
 	}
 	if result.RowsAffected != 1 {
-		return Principal{}, ErrInvalidKey
+		return ErrInvalidKey
+	}
+	return nil
+}
+
+// AuthorizeHeader authenticates a Bearer value and applies endpoint/model policy.
+func (a *Authorizer) AuthorizeHeader(ctx context.Context, header string, endpoint, model string) (Principal, error) {
+	principal, err := a.AuthenticateHeader(ctx, header)
+	if err != nil {
+		return Principal{}, err
+	}
+	if err := a.AuthorizePrincipal(ctx, principal, endpoint, model); err != nil {
+		return Principal{}, err
+	}
+	return principal, nil
+}
+
+// Authorize authenticates a key and applies endpoint/model policy.
+func (a *Authorizer) Authorize(ctx context.Context, rawKey, endpoint, model string) (Principal, error) {
+	principal, err := a.Authenticate(ctx, rawKey)
+	if err != nil {
+		return Principal{}, err
+	}
+	if err := a.AuthorizePrincipal(ctx, principal, endpoint, model); err != nil {
+		return Principal{}, err
 	}
 	return principal, nil
 }

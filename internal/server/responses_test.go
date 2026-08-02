@@ -68,6 +68,59 @@ func TestResponsesJSONPreservesImageAndUsage(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
 	}
 }
+func TestResponsesSupportedFieldsReachCodexAndUnknownFieldsReject(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamCalls atomic.Int32
+	var upstreamBody atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			t.Errorf("read upstream body: %v", readErr)
+		}
+		upstreamBody.Store(append([]byte(nil), body...))
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	requestBody := `{"model":"gpt-5.6-sol","stream":false,"max_output_tokens":123,"include":["reasoning.encrypted_content"],"metadata":{"trace":"fixture"},"prompt_cache_key":"fixture-cache","service_tier":"priority"}`
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, requestBody, "application/json")
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("supported fields status = %d", response.StatusCode)
+	}
+	privateBody, ok := upstreamBody.Load().([]byte)
+	if !ok {
+		t.Fatal("upstream request body was not captured")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(privateBody, &fields); err != nil {
+		t.Fatalf("decode private request: %v", err)
+	}
+	for _, name := range []string{"max_output_tokens", "include", "client_metadata", "prompt_cache_key", "service_tier"} {
+		if _, found := fields[name]; !found {
+			t.Fatalf("private request omitted %s: %s", name, privateBody)
+		}
+	}
+	if _, found := fields["metadata"]; found {
+		t.Fatalf("private request used unsupported metadata field: %s", privateBody)
+	}
+
+	response = doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","unknown_field":true}`, "application/json")
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown field status = %d", response.StatusCode)
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls after unknown field = %d", upstreamCalls.Load())
+	}
+}
 
 func TestResponsesSSEFramesOnceAndOmitsPrivateMetadata(t *testing.T) {
 	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
@@ -222,15 +275,33 @@ func TestResponsesCancellationCancelsUpstream(t *testing.T) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+rawKey)
-	client := &http.Client{Timeout: time.Second}
-	done := make(chan error, 1)
+	client := &http.Client{Timeout: 5 * time.Second}
+	type clientResult struct {
+		response *http.Response
+		err      error
+	}
+	resultCh := make(chan clientResult, 1)
 	go func() {
 		response, requestErr := client.Do(request)
-		if response != nil {
-			response.Body.Close()
-		}
-		done <- requestErr
+		resultCh <- clientResult{response: response, err: requestErr}
 	}()
+	var response *http.Response
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		response = result.response
+	case <-time.After(time.Second):
+		t.Fatal("downstream response headers were not flushed")
+	}
+	if response == nil {
+		t.Fatal("downstream response is nil")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status = %d, content type = %q", response.StatusCode, response.Header.Get("Content-Type"))
+	}
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -242,10 +313,75 @@ func TestResponsesCancellationCancelsUpstream(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("upstream request was not cancelled")
 	}
+	body, _ := io.ReadAll(response.Body)
+	if len(body) != 0 {
+		t.Fatalf("downstream wrote after disconnect: %s", body)
+	}
+}
+func TestResponsesSSEFirstEventSurvivesWriteTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		flusher, ok := writer.(http.Flusher)
+		if !ok {
+			return
+		}
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"delta\":\"first\"}\n\n")
+		flusher.Flush()
+		time.Sleep(11 * time.Second)
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+responsesEndpoint, strings.NewReader(`{"model":"gpt-5.6-sol","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	firstLine := make(chan string, 1)
+	streamDone := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(response.Body)
+		sentFirst := false
+		for scanner.Scan() {
+			if !sentFirst && strings.HasPrefix(scanner.Text(), "data: ") {
+				firstLine <- scanner.Text()
+				sentFirst = true
+			}
+			if scanner.Text() == "data: [DONE]" {
+				streamDone <- nil
+				return
+			}
+		}
+		streamDone <- scanner.Err()
+	}()
 	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("downstream request did not finish")
+	case line := <-firstLine:
+		if !strings.Contains(line, `"delta":"first"`) {
+			t.Fatalf("first SSE line = %s", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first SSE event did not arrive promptly")
+	}
+	select {
+	case err := <-streamDone:
+		if err != nil {
+			t.Fatalf("read SSE stream: %v", err)
+		}
+	case <-time.After(13 * time.Second):
+		t.Fatal("SSE stream did not survive write timeout")
 	}
 }
 
