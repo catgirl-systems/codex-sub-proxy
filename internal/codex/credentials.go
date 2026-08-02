@@ -2,9 +2,6 @@ package codex
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,15 +17,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 const (
-	maxCredentialFileBytes = 1 << 20
+	maxCredentialJSONBytes = 1 << 20
+	maxCredentialFileBytes = envelope.MaxEnvelopeSize
 	maxTokenBytes          = 64 << 10
-	credentialFormat       = "csp-credential"
-	credentialVersion      = 1
 )
 
 // Credential contains Codex OAuth material and its non-secret identity.
@@ -43,13 +40,6 @@ type Credential struct {
 	PlanType         string    `json:"plan_type"`
 	AccountIsFedRAMP bool      `json:"account_is_fedramp"`
 	Email            string    `json:"email,omitempty"`
-}
-
-type encryptedCredential struct {
-	Format     string `json:"format"`
-	Version    int    `json:"version"`
-	Nonce      string `json:"nonce"`
-	Ciphertext string `json:"ciphertext"`
 }
 
 type codexAuthFile struct {
@@ -112,79 +102,33 @@ type standardClaims struct {
 	ExpiresAt int64 `json:"exp"`
 }
 
-// EncryptCredential returns a versioned AES-GCM envelope.
-func EncryptCredential(credential Credential, key []byte) ([]byte, error) {
-	if err := validateCredential(credential, false); err != nil {
+// EncryptCredential returns a versioned authenticated credential envelope.
+func EncryptCredential(credential Credential, keys envelope.KeySet) ([]byte, error) {
+	if err := keys.Validate(); err != nil {
 		return nil, err
 	}
-	if len(key) == 0 {
-		return nil, errors.New("credential encryption key is empty")
+	if err := validateCredential(credential, false); err != nil {
+		return nil, err
 	}
 	plain, err := json.Marshal(credential)
 	if err != nil {
 		return nil, fmt.Errorf("encode credential: %w", err)
 	}
-	block, err := newCipher(key)
+	encoded, err := envelope.Encrypt(plain, envelope.CredentialDomain, keys)
 	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, block.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("generate credential nonce: %w", err)
-	}
-	ciphertext := block.Seal(nil, nonce, plain, nil)
-	envelope := encryptedCredential{
-		Format:     credentialFormat,
-		Version:    credentialVersion,
-		Nonce:      base64.RawStdEncoding.EncodeToString(nonce),
-		Ciphertext: base64.RawStdEncoding.EncodeToString(ciphertext),
-	}
-	encoded, err := json.Marshal(envelope)
-	if err != nil {
-		return nil, fmt.Errorf("encode encrypted credential: %w", err)
+		return nil, fmt.Errorf("encrypt credential: %w", err)
 	}
 	return encoded, nil
 }
 
 // DecryptCredential opens a credential envelope written by SaveCredential.
-func DecryptCredential(data, key []byte) (Credential, error) {
-	if len(data) == 0 {
-		return Credential{}, errors.New("encrypted credential is empty")
-	}
-	if len(data) > maxCredentialFileBytes {
-		return Credential{}, errors.New("encrypted credential is too large")
-	}
-	if len(key) == 0 {
-		return Credential{}, errors.New("credential encryption key is empty")
-	}
-	var envelope encryptedCredential
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return Credential{}, errors.New("decode encrypted credential")
-	}
-	if envelope.Format != credentialFormat || envelope.Version != credentialVersion {
-		return Credential{}, errors.New("unsupported encrypted credential format")
-	}
-	nonce, err := base64.RawStdEncoding.DecodeString(envelope.Nonce)
-	if err != nil {
-		return Credential{}, errors.New("decode encrypted credential nonce")
-	}
-	ciphertext, err := base64.RawStdEncoding.DecodeString(envelope.Ciphertext)
-	if err != nil {
-		return Credential{}, errors.New("decode encrypted credential payload")
-	}
-	block, err := newCipher(key)
-	if err != nil {
+func DecryptCredential(data []byte, keys envelope.KeySet) (Credential, error) {
+	if err := keys.Validate(); err != nil {
 		return Credential{}, err
 	}
-	if len(nonce) != block.NonceSize() {
-		return Credential{}, errors.New("invalid encrypted credential nonce")
-	}
-	plain, err := block.Open(nil, nonce, ciphertext, nil)
+	plain, err := envelope.Decrypt(data, envelope.CredentialDomain, keys)
 	if err != nil {
-		return Credential{}, errors.New("decrypt credential")
-	}
-	if len(plain) > maxCredentialFileBytes {
-		return Credential{}, errors.New("decrypted credential is too large")
+		return Credential{}, fmt.Errorf("decrypt credential: %w", err)
 	}
 	var credential Credential
 	if err := json.Unmarshal(plain, &credential); err != nil {
@@ -197,15 +141,18 @@ func DecryptCredential(data, key []byte) (Credential, error) {
 }
 
 // SaveCredential writes an encrypted credential with private-file permissions.
-func SaveCredential(path string, credential Credential, key []byte) error {
+func SaveCredential(path string, credential Credential, keys envelope.KeySet) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return errors.New("credential path is empty")
 	}
+	if err := keys.Validate(); err != nil {
+		return err
+	}
 	if err := validateCredential(credential, false); err != nil {
 		return err
 	}
-	encoded, err := EncryptCredential(credential, key)
+	encoded, err := EncryptCredential(credential, keys)
 	if err != nil {
 		return err
 	}
@@ -263,17 +210,20 @@ func SaveCredential(path string, credential Credential, key []byte) error {
 }
 
 // LoadCredential reads and decrypts a credential without exposing token bytes.
-func LoadCredential(path string, key []byte) (Credential, error) {
+func LoadCredential(path string, keys envelope.KeySet) (Credential, error) {
+	if err := keys.Validate(); err != nil {
+		return Credential{}, err
+	}
 	data, err := readRegularFile(path, maxCredentialFileBytes)
 	if err != nil {
 		return Credential{}, err
 	}
-	return DecryptCredential(data, key)
+	return DecryptCredential(data, keys)
 }
 
 // CredentialAvailable reports whether path contains a usable encrypted credential.
-func CredentialAvailable(path string, key []byte) bool {
-	credential, err := LoadCredential(path, key)
+func CredentialAvailable(path string, keys envelope.KeySet) bool {
+	credential, err := LoadCredential(path, keys)
 	if err != nil ||
 		strings.TrimSpace(credential.AccessToken) == "" ||
 		strings.TrimSpace(credential.RefreshToken) == "" ||
@@ -285,9 +235,12 @@ func CredentialAvailable(path string, key []byte) bool {
 
 // ImportCredential reads a Codex auth.json, a Codex keyring home, or an OMP
 // agent database and writes a new encrypted credential. The source is read only.
-func ImportCredential(ctx context.Context, sourcePath, destinationPath string, key []byte) (Credential, error) {
+func ImportCredential(ctx context.Context, sourcePath, destinationPath string, keys envelope.KeySet) (Credential, error) {
 	if ctx == nil {
 		return Credential{}, errors.New("credential import context is nil")
+	}
+	if err := keys.Validate(); err != nil {
+		return Credential{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return Credential{}, err
@@ -319,7 +272,7 @@ func ImportCredential(ctx context.Context, sourcePath, destinationPath string, k
 	if err := ctx.Err(); err != nil {
 		return Credential{}, err
 	}
-	if err := SaveCredential(destinationPath, credential, key); err != nil {
+	if err := SaveCredential(destinationPath, credential, keys); err != nil {
 		return Credential{}, err
 	}
 	return credential, nil
@@ -390,7 +343,7 @@ func readImportedCredential(ctx context.Context, sourcePath string) (Credential,
 }
 
 func readCredentialJSON(path string) (Credential, error) {
-	data, err := readRegularFile(path, maxCredentialFileBytes)
+	data, err := readRegularFile(path, maxCredentialJSONBytes)
 	if err != nil {
 		return Credential{}, fmt.Errorf("read credential source: %w", err)
 	}
@@ -402,7 +355,7 @@ func readCredentialJSON(path string) (Credential, error) {
 }
 
 func parseCredentialJSON(data []byte) (Credential, error) {
-	if len(data) > maxCredentialFileBytes {
+	if len(data) > maxCredentialJSONBytes {
 		return Credential{}, errors.New("credential JSON is too large")
 	}
 	var auth codexAuthFile
@@ -478,7 +431,7 @@ func readOMPCredential(ctx context.Context, path string) (Credential, error) {
 	var row struct {
 		Data string
 	}
-	if err := db.WithContext(ctx).Raw("SELECT substr(data, 1, ?) AS data FROM auth_credentials WHERE provider = ? AND credential_type = ? AND disabled_cause IS NULL ORDER BY id ASC LIMIT 1", maxCredentialFileBytes+1, "openai-codex", "oauth").Scan(&row).Error; err != nil {
+	if err := db.WithContext(ctx).Raw("SELECT substr(data, 1, ?) AS data FROM auth_credentials WHERE provider = ? AND credential_type = ? AND disabled_cause IS NULL ORDER BY id ASC LIMIT 1", maxCredentialJSONBytes+1, "openai-codex", "oauth").Scan(&row).Error; err != nil {
 		return Credential{}, errors.New("read OMP credential database")
 	}
 	if strings.TrimSpace(row.Data) == "" {
@@ -515,12 +468,12 @@ func readCodexKeyring(ctx context.Context, codexHome string) ([]byte, error) {
 	if err := command.Start(); err != nil {
 		return nil, errors.New("read Codex keyring")
 	}
-	data, readErr := io.ReadAll(io.LimitReader(stdout, maxCredentialFileBytes+1))
+	data, readErr := io.ReadAll(io.LimitReader(stdout, maxCredentialJSONBytes+1))
 	waitErr := command.Wait()
 	if readErr != nil || waitErr != nil {
 		return nil, errors.New("Codex keyring credential is unavailable")
 	}
-	if len(data) > maxCredentialFileBytes {
+	if len(data) > maxCredentialJSONBytes {
 		return nil, errors.New("Codex keyring credential is too large")
 	}
 	return data, nil
@@ -691,7 +644,7 @@ func jwtPayload(token string) ([]byte, bool) {
 	if err != nil {
 		payload, err = base64.URLEncoding.DecodeString(parts[1])
 	}
-	if err != nil || len(payload) > maxCredentialFileBytes {
+	if err != nil || len(payload) > maxCredentialJSONBytes {
 		return nil, false
 	}
 	return payload, true
@@ -737,13 +690,4 @@ func readRegularFile(path string, maxBytes int64) ([]byte, error) {
 		return nil, errors.New("credential file is too large")
 	}
 	return data, nil
-}
-
-func newCipher(key []byte) (cipher.AEAD, error) {
-	digest := sha256.Sum256(key)
-	block, err := aes.NewCipher(digest[:])
-	if err != nil {
-		return nil, errors.New("create credential cipher")
-	}
-	return cipher.NewGCM(block)
 }

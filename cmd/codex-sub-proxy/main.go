@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -74,12 +73,14 @@ func run(args []string) error {
 	}
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
+	_, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
+	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
+	keysReady = keysReady && payloadErr == nil && credentialErr == nil
 	var credentialAvailable func() bool
-	if key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv); ok {
+	if credentialErr == nil {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
-			credentialKey := []byte(key)
 			credentialAvailable = func() bool {
-				return codex.CredentialAvailable(credentialPath, credentialKey)
+				return codex.CredentialAvailable(credentialPath, credentialKeys)
 			}
 		}
 	}
@@ -120,9 +121,9 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv)
-	if !ok || strings.TrimSpace(key) == "" {
-		return fmt.Errorf("credential encryption key is unavailable")
+	credentialKeys, err := cfg.Security.CredentialKeySet(os.LookupEnv)
+	if err != nil {
+		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
 	if err != nil {
@@ -130,7 +131,7 @@ func runImport(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	_, err = codex.ImportCredential(ctx, *sourcePath, destinationPath, []byte(key))
+	_, err = codex.ImportCredential(ctx, *sourcePath, destinationPath, credentialKeys)
 	return err
 }
 
@@ -150,9 +151,9 @@ func runLogin(args []string) error {
 	if err != nil {
 		return err
 	}
-	key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv)
-	if !ok || strings.TrimSpace(key) == "" {
-		return fmt.Errorf("credential encryption key is unavailable")
+	credentialKeys, err := cfg.Security.CredentialKeySet(os.LookupEnv)
+	if err != nil {
+		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
 	if err != nil {
@@ -170,7 +171,7 @@ func runLogin(args []string) error {
 		OnDeviceCode: func(url, code string) {
 			fmt.Fprintf(os.Stdout, "Open %s and enter code %s.\n", url, code)
 		},
-	}, destinationPath, []byte(key))
+	}, destinationPath, credentialKeys)
 	return err
 }
 

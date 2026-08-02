@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -17,6 +18,8 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
 func TestImportCredentialEncryptsWithoutChangingSource(t *testing.T) {
@@ -40,7 +43,7 @@ func TestImportCredentialEncryptsWithoutChangingSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	destinationPath := filepath.Join(t.TempDir(), "credential.enc")
-	credential, err := ImportCredential(context.Background(), sourcePath, destinationPath, []byte("encryption-key"))
+	credential, err := ImportCredential(context.Background(), sourcePath, destinationPath, testCredentialKeys(t))
 	if err != nil {
 		t.Fatalf("import credential: %v", err)
 	}
@@ -54,11 +57,61 @@ func TestImportCredentialEncryptsWithoutChangingSource(t *testing.T) {
 	if string(got) != string(sourceBytes) {
 		t.Fatal("source credential changed")
 	}
-	if got, err := LoadCredential(destinationPath, []byte("encryption-key")); err != nil || got.AccessToken != credential.AccessToken {
+	if got, err := LoadCredential(destinationPath, testCredentialKeys(t)); err != nil || got.AccessToken != credential.AccessToken {
 		t.Fatalf("load imported credential = %#v, %v", got, err)
 	}
 	if mode := encryptedMode(t, destinationPath); mode != 0o600 {
 		t.Fatalf("destination mode = %o, want 600", mode)
+	}
+}
+
+func TestCredentialEncryptionAuthenticatesAndHidesTokens(t *testing.T) {
+	credential := Credential{
+		AccessToken:  "access-secret",
+		RefreshToken: "refresh-secret",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		AccountID:    "account",
+	}
+	keys := testCredentialKeys(t)
+	encoded, err := EncryptCredential(credential, keys)
+	if err != nil {
+		t.Fatalf("encrypt credential: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(credential.AccessToken)) || bytes.Contains(encoded, []byte(credential.RefreshToken)) {
+		t.Fatal("credential token reached encrypted envelope")
+	}
+	got, err := DecryptCredential(encoded, keys)
+	if err != nil {
+		t.Fatalf("decrypt credential: %v", err)
+	}
+	if got.AccessToken != credential.AccessToken || got.RefreshToken != credential.RefreshToken {
+		t.Fatalf("credential = %#v", got)
+	}
+	for name, tampered := range map[string][]byte{
+		"ciphertext": func() []byte {
+			copyOf := append([]byte(nil), encoded...)
+			copyOf[len(copyOf)-1] ^= 1
+			return copyOf
+		}(),
+		"version": func() []byte {
+			copyOf := append([]byte(nil), encoded...)
+			copyOf[4]++
+			return copyOf
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecryptCredential(tampered, keys); err == nil {
+				t.Fatal("tampered credential was accepted")
+			} else if strings.Contains(err.Error(), credential.AccessToken) || strings.Contains(err.Error(), credential.RefreshToken) {
+				t.Fatal("credential token reached error")
+			}
+		})
+	}
+	if _, err := DecryptCredential(encoded, testWrongCredentialKeys(t)); err == nil {
+		t.Fatal("credential decrypted with wrong key")
+	}
+	if _, err := EncryptCredential(credential, envelope.KeySet{}); err == nil {
+		t.Fatal("credential encrypted with invalid key set")
 	}
 }
 
@@ -67,7 +120,7 @@ func TestImportCredentialRejectsSourceAndDestinationSame(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"tokens":{"access_token":"access","refresh_token":"refresh"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := ImportCredential(context.Background(), path, path, []byte("key"))
+	_, err := ImportCredential(context.Background(), path, path, testCredentialKeys(t))
 	if err == nil {
 		t.Fatal("same source and destination were accepted")
 	}
@@ -81,7 +134,7 @@ func TestImportCredentialRejectsNonRegularSourceWithoutBlocking(t *testing.T) {
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := ImportCredential(context.Background(), path, filepath.Join(t.TempDir(), "destination.enc"), []byte("key"))
+	_, err := ImportCredential(context.Background(), path, filepath.Join(t.TempDir(), "destination.enc"), testCredentialKeys(t))
 	if err == nil {
 		t.Fatal("FIFO source was accepted")
 	}
@@ -92,38 +145,38 @@ func TestImportCredentialRejectsNonRegularSourceWithoutBlocking(t *testing.T) {
 
 func TestCredentialAvailableRequiresUsableEncryptedCredential(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credential.enc")
-	if CredentialAvailable(path, []byte("key")) {
+	if CredentialAvailable(path, testCredentialKeys(t)) {
 		t.Fatal("missing credential reported as available")
 	}
 	if err := os.WriteFile(path, []byte("plain credential"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if CredentialAvailable(path, []byte("key")) {
+	if CredentialAvailable(path, testCredentialKeys(t)) {
 		t.Fatal("plain credential reported as available")
 	}
 	credential := Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}
-	if err := SaveCredential(path, credential, []byte("key")); err != nil {
+	if err := SaveCredential(path, credential, testCredentialKeys(t)); err != nil {
 		t.Fatal(err)
 	}
-	if !CredentialAvailable(path, []byte("key")) {
+	if !CredentialAvailable(path, testCredentialKeys(t)) {
 		t.Fatal("usable encrypted credential reported as unavailable")
 	}
 	credential.ExpiresAt = time.Now().Add(-time.Second)
-	if err := SaveCredential(path, credential, []byte("key")); err != nil {
+	if err := SaveCredential(path, credential, testCredentialKeys(t)); err != nil {
 		t.Fatal(err)
 	}
-	if CredentialAvailable(path, []byte("key")) {
+	if CredentialAvailable(path, testCredentialKeys(t)) {
 		t.Fatal("expired credential reported as available")
 	}
 	credential.ExpiresAt = time.Now().Add(time.Hour)
 	credential.AccountID = ""
-	if err := SaveCredential(path, credential, []byte("key")); err != nil {
+	if err := SaveCredential(path, credential, testCredentialKeys(t)); err != nil {
 		t.Fatal(err)
 	}
-	if CredentialAvailable(path, []byte("key")) {
+	if CredentialAvailable(path, testCredentialKeys(t)) {
 		t.Fatal("credential without account identity reported as available")
 	}
-	if CredentialAvailable(path, []byte("wrong")) {
+	if CredentialAvailable(path, testWrongCredentialKeys(t)) {
 		t.Fatal("credential with wrong key reported as available")
 	}
 }
@@ -153,7 +206,7 @@ func TestImportCredentialReadsOMPDatabase(t *testing.T) {
 		t.Fatalf("make database read-only: %v", err)
 	}
 	destinationPath := filepath.Join(t.TempDir(), "credential.enc")
-	credential, err := ImportCredential(context.Background(), databasePath, destinationPath, []byte("key"))
+	credential, err := ImportCredential(context.Background(), databasePath, destinationPath, testCredentialKeys(t))
 	if err != nil {
 		t.Fatalf("import OMP credential: %v", err)
 	}
@@ -165,7 +218,7 @@ func TestImportCredentialReadsOMPDatabase(t *testing.T) {
 func TestImportCredentialRejectsCodexHomeAuthDestination(t *testing.T) {
 	codexHome := t.TempDir()
 	destination := filepath.Join(codexHome, "auth.json")
-	_, err := ImportCredential(context.Background(), codexHome, destination, []byte("key"))
+	_, err := ImportCredential(context.Background(), codexHome, destination, testCredentialKeys(t))
 	if err == nil {
 		t.Fatal("Codex home auth.json destination was accepted")
 	}
@@ -177,7 +230,7 @@ func TestImportCredentialRejectsCodexHomeAuthDestination(t *testing.T) {
 func TestImportCredentialRejectsCodexHomeAuthDestinationCaseInsensitive(t *testing.T) {
 	codexHome := t.TempDir()
 	destination := filepath.Join(codexHome, "AUTH.JSON")
-	_, err := ImportCredential(context.Background(), codexHome, destination, []byte("key"))
+	_, err := ImportCredential(context.Background(), codexHome, destination, testCredentialKeys(t))
 	if err == nil {
 		t.Fatal("case-variant Codex home auth.json destination was accepted")
 	}
@@ -195,7 +248,7 @@ func TestImportCredentialRejectsOMPSymlink(t *testing.T) {
 	if err := os.Symlink(target, source); err != nil {
 		t.Fatal(err)
 	}
-	_, err := ImportCredential(context.Background(), source, filepath.Join(t.TempDir(), "credential.enc"), []byte("key"))
+	_, err := ImportCredential(context.Background(), source, filepath.Join(t.TempDir(), "credential.enc"), testCredentialKeys(t))
 	if err == nil {
 		t.Fatal("OMP database symlink was accepted")
 	}
@@ -312,4 +365,30 @@ func testJWT(t *testing.T, claims map[string]any) string {
 		t.Fatal(err)
 	}
 	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+}
+
+func testCredentialKeys(t *testing.T) envelope.KeySet {
+	t.Helper()
+	key, err := envelope.NewKey(1, []byte(strings.Repeat("k", envelope.KeySize)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := envelope.NewKeySet(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keys
+}
+
+func testWrongCredentialKeys(t *testing.T) envelope.KeySet {
+	t.Helper()
+	key, err := envelope.NewKey(1, []byte(strings.Repeat("w", envelope.KeySize)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := envelope.NewKeySet(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keys
 }

@@ -1,8 +1,11 @@
 package config
 
 import (
+	"encoding/binary"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -128,5 +131,86 @@ func TestKeysAvailableRequiresEveryConfiguredKey(t *testing.T) {
 	}
 	if keys.KeysAvailable(lookup) {
 		t.Fatal("incomplete keys reported as available")
+	}
+}
+
+func TestCredentialKeySetLoadsActiveAndPreviousVersions(t *testing.T) {
+	security := Default().Security
+	security.CredentialEncryptionKeyVersion = 2
+	security.CredentialEncryptionPreviousKeyEnvs = []string{"CSP_OLD_CREDENTIAL_KEY"}
+	security.CredentialEncryptionPreviousKeyVersions = []uint32{1}
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case security.CredentialEncryptionKeyEnv:
+			return strings.Repeat("n", 32), true
+		case "CSP_OLD_CREDENTIAL_KEY":
+			return strings.Repeat("o", 32), true
+		default:
+			return "", false
+		}
+	}
+	keys, err := security.CredentialKeySet(lookup)
+	if err != nil {
+		t.Fatalf("load credential keys: %v", err)
+	}
+	if keys.Active.Version != 2 || len(keys.Previous) != 1 || keys.Previous[0].Version != 1 {
+		t.Fatalf("keys = %#v", keys)
+	}
+}
+
+func TestCredentialKeySetRejectsInvalidKeyLength(t *testing.T) {
+	security := Default().Security
+	keys, err := security.CredentialKeySet(func(name string) (string, bool) {
+		return "short", true
+	})
+	if err == nil {
+		t.Fatal("short credential key was accepted")
+	}
+	if keys.Active.Version != 0 {
+		t.Fatalf("keys = %#v", keys)
+	}
+}
+
+func TestCredentialKeyRotationReadsOldAndWritesNewVersion(t *testing.T) {
+	oldSecurity := Default().Security
+	oldSecurity.CredentialEncryptionKeyEnv = "CSP_OLD_CREDENTIAL_KEY"
+	oldSecurity.CredentialEncryptionKeyVersion = 1
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case "CSP_OLD_CREDENTIAL_KEY":
+			return strings.Repeat("o", 32), true
+		case "CSP_NEW_CREDENTIAL_KEY":
+			return strings.Repeat("n", 32), true
+		default:
+			return "", false
+		}
+	}
+	oldKeys, err := oldSecurity.CredentialKeySet(lookup)
+	if err != nil {
+		t.Fatalf("load old keys: %v", err)
+	}
+	oldEnvelope, err := envelope.Encrypt([]byte("credential"), envelope.CredentialDomain, oldKeys)
+	if err != nil {
+		t.Fatalf("encrypt old credential: %v", err)
+	}
+	newSecurity := Default().Security
+	newSecurity.CredentialEncryptionKeyEnv = "CSP_NEW_CREDENTIAL_KEY"
+	newSecurity.CredentialEncryptionKeyVersion = 2
+	newSecurity.CredentialEncryptionPreviousKeyEnvs = []string{"CSP_OLD_CREDENTIAL_KEY"}
+	newSecurity.CredentialEncryptionPreviousKeyVersions = []uint32{1}
+	newKeys, err := newSecurity.CredentialKeySet(lookup)
+	if err != nil {
+		t.Fatalf("load new keys: %v", err)
+	}
+	plaintext, err := envelope.Decrypt(oldEnvelope, envelope.CredentialDomain, newKeys)
+	if err != nil || string(plaintext) != "credential" {
+		t.Fatalf("decrypt old credential = %q, %v", plaintext, err)
+	}
+	newEnvelope, err := envelope.Encrypt([]byte("new credential"), envelope.CredentialDomain, newKeys)
+	if err != nil {
+		t.Fatalf("encrypt new credential: %v", err)
+	}
+	if got := binary.BigEndian.Uint32(newEnvelope[5:9]); got != 2 {
+		t.Fatalf("new key version = %d, want 2", got)
 	}
 }

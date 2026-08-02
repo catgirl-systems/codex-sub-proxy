@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
 const (
@@ -321,12 +323,12 @@ func Login(ctx context.Context, options LoginOptions) (Credential, error) {
 }
 
 // LoginAndSave logs in and stores the resulting credential in encrypted form.
-func LoginAndSave(ctx context.Context, options LoginOptions, path string, key []byte) (Credential, error) {
+func LoginAndSave(ctx context.Context, options LoginOptions, path string, keys envelope.KeySet) (Credential, error) {
 	credential, err := Login(ctx, options)
 	if err != nil {
 		return Credential{}, err
 	}
-	if err := SaveCredential(path, credential, key); err != nil {
+	if err := SaveCredential(path, credential, keys); err != nil {
 		return Credential{}, fmt.Errorf("save OAuth credential: %w", err)
 	}
 	return credential, nil

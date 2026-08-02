@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
 func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
@@ -54,7 +56,7 @@ func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 
 func TestReadinessReflectsCredentialChanges(t *testing.T) {
 	credentialPath := filepath.Join(t.TempDir(), "credential.enc")
-	credentialKey := []byte("credential-key")
+	credentialKey := testCredentialKey(t)
 	credential := codex.Credential{
 		AccessToken:  "access-token",
 		RefreshToken: "refresh-token",
@@ -365,4 +367,17 @@ func checkReadiness(t *testing.T, client *http.Client, url string, wantCode int,
 	if body.Checks != wantChecks {
 		t.Fatalf("readiness checks = %+v, want %+v", body.Checks, wantChecks)
 	}
+}
+
+func testCredentialKey(t *testing.T) envelope.KeySet {
+	t.Helper()
+	key, err := envelope.NewKey(1, bytes.Repeat([]byte{0x44}, envelope.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := envelope.NewKeySet(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keys
 }
