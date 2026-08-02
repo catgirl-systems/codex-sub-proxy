@@ -204,6 +204,86 @@ func TestExchangeCodeDoesNotReturnTokenEndpointBody(t *testing.T) {
 	}
 }
 
+func TestExchangeCodePreservesBodyReadCancellation(t *testing.T) {
+	headersSent := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Length", "1")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		close(headersSent)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errChannel := make(chan error, 1)
+	go func() {
+		_, err := ExchangeCode(ctx, server.Client(), server.URL, "client", "http://localhost/callback", "code", "verifier")
+		errChannel <- err
+	}()
+	select {
+	case <-headersSent:
+	case <-time.After(time.Second):
+		t.Fatal("token endpoint did not send response headers")
+	}
+	cancel()
+	select {
+	case err := <-errChannel:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("token body read error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("token body read did not return after cancellation")
+	}
+}
+
+func TestDeviceLoginPreservesInitialBodyReadDeadline(t *testing.T) {
+	headersSent := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/accounts/deviceauth/usercode" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Length", "1")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		close(headersSent)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	errChannel := make(chan error, 1)
+	go func() {
+		_, err := Login(ctx, LoginOptions{
+			Issuer:     server.URL,
+			Device:     true,
+			HTTPClient: server.Client(),
+		})
+		errChannel <- err
+	}()
+	select {
+	case <-headersSent:
+	case <-time.After(time.Second):
+		t.Fatal("device authorization endpoint did not send response headers")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("device authorization context did not expire")
+	}
+	select {
+	case err := <-errChannel:
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("device body read error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("device body read did not return after deadline")
+	}
+}
+
 func TestBrowserLoginValidatesCallbackAndStoresCredential(t *testing.T) {
 	idToken := testJWT(t, map[string]any{
 		"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": "browser-workspace"},

@@ -632,7 +632,7 @@ func readAndCloseOAuthBody(response *http.Response) ([]byte, error) {
 func readOAuthBody(reader io.Reader) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(reader, maxOAuthBodyBytes+1))
 	if err != nil {
-		return nil, errors.New("read OAuth response")
+		return nil, fmt.Errorf("read OAuth response: %w", err)
 	}
 	if len(body) > maxOAuthBodyBytes {
 		return nil, errors.New("OAuth response is too large")
