@@ -2,14 +2,38 @@ package codex
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+type codexErrorReader struct {
+	err error
+}
+
+func (reader codexErrorReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+type codexChunkErrorReader struct {
+	data []byte
+	err  error
+}
+
+func (reader *codexChunkErrorReader) Read(target []byte) (int, error) {
+	if len(reader.data) == 0 {
+		return 0, reader.err
+	}
+	count := copy(target, reader.data)
+	reader.data = reader.data[count:]
+	return count, reader.err
+}
 
 func TestCodexResponseRequestFixtureRoundTrips(t *testing.T) {
 	raw, err := os.ReadFile("testdata/responses_request.json")
@@ -23,8 +47,32 @@ func TestCodexResponseRequestFixtureRoundTrips(t *testing.T) {
 	if request.Model != "gpt-5.6-sol" || !request.Stream || request.ToolChoice == nil {
 		t.Fatalf("request = %#v", request)
 	}
-	if len(request.Input) != 1 || len(request.Tools) != 1 || request.Tools[0].Type != "image_generation" {
+	if len(request.Input) != 6 || len(request.Tools) != 1 || request.Tools[0].Type != "image_generation" {
 		t.Fatalf("request shape = %#v", request)
+	}
+	if request.Tools[0].PartialImages != 2 || request.Tools[0].InputImageMask == nil ||
+		request.Tools[0].InputImageMask.FileID != "fixture-file-mask" {
+		t.Fatalf("hosted image tool = %#v", request.Tools[0])
+	}
+	if len(request.Include) != 1 || request.StreamOptions == nil ||
+		request.StreamOptions.ReasoningSummaryDelivery != "sequential_cutoff" ||
+		request.PromptCacheKey != "fixture-cache-key" ||
+		request.PromptCacheRetention != "24h" ||
+		request.MaxOutputTokens != 123 || request.MaxCompletionTokens != 456 ||
+		request.ServiceTier != "priority" {
+		t.Fatalf("request options = %#v", request)
+	}
+	if request.Input[0].Content == nil || !bytes.Contains(request.Input[0].Content, []byte(`fixture-file-image`)) ||
+		!bytes.Contains(request.Input[1].Arguments, []byte(`value`)) {
+		t.Fatalf("input content/arguments = %s / %s", request.Input[0].Content, request.Input[1].Arguments)
+	}
+	if request.Input[3].Action == nil || request.Input[3].Actions == nil ||
+		len(request.Input[3].PendingSafetyChecks) != 1 ||
+		request.Input[3].PendingSafetyChecks[0].ID != "fixture-safety" {
+		t.Fatalf("computer input = %#v", request.Input[3])
+	}
+	if request.Input[4].Output == nil || len(request.Input[4].AcknowledgedSafetyChecks) != 1 {
+		t.Fatalf("computer output = %#v", request.Input[4])
 	}
 	encoded, err := json.Marshal(request)
 	if err != nil {
@@ -34,7 +82,10 @@ func TestCodexResponseRequestFixtureRoundTrips(t *testing.T) {
 	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
 		t.Fatalf("decode encoded request: %v", err)
 	}
-	if roundTrip.Model != request.Model || roundTrip.Tools[0].Action != request.Tools[0].Action {
+	if roundTrip.Model != request.Model || roundTrip.Tools[0].Action != request.Tools[0].Action ||
+		roundTrip.Tools[0].PartialImages != 2 || roundTrip.StreamOptions == nil ||
+		roundTrip.Input[3].PendingSafetyChecks[0].ID != "fixture-safety" ||
+		!bytes.Contains(roundTrip.Input[0].Content, []byte(`fixture-file-image`)) {
 		t.Fatalf("round-trip request = %#v", roundTrip)
 	}
 }
@@ -63,6 +114,20 @@ func TestCodexResponsesTerminalFixtureIncludesHostedImage(t *testing.T) {
 	}
 	if result.Response.Usage == nil || result.Response.Usage.TotalTokens != 20 {
 		t.Fatalf("usage = %#v", result.Response.Usage)
+	}
+	var sawMetadata, sawPartial bool
+	for _, event := range result.Events {
+		switch event.Type {
+		case CodexEventResponseMetadata:
+			sawMetadata = len(event.Headers) == 1 &&
+				event.Headers["x-codex-turn-state"] == "fixture-turn-state" &&
+				bytes.Contains(event.Metadata, []byte(`"decision":"allow"`))
+		case CodexEventResponseImageGenerationPartialImage:
+			sawPartial = event.PartialImageB64 != "" && event.PartialImageIndex == 0
+		}
+	}
+	if !sawMetadata || !sawPartial {
+		t.Fatalf("stream metadata/partial image missing: %#v", result.Events)
 	}
 }
 
@@ -134,6 +199,50 @@ func TestCodexResponsesAbruptFixtureFailsWithoutTerminal(t *testing.T) {
 	_, err = ParseCodexResponsesSSE(bytes.NewReader(raw))
 	if !errors.Is(err, ErrCodexStreamAbruptClose) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCodexResponsesSSERejectsOverlongCommentAndData(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "comment",
+			line: ":" + strings.Repeat("x", maxCodexStreamLineBytes+1),
+		},
+		{
+			name: "data",
+			line: "data: " + strings.Repeat("x", maxCodexStreamLineBytes+1),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ParseCodexResponsesSSE(strings.NewReader(test.line + "\n"))
+			if !errors.Is(err, ErrCodexStreamMalformed) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCodexResponsesSSEWrapsReadCause(t *testing.T) {
+	for _, cause := range []error{context.Canceled, io.ErrUnexpectedEOF} {
+		_, err := ParseCodexResponsesSSE(codexErrorReader{err: cause})
+		if !errors.Is(err, cause) {
+			t.Fatalf("error = %v, want cause %v", err, cause)
+		}
+		if errors.Is(err, ErrCodexStreamMalformed) {
+			t.Fatalf("read cause classified malformed: %v", err)
+		}
+	}
+	partial := &codexChunkErrorReader{
+		data: []byte("data: {\"type\":\"response.created\"}\n"),
+		err:  context.Canceled,
+	}
+	_, err := ParseCodexResponsesSSE(partial)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("partial read error = %v", err)
 	}
 }
 

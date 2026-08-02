@@ -4,18 +4,22 @@ import "encoding/json"
 
 const (
 	// Responses event names used by the public wire contract.
-	EventResponseCreated         = "response.created"
-	EventResponseOutputItemAdded = "response.output_item.added"
-	EventResponseOutputItemDone  = "response.output_item.done"
-	EventContentPartAdded        = "response.content_part.added"
-	EventOutputTextDelta         = "response.output_text.delta"
-	EventCompleted               = "response.completed"
-	EventDone                    = "response.done"
-	EventIncomplete              = "response.incomplete"
-	EventFailed                  = "response.failed"
-	EventError                   = "error"
-	ImageGenerationCall          = "image_generation_call"
-	ToolChoiceImageGeneration    = "image_generation"
+	EventResponseCreated                 = "response.created"
+	EventResponseOutputItemAdded         = "response.output_item.added"
+	EventResponseOutputItemDone          = "response.output_item.done"
+	EventContentPartAdded                = "response.content_part.added"
+	EventOutputTextDelta                 = "response.output_text.delta"
+	EventCompleted                       = "response.completed"
+	EventDone                            = "response.done"
+	EventIncomplete                      = "response.incomplete"
+	EventFailed                          = "response.failed"
+	EventError                           = "error"
+	ImageGenerationCall                  = "image_generation_call"
+	ToolChoiceImageGeneration            = "image_generation"
+	EventImageGenerationCallInProgress   = "response.image_generation_call.in_progress"
+	EventImageGenerationCallGenerating   = "response.image_generation_call.generating"
+	EventImageGenerationCallCompleted    = "response.image_generation_call.completed"
+	EventImageGenerationCallPartialImage = "response.image_generation_call.partial_image"
 
 	ResponseStatusCompleted  = "completed"
 	ResponseStatusFailed     = "failed"
@@ -37,16 +41,17 @@ type ResponseRequest struct {
 	Text               *TextConfig      `json:"text,omitempty"`
 }
 
-// InputItem is one public Responses input item.
+// InputItem is one public Responses input item. Content and output are
+// polymorphic in the wire contract (a string or a typed content list).
 type InputItem struct {
-	Type      string         `json:"type,omitempty"`
-	Role      string         `json:"role,omitempty"`
-	Content   []InputContent `json:"content,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	CallID    string         `json:"call_id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Arguments string         `json:"arguments,omitempty"`
-	Output    string         `json:"output,omitempty"`
+	Type      string          `json:"type,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
+	Output    json.RawMessage `json:"output,omitempty"`
 }
 
 // InputContent is one public input content part.
@@ -54,17 +59,52 @@ type InputContent struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	FileData string `json:"file_data,omitempty"`
+	FileURL  string `json:"file_url,omitempty"`
+	Filename string `json:"filename,omitempty"`
 	Detail   string `json:"detail,omitempty"`
+}
+
+// InputImageMask is an optional hosted-image inpainting mask.
+type InputImageMask struct {
+	FileID   string `json:"file_id,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+// TextLogprob is the log probability for one output token.
+type TextLogprob struct {
+	Token       string       `json:"token"`
+	Bytes       []int        `json:"bytes,omitempty"`
+	Logprob     float64      `json:"logprob"`
+	TopLogprobs []TopLogprob `json:"top_logprobs,omitempty"`
+}
+
+// TopLogprob is one alternative token log probability.
+type TopLogprob struct {
+	Token   string  `json:"token"`
+	Bytes   []int   `json:"bytes,omitempty"`
+	Logprob float64 `json:"logprob"`
 }
 
 // Tool describes a public Responses tool.
 type Tool struct {
-	Type         string          `json:"type"`
-	Parameters   json.RawMessage `json:"parameters,omitempty"`
-	Description  string          `json:"description,omitempty"`
-	Action       string          `json:"action,omitempty"`
-	OutputFormat string          `json:"output_format,omitempty"`
-	Size         string          `json:"size,omitempty"`
+	Type              string          `json:"type"`
+	Name              string          `json:"name,omitempty"`
+	Parameters        json.RawMessage `json:"parameters,omitempty"`
+	Strict            *bool           `json:"strict,omitempty"`
+	Description       string          `json:"description,omitempty"`
+	Action            string          `json:"action,omitempty"`
+	Background        string          `json:"background,omitempty"`
+	InputFidelity     string          `json:"input_fidelity,omitempty"`
+	InputImageMask    *InputImageMask `json:"input_image_mask,omitempty"`
+	Model             string          `json:"model,omitempty"`
+	Moderation        string          `json:"moderation,omitempty"`
+	OutputCompression int             `json:"output_compression,omitempty"`
+	OutputFormat      string          `json:"output_format,omitempty"`
+	PartialImages     int             `json:"partial_images,omitempty"`
+	Quality           string          `json:"quality,omitempty"`
+	Size              string          `json:"size,omitempty"`
 }
 
 // ToolChoice selects a public Responses tool.
@@ -119,11 +159,13 @@ type OutputItem struct {
 
 // ContentPart is one public output content part.
 type ContentPart struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Refusal  string `json:"refusal,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`
-	Detail   string `json:"detail,omitempty"`
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`
+	Refusal     string            `json:"refusal,omitempty"`
+	ImageURL    string            `json:"image_url,omitempty"`
+	Detail      string            `json:"detail,omitempty"`
+	Annotations []json.RawMessage `json:"annotations,omitempty"`
+	Logprobs    []TextLogprob     `json:"logprobs,omitempty"`
 }
 
 // IncompleteDetails explains why a response stopped early.
@@ -133,19 +175,23 @@ type IncompleteDetails struct {
 
 // ResponseStreamEvent is one public Responses SSE event.
 type ResponseStreamEvent struct {
-	Type           string       `json:"type"`
-	SequenceNumber int          `json:"sequence_number"`
-	Response       *Response    `json:"response,omitempty"`
-	Item           *OutputItem  `json:"item,omitempty"`
-	Part           *ContentPart `json:"part,omitempty"`
-	Error          *Error       `json:"error,omitempty"`
-	Delta          string       `json:"delta,omitempty"`
-	Text           string       `json:"text,omitempty"`
-	Code           string       `json:"code,omitempty"`
-	Message        string       `json:"message,omitempty"`
-	ItemID         string       `json:"item_id,omitempty"`
-	OutputIndex    int          `json:"output_index"`
-	ContentIndex   int          `json:"content_index"`
+	Type              string        `json:"type"`
+	SequenceNumber    int           `json:"sequence_number"`
+	Response          *Response     `json:"response,omitempty"`
+	Item              *OutputItem   `json:"item,omitempty"`
+	Part              *ContentPart  `json:"part,omitempty"`
+	Error             *Error        `json:"error,omitempty"`
+	Delta             string        `json:"delta,omitempty"`
+	Text              string        `json:"text,omitempty"`
+	Logprobs          []TextLogprob `json:"logprobs,omitempty"`
+	Code              string        `json:"code,omitempty"`
+	Message           string        `json:"message,omitempty"`
+	ItemID            string        `json:"item_id,omitempty"`
+	OutputIndex       int           `json:"output_index"`
+	ContentIndex      int           `json:"content_index"`
+	SummaryIndex      int           `json:"summary_index"`
+	PartialImageB64   string        `json:"partial_image_b64,omitempty"`
+	PartialImageIndex int           `json:"partial_image_index"`
 }
 
 // Usage records public token counts.

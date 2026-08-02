@@ -27,11 +27,23 @@ func TestResponsesRequestFixtureRoundTrips(t *testing.T) {
 	if fixtures.Responses.Model != "gpt-5.6-sol" || !fixtures.Responses.Stream {
 		t.Fatalf("Responses request = %#v", fixtures.Responses)
 	}
-	if len(fixtures.Responses.Input) != 1 || len(fixtures.Responses.Tools) != 1 {
+	if len(fixtures.Responses.Input) != 1 || len(fixtures.Responses.Tools) != 2 {
 		t.Fatalf("Responses input = %#v", fixtures.Responses)
+	}
+	if !strings.Contains(string(fixtures.Responses.Input[0].Content), "fixture-public-file-image") {
+		t.Fatalf("input image = %s", fixtures.Responses.Input[0].Content)
 	}
 	if fixtures.Responses.ToolChoice == nil || fixtures.Responses.ToolChoice.Type != ToolChoiceImageGeneration {
 		t.Fatalf("tool choice = %#v", fixtures.Responses.ToolChoice)
+	}
+	imageTool := fixtures.Responses.Tools[0]
+	if imageTool.PartialImages != 2 || imageTool.InputImageMask == nil ||
+		imageTool.InputImageMask.FileID != "fixture-public-file-mask" {
+		t.Fatalf("hosted image tool = %#v", imageTool)
+	}
+	functionTool := fixtures.Responses.Tools[1]
+	if functionTool.Name != "fixture_function" || functionTool.Strict == nil || *functionTool.Strict {
+		t.Fatalf("function tool = %#v", functionTool)
 	}
 	if fixtures.Images.Model != "gpt-image-2" || fixtures.Images.ResponseFormat != "b64_json" {
 		t.Fatalf("Images request = %#v", fixtures.Images)
@@ -47,7 +59,9 @@ func TestResponsesRequestFixtureRoundTrips(t *testing.T) {
 	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
 		t.Fatalf("decode encoded Responses request: %v", err)
 	}
-	if roundTrip.Tools[0].Action != "generate" || roundTrip.ToolChoice.Type != ToolChoiceImageGeneration {
+	if roundTrip.Tools[0].PartialImages != 2 || roundTrip.Tools[1].Name != "fixture_function" ||
+		roundTrip.Tools[1].Strict == nil || *roundTrip.Tools[1].Strict ||
+		!strings.Contains(string(roundTrip.Input[0].Content), "fixture-public-file-image") {
 		t.Fatalf("round-trip Responses request = %#v", roundTrip)
 	}
 }
@@ -72,15 +86,19 @@ func TestPublicResponsesSSEFixtureDecodesTypedEvents(t *testing.T) {
 		}
 		events = append(events, event)
 	}
-	if len(events) != 4 || events[len(events)-1].Type != EventCompleted {
+	if len(events) != 5 || events[len(events)-1].Type != EventCompleted {
 		t.Fatalf("SSE events = %#v", events)
 	}
-	if events[0].SequenceNumber != 0 || events[1].SequenceNumber != 1 || events[2].OutputIndex != 0 ||
-		events[3].SequenceNumber != 3 {
+	if events[0].SequenceNumber != 0 || events[1].SequenceNumber != 1 || events[2].SequenceNumber != 2 ||
+		events[2].OutputIndex != 0 || events[2].PartialImageIndex != 0 || events[3].SequenceNumber != 3 ||
+		events[4].SequenceNumber != 4 {
 		t.Fatalf("SSE coordinates = %#v", events)
 	}
-	if events[2].Item == nil || events[2].Item.Type != ImageGenerationCall {
-		t.Fatalf("image event = %#v", events[2])
+	if events[2].Type != EventImageGenerationCallPartialImage || events[2].PartialImageB64 == "" {
+		t.Fatalf("partial image event = %#v", events[2])
+	}
+	if events[3].Item == nil || events[3].Item.Type != ImageGenerationCall {
+		t.Fatalf("image event = %#v", events[3])
 	}
 	for _, event := range events {
 		encoded, err := json.Marshal(event)
@@ -92,7 +110,9 @@ func TestPublicResponsesSSEFixtureDecodesTypedEvents(t *testing.T) {
 			t.Fatalf("decode encoded SSE event: %v", err)
 		}
 		if roundTrip.SequenceNumber != event.SequenceNumber || roundTrip.OutputIndex != event.OutputIndex ||
-			roundTrip.ContentIndex != event.ContentIndex {
+			roundTrip.ContentIndex != event.ContentIndex || roundTrip.SummaryIndex != event.SummaryIndex ||
+			roundTrip.PartialImageIndex != event.PartialImageIndex ||
+			roundTrip.PartialImageB64 != event.PartialImageB64 {
 			t.Fatalf("round-trip SSE coordinates = %#v", roundTrip)
 		}
 	}
@@ -119,6 +139,28 @@ func TestPublicStreamCoordinatesRoundTripIncludingZero(t *testing.T) {
 		if string(fields[name]) != "0" {
 			t.Fatalf("encoded %s = %s", name, fields[name])
 		}
+	}
+}
+
+func TestPublicReasoningSummaryIndexRoundTripsZero(t *testing.T) {
+	raw := []byte(`{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"synthetic-reasoning","output_index":0,"summary_index":0,"delta":"synthetic summary"}`)
+	var event ResponseStreamEvent
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatalf("decode reasoning event: %v", err)
+	}
+	if event.SummaryIndex != 0 {
+		t.Fatalf("reasoning summary index = %#v", event)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("encode reasoning event: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode encoded reasoning event: %v", err)
+	}
+	if string(fields["summary_index"]) != "0" {
+		t.Fatalf("encoded summary index = %s", fields["summary_index"])
 	}
 }
 
@@ -154,6 +196,35 @@ func TestPublicResponsesTerminalFixtureIncludesHostedImage(t *testing.T) {
 	}
 	if roundTrip.Output[0].RevisedPrompt != "a synthetic public icon" {
 		t.Fatalf("round-trip output = %#v", roundTrip.Output[0])
+	}
+}
+
+func TestPublicResponsesTextFixtureRoundTripsAnnotationsAndLogprobs(t *testing.T) {
+	raw, err := os.ReadFile("testdata/responses_text.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response Response
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("decode text response: %v", err)
+	}
+	text := response.Output[0].Content[0]
+	if len(text.Annotations) != 1 || len(text.Logprobs) != 1 ||
+		text.Logprobs[0].Token != "fixture" || text.Logprobs[0].TopLogprobs[0].Logprob != -0.25 {
+		t.Fatalf("text output = %#v", text)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("encode text response: %v", err)
+	}
+	var roundTrip Response
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatalf("decode encoded text response: %v", err)
+	}
+	roundText := roundTrip.Output[0].Content[0]
+	if len(roundText.Annotations) != 1 || !strings.Contains(string(roundText.Annotations[0]), `"url_citation"`) ||
+		roundText.Logprobs[0].Bytes[0] != 102 {
+		t.Fatalf("round-trip text output = %#v", roundText)
 	}
 }
 
@@ -274,6 +345,7 @@ func TestPublicFixturesContainNoCredentialPatterns(t *testing.T) {
 		"requests.json",
 		"responses_terminal.json",
 		"responses_terminal.sse",
+		"responses_text.json",
 		"responses_incomplete.json",
 		"responses_failed.json",
 		"images_generation.json",

@@ -3,11 +3,17 @@
     "model": "gpt-5.6-sol",
     "input": [
       {
+        "type": "message",
         "role": "user",
         "content": [
           {
             "type": "input_text",
             "text": "fixture public request"
+          },
+          {
+            "type": "input_image",
+            "file_id": "fixture-public-file-image",
+            "detail": "high"
           }
         ]
       }
@@ -16,8 +22,27 @@
       {
         "type": "image_generation",
         "action": "generate",
+        "background": "opaque",
+        "input_fidelity": "high",
+        "input_image_mask": {
+          "file_id": "fixture-public-file-mask"
+        },
+        "model": "gpt-image-2",
+        "moderation": "low",
+        "output_compression": 80,
         "output_format": "png",
+        "partial_images": 2,
+        "quality": "high",
         "size": "1024x1024"
+      },
+      {
+        "type": "function",
+        "name": "fixture_function",
+        "description": "fixture function",
+        "parameters": {
+          "type": "object"
+        },
+        "strict": false
       }
     ],
     "tool_choice": {

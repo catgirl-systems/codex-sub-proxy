@@ -1,0 +1,44 @@
+{
+  "id": "resp_fixture_public_text_001",
+  "object": "response",
+  "created_at": 1738888910,
+  "model": "gpt-5.6-sol",
+  "status": "completed",
+  "output": [
+    {
+      "id": "msg_fixture_public_text_001",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "fixture output text",
+          "annotations": [
+            {
+              "type": "url_citation",
+              "start_index": 0,
+              "end_index": 7,
+              "title": "fixture source",
+              "url": "https://example.invalid/fixture"
+            }
+          ],
+          "logprobs": [
+            {
+              "token": "fixture",
+              "bytes": [102, 105, 120, 116, 117, 114, 101],
+              "logprob": -0.25,
+              "top_logprobs": [
+                {
+                  "token": "fixture",
+                  "bytes": [102, 105, 120, 116, 117, 114, 101],
+                  "logprob": -0.25
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

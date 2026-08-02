@@ -13,60 +13,111 @@ import (
 
 const (
 	// Codex responses event names.
-	CodexEventResponseCreated            = "response.created"
-	CodexEventResponseOutputItemAdded    = "response.output_item.added"
-	CodexEventResponseOutputItemDone     = "response.output_item.done"
-	CodexEventResponseContentPartAdded   = "response.content_part.added"
-	CodexEventResponseOutputTextDelta    = "response.output_text.delta"
-	CodexEventResponseFunctionArgsDelta  = "response.function_call_arguments.delta"
-	CodexEventResponseFunctionArgsDone   = "response.function_call_arguments.done"
-	CodexEventResponseCompleted          = "response.completed"
-	CodexEventResponseDone               = "response.done"
-	CodexEventResponseIncomplete         = "response.incomplete"
-	CodexEventResponseFailed             = "response.failed"
-	CodexEventError                      = "error"
-	CodexEventResponseMetadata           = "response.metadata"
-	CodexResponseStatusCompleted         = "completed"
-	CodexResponseStatusFailed            = "failed"
-	CodexResponseStatusIncomplete        = "incomplete"
-	CodexResponseStatusInProgress        = "in_progress"
-	CodexIncompleteReasonMaxOutputTokens = "max_output_tokens"
-	CodexIncompleteReasonContentFilter   = "content_filter"
-	CodexImageGenerationCall             = "image_generation_call"
+	CodexEventResponseCreated                     = "response.created"
+	CodexEventResponseOutputItemAdded             = "response.output_item.added"
+	CodexEventResponseOutputItemDone              = "response.output_item.done"
+	CodexEventResponseContentPartAdded            = "response.content_part.added"
+	CodexEventResponseOutputTextDelta             = "response.output_text.delta"
+	CodexEventResponseFunctionArgsDelta           = "response.function_call_arguments.delta"
+	CodexEventResponseFunctionArgsDone            = "response.function_call_arguments.done"
+	CodexEventResponseCompleted                   = "response.completed"
+	CodexEventResponseDone                        = "response.done"
+	CodexEventResponseIncomplete                  = "response.incomplete"
+	CodexEventResponseFailed                      = "response.failed"
+	CodexEventError                               = "error"
+	CodexEventResponseMetadata                    = "response.metadata"
+	CodexResponseStatusCompleted                  = "completed"
+	CodexResponseStatusFailed                     = "failed"
+	CodexResponseStatusIncomplete                 = "incomplete"
+	CodexResponseStatusInProgress                 = "in_progress"
+	CodexIncompleteReasonMaxOutputTokens          = "max_output_tokens"
+	CodexIncompleteReasonContentFilter            = "content_filter"
+	CodexImageGenerationCall                      = "image_generation_call"
+	CodexEventResponseImageGenerationInProgress   = "response.image_generation_call.in_progress"
+	CodexEventResponseImageGenerationGenerating   = "response.image_generation_call.generating"
+	CodexEventResponseImageGenerationCompleted    = "response.image_generation_call.completed"
+	CodexEventResponseImageGenerationPartialImage = "response.image_generation_call.partial_image"
 )
 
 const (
-	maxCodexStreamLineBytes    = 256 * 1024
+	maxCodexStreamLineBytes = 256 * 1024
+
 	maxCodexStreamEvents       = 8192
 	maxCodexStreamPayloadBytes = 4 * 1024 * 1024
 )
 
-// CodexResponseRequest is the private request body for the Responses endpoint.
-type CodexResponseRequest struct {
-	Model              string                `json:"model"`
-	Input              []CodexInputItem      `json:"input,omitempty"`
-	Instructions       string                `json:"instructions,omitempty"`
-	Tools              []CodexTool           `json:"tools,omitempty"`
-	ToolChoice         *CodexToolChoice      `json:"tool_choice,omitempty"`
-	Store              bool                  `json:"store,omitempty"`
-	Stream             bool                  `json:"stream,omitempty"`
-	ParallelToolCalls  bool                  `json:"parallel_tool_calls,omitempty"`
-	ClientMetadata     map[string]string     `json:"client_metadata,omitempty"`
-	PreviousResponseID string                `json:"previous_response_id,omitempty"`
-	Reasoning          *CodexReasoningConfig `json:"reasoning,omitempty"`
-	Text               *CodexTextConfig      `json:"text,omitempty"`
+// CodexStreamOptions controls provider-specific stream behavior.
+type CodexStreamOptions struct {
+	ReasoningSummaryDelivery string `json:"reasoning_summary_delivery"`
 }
 
-// CodexInputItem is one private Responses input item.
+// CodexInputImageMask is an optional image-generation inpainting mask.
+type CodexInputImageMask struct {
+	FileID   string `json:"file_id,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+// CodexSafetyCheck is a provider safety check attached to computer calls.
+type CodexSafetyCheck struct {
+	ID      string `json:"id"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// CodexTextLogprob is one output token log probability.
+type CodexTextLogprob struct {
+	Token       string            `json:"token"`
+	Bytes       []int             `json:"bytes,omitempty"`
+	Logprob     float64           `json:"logprob"`
+	TopLogprobs []CodexTopLogprob `json:"top_logprobs,omitempty"`
+}
+
+// CodexTopLogprob is one alternative token log probability.
+type CodexTopLogprob struct {
+	Token   string  `json:"token"`
+	Bytes   []int   `json:"bytes,omitempty"`
+	Logprob float64 `json:"logprob"`
+}
+
+// CodexResponseRequest is the private request body for the Responses endpoint.
+type CodexResponseRequest struct {
+	Model                string                `json:"model"`
+	Input                []CodexInputItem      `json:"input,omitempty"`
+	Instructions         string                `json:"instructions,omitempty"`
+	Tools                []CodexTool           `json:"tools,omitempty"`
+	ToolChoice           *CodexToolChoice      `json:"tool_choice,omitempty"`
+	Store                bool                  `json:"store,omitempty"`
+	Stream               bool                  `json:"stream,omitempty"`
+	ParallelToolCalls    bool                  `json:"parallel_tool_calls,omitempty"`
+	ClientMetadata       map[string]string     `json:"client_metadata,omitempty"`
+	Include              []string              `json:"include,omitempty"`
+	PreviousResponseID   string                `json:"previous_response_id,omitempty"`
+	Reasoning            *CodexReasoningConfig `json:"reasoning,omitempty"`
+	Text                 *CodexTextConfig      `json:"text,omitempty"`
+	StreamOptions        *CodexStreamOptions   `json:"stream_options,omitempty"`
+	PromptCacheKey       string                `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string                `json:"prompt_cache_retention,omitempty"`
+	MaxOutputTokens      int                   `json:"max_output_tokens,omitempty"`
+	MaxCompletionTokens  int                   `json:"max_completion_tokens,omitempty"`
+	ServiceTier          string                `json:"service_tier,omitempty"`
+}
+
+// CodexInputItem is one private Responses input item. Content and output are
+// polymorphic in the provider contract, so they remain raw JSON values.
 type CodexInputItem struct {
-	Type      string              `json:"type,omitempty"`
-	Role      string              `json:"role,omitempty"`
-	Content   []CodexInputContent `json:"content,omitempty"`
-	ID        string              `json:"id,omitempty"`
-	CallID    string              `json:"call_id,omitempty"`
-	Name      string              `json:"name,omitempty"`
-	Arguments string              `json:"arguments,omitempty"`
-	Output    string              `json:"output,omitempty"`
+	Type                     string             `json:"type,omitempty"`
+	Role                     string             `json:"role,omitempty"`
+	Content                  json.RawMessage    `json:"content,omitempty"`
+	ID                       string             `json:"id,omitempty"`
+	CallID                   string             `json:"call_id,omitempty"`
+	Name                     string             `json:"name,omitempty"`
+	Arguments                json.RawMessage    `json:"arguments,omitempty"`
+	Output                   json.RawMessage    `json:"output,omitempty"`
+	Action                   json.RawMessage    `json:"action,omitempty"`
+	Actions                  json.RawMessage    `json:"actions,omitempty"`
+	PendingSafetyChecks      []CodexSafetyCheck `json:"pending_safety_checks,omitempty"`
+	AcknowledgedSafetyChecks []CodexSafetyCheck `json:"acknowledged_safety_checks,omitempty"`
+	Tools                    []CodexTool        `json:"tools,omitempty"`
 }
 
 // CodexInputContent is one private input content part.
@@ -74,16 +125,31 @@ type CodexInputContent struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	FileData string `json:"file_data,omitempty"`
+	FileURL  string `json:"file_url,omitempty"`
+	Filename string `json:"filename,omitempty"`
 	Detail   string `json:"detail,omitempty"`
 }
 
 // CodexTool describes a private Responses tool.
 type CodexTool struct {
-	Type         string          `json:"type"`
-	Action       string          `json:"action,omitempty"`
-	OutputFormat string          `json:"output_format,omitempty"`
-	Size         string          `json:"size,omitempty"`
-	Parameters   json.RawMessage `json:"parameters,omitempty"`
+	Type              string               `json:"type"`
+	Name              string               `json:"name,omitempty"`
+	Description       string               `json:"description,omitempty"`
+	Strict            *bool                `json:"strict,omitempty"`
+	Parameters        json.RawMessage      `json:"parameters,omitempty"`
+	Action            string               `json:"action,omitempty"`
+	Background        string               `json:"background,omitempty"`
+	InputFidelity     string               `json:"input_fidelity,omitempty"`
+	InputImageMask    *CodexInputImageMask `json:"input_image_mask,omitempty"`
+	Model             string               `json:"model,omitempty"`
+	Moderation        string               `json:"moderation,omitempty"`
+	OutputCompression int                  `json:"output_compression,omitempty"`
+	OutputFormat      string               `json:"output_format,omitempty"`
+	PartialImages     int                  `json:"partial_images,omitempty"`
+	Quality           string               `json:"quality,omitempty"`
+	Size              string               `json:"size,omitempty"`
 }
 
 // CodexToolChoice selects a private Responses tool.
@@ -121,27 +187,35 @@ type CodexResponse struct {
 
 // CodexOutputItem is a typed private output item.
 type CodexOutputItem struct {
-	ID            string             `json:"id,omitempty"`
-	Type          string             `json:"type"`
-	Role          string             `json:"role,omitempty"`
-	Status        string             `json:"status,omitempty"`
-	Content       []CodexContentPart `json:"content,omitempty"`
-	CallID        string             `json:"call_id,omitempty"`
-	Name          string             `json:"name,omitempty"`
-	Arguments     string             `json:"arguments,omitempty"`
-	Input         string             `json:"input,omitempty"`
-	Result        string             `json:"result,omitempty"`
-	RevisedPrompt string             `json:"revised_prompt,omitempty"`
-	Action        string             `json:"action,omitempty"`
+	ID                       string             `json:"id,omitempty"`
+	Type                     string             `json:"type"`
+	Role                     string             `json:"role,omitempty"`
+	Status                   string             `json:"status,omitempty"`
+	Content                  []CodexContentPart `json:"content,omitempty"`
+	CallID                   string             `json:"call_id,omitempty"`
+	Name                     string             `json:"name,omitempty"`
+	Arguments                string             `json:"arguments,omitempty"`
+	Input                    string             `json:"input,omitempty"`
+	Output                   json.RawMessage    `json:"output,omitempty"`
+	Result                   string             `json:"result,omitempty"`
+	RevisedPrompt            string             `json:"revised_prompt,omitempty"`
+	Action                   json.RawMessage    `json:"action,omitempty"`
+	Actions                  json.RawMessage    `json:"actions,omitempty"`
+	PendingSafetyChecks      []CodexSafetyCheck `json:"pending_safety_checks,omitempty"`
+	AcknowledgedSafetyChecks []CodexSafetyCheck `json:"acknowledged_safety_checks,omitempty"`
+	CreatedBy                string             `json:"created_by,omitempty"`
+	Phase                    string             `json:"phase,omitempty"`
 }
 
 // CodexContentPart is a typed private output content part.
 type CodexContentPart struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Refusal  string `json:"refusal,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`
-	Detail   string `json:"detail,omitempty"`
+	Type        string             `json:"type"`
+	Text        string             `json:"text,omitempty"`
+	Refusal     string             `json:"refusal,omitempty"`
+	ImageURL    string             `json:"image_url,omitempty"`
+	Detail      string             `json:"detail,omitempty"`
+	Annotations []json.RawMessage  `json:"annotations,omitempty"`
+	Logprobs    []CodexTextLogprob `json:"logprobs,omitempty"`
 }
 
 // CodexIncompleteDetails explains why a response stopped early.
@@ -151,20 +225,25 @@ type CodexIncompleteDetails struct {
 
 // CodexResponseStreamEvent is one private SSE or WebSocket event.
 type CodexResponseStreamEvent struct {
-	Type           string            `json:"type"`
-	SequenceNumber int               `json:"sequence_number"`
-	Response       *CodexResponse    `json:"response,omitempty"`
-	Item           *CodexOutputItem  `json:"item,omitempty"`
-	Part           *CodexContentPart `json:"part,omitempty"`
-	Error          *CodexError       `json:"error,omitempty"`
-	Delta          string            `json:"delta,omitempty"`
-	Text           string            `json:"text,omitempty"`
-	Code           string            `json:"code,omitempty"`
-	Message        string            `json:"message,omitempty"`
-	ItemID         string            `json:"item_id,omitempty"`
-	OutputIndex    int               `json:"output_index"`
-	ContentIndex   int               `json:"content_index"`
-	SummaryIndex   int               `json:"summary_index,omitempty"`
+	Type              string             `json:"type"`
+	SequenceNumber    int                `json:"sequence_number"`
+	Response          *CodexResponse     `json:"response,omitempty"`
+	Item              *CodexOutputItem   `json:"item,omitempty"`
+	Part              *CodexContentPart  `json:"part,omitempty"`
+	Error             *CodexError        `json:"error,omitempty"`
+	Delta             string             `json:"delta,omitempty"`
+	Text              string             `json:"text,omitempty"`
+	Logprobs          []CodexTextLogprob `json:"logprobs,omitempty"`
+	Code              string             `json:"code,omitempty"`
+	Message           string             `json:"message,omitempty"`
+	ItemID            string             `json:"item_id,omitempty"`
+	OutputIndex       int                `json:"output_index"`
+	ContentIndex      int                `json:"content_index"`
+	SummaryIndex      int                `json:"summary_index"`
+	PartialImageB64   string             `json:"partial_image_b64,omitempty"`
+	PartialImageIndex int                `json:"partial_image_index"`
+	Headers           map[string]string  `json:"headers,omitempty"`
+	Metadata          json.RawMessage    `json:"metadata,omitempty"`
 }
 
 // CodexUsage records token counts reported by Codex.
@@ -306,7 +385,7 @@ var ErrCodexStreamAbruptClose = errors.New("codex stream ended before terminal e
 // ErrCodexStreamDuplicateTerminal means that a stream sent two terminal events.
 var ErrCodexStreamDuplicateTerminal = errors.New("codex stream sent duplicate terminal event")
 
-// ErrCodexStreamMalformed means that a stream event is not valid JSON or has no type.
+// ErrCodexStreamMalformed means that a stream event or line is invalid or exceeds a stream bound.
 var ErrCodexStreamMalformed = errors.New("codex stream event is malformed")
 
 // ErrCodexStreamFailed means that Codex sent a failed terminal event.
@@ -333,8 +412,7 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 	}
 
 	var decoder codexStreamDecoder
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), maxCodexStreamLineBytes)
+	stream := bufio.NewReaderSize(reader, maxCodexStreamLineBytes+1)
 	var data bytes.Buffer
 	flush := func() error {
 		if data.Len() == 0 {
@@ -358,14 +436,10 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 		data.Reset()
 		return nil
 	}
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	consumeLine := func(line []byte) error {
 		switch {
 		case len(line) == 0:
-			if err := flush(); err != nil {
-				return CodexStreamResult{}, err
-			}
+			return flush()
 		case bytes.HasPrefix(line, []byte("data:")):
 			value := bytes.TrimPrefix(line, []byte("data:"))
 			value = bytes.TrimPrefix(value, []byte(" "))
@@ -374,16 +448,32 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 				additional++
 			}
 			if additional > maxCodexStreamLineBytes || data.Len() > maxCodexStreamLineBytes-additional {
-				return CodexStreamResult{}, fmt.Errorf("%w: data field is too large", ErrCodexStreamMalformed)
+				return fmt.Errorf("%w: data field is too large", ErrCodexStreamMalformed)
 			}
 			if data.Len() > 0 {
 				data.WriteByte('\n')
 			}
 			data.Write(value)
 		}
+		return nil
 	}
-	if err := scanner.Err(); err != nil {
-		return CodexStreamResult{}, fmt.Errorf("read Codex SSE: %w", err)
+
+	for {
+		line, isPrefix, err := stream.ReadLine()
+		if isPrefix || len(line) > maxCodexStreamLineBytes {
+			return CodexStreamResult{}, fmt.Errorf("%w: SSE line is too large", ErrCodexStreamMalformed)
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return CodexStreamResult{}, fmt.Errorf("read Codex SSE: %w", err)
+		}
+		if len(line) > 0 || err == nil {
+			if consumeErr := consumeLine(line); consumeErr != nil {
+				return CodexStreamResult{}, consumeErr
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
 	}
 	if err := flush(); err != nil {
 		return CodexStreamResult{}, err

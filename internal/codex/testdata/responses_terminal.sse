@@ -4,9 +4,13 @@ data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,
 
 data: {"type":"response.image_generation_call.in_progress","sequence_number":2,"item_id":"img_call_fixture_001","output_index":0}
 
-data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"img_call_fixture_001","type":"image_generation_call","status":"completed","action":"generate","result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=","revised_prompt":"a synthetic square icon"}}
+data: {"type":"response.metadata","sequence_number":3,"headers":{"x-codex-turn-state":"fixture-turn-state"},"metadata":{"openai_chatgpt_moderation_metadata":{"decision":"allow"}}}
 
-data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_fixture_001","object":"response","created_at":1738888888,"model":"gpt-5.6-sol","status":"completed","output":[{"id":"img_call_fixture_001","type":"image_generation_call","status":"completed","action":"generate","result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=","revised_prompt":"a synthetic square icon"}],"usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20,"input_tokens_details":{"cached_tokens":2,"orchestration_input_tokens":0},"output_tokens_details":{"reasoning_tokens":1,"orchestration_output_tokens":0}}}}
+data: {"type":"response.image_generation_call.partial_image","sequence_number":4,"item_id":"img_call_fixture_001","output_index":0,"partial_image_b64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB","partial_image_index":0}
+
+data: {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"id":"img_call_fixture_001","type":"image_generation_call","status":"completed","action":"generate","result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=","revised_prompt":"a synthetic square icon"}}
+
+data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp_fixture_001","object":"response","created_at":1738888888,"model":"gpt-5.6-sol","status":"completed","output":[{"id":"img_call_fixture_001","type":"image_generation_call","status":"completed","action":"generate","result":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=","revised_prompt":"a synthetic square icon"}],"usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20,"input_tokens_details":{"cached_tokens":2,"orchestration_input_tokens":0},"output_tokens_details":{"reasoning_tokens":1,"orchestration_output_tokens":0}}}}
 
 data: [DONE]
 
