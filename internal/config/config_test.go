@@ -38,6 +38,33 @@ func TestLoadEmptyFileAndEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestResponsesTransportPolicyDefaultsToWebSocketAndRejectsUnknownValues(t *testing.T) {
+	if got := Default().Codex.ResponsesTransport; got != ResponsesTransportWebSocketPreferred {
+		t.Fatalf("default responses transport = %q, want %q", got, ResponsesTransportWebSocketPreferred)
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[codex]\nresponses_transport = \"other\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "responses transport") {
+		t.Fatalf("unknown responses transport error = %v", err)
+	}
+}
+
+func TestLoadReadsSSEResponsesTransportPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[codex]\nresponses_transport = \"sse\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Codex.ResponsesTransport != ResponsesTransportSSE {
+		t.Fatalf("responses transport = %q, want %q", cfg.Codex.ResponsesTransport, ResponsesTransportSSE)
+	}
+}
+
 func TestLoadIgnoresUnsupportedEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CSP_ARTIFACTS_TYPE", "s3")
 	t.Setenv("CSP_STREAMING_DRAIN_DEADLINE", "not-a-duration")

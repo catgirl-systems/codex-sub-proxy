@@ -50,8 +50,25 @@ type SecurityConfig struct {
 	AdminTokenHMACKeyEnv                    string   `toml:"admin_token_hmac_key_env"`
 }
 
+type ResponsesTransport string
+
+const (
+	ResponsesTransportWebSocketPreferred ResponsesTransport = "websocket_preferred"
+	ResponsesTransportSSE                ResponsesTransport = "sse"
+)
+
 type CodexConfig struct {
-	CredentialFile string `toml:"credential_file"`
+	CredentialFile     string             `toml:"credential_file"`
+	ResponsesTransport ResponsesTransport `toml:"responses_transport"`
+}
+
+func (c CodexConfig) Validate() error {
+	switch c.ResponsesTransport {
+	case ResponsesTransportWebSocketPreferred, ResponsesTransportSSE:
+		return nil
+	default:
+		return fmt.Errorf("responses transport %q is not supported", c.ResponsesTransport)
+	}
 }
 
 func Default() Config {
@@ -73,7 +90,8 @@ func Default() Config {
 			AdminTokenHMACKeyEnv:           "CSP_ADMIN_TOKEN_HMAC_KEY",
 		},
 		Codex: CodexConfig{
-			CredentialFile: defaultCredentialFile,
+			CredentialFile:     defaultCredentialFile,
+			ResponsesTransport: ResponsesTransportWebSocketPreferred,
 		},
 	}
 }
@@ -112,6 +130,9 @@ func (c Config) Validate() error {
 	}
 	if c.Storage.BusyTimeout <= 0 {
 		return fmt.Errorf("storage busy timeout must be positive")
+	}
+	if err := c.Codex.Validate(); err != nil {
+		return fmt.Errorf("codex configuration: %w", err)
 	}
 	if c.Storage.BusyTimeout > 24*time.Hour {
 		return fmt.Errorf("storage busy timeout is too large")
