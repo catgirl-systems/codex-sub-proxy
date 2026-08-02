@@ -207,21 +207,6 @@ func (a *Authorizer) Authenticate(ctx context.Context, rawKey string) (Principal
 	}, nil
 }
 
-// Authenticate verifies a key against the given store.
-func Authenticate(ctx context.Context, db *gorm.DB, hmacKey []byte, rawKey string) (Principal, error) {
-	return NewAuthorizer(db, hmacKey).Authenticate(ctx, rawKey)
-}
-
-// Authorize checks a key, endpoint, and model against the given store.
-func Authorize(ctx context.Context, db *gorm.DB, hmacKey []byte, rawKey, endpoint, model string) (Principal, error) {
-	return NewAuthorizer(db, hmacKey).Authorize(ctx, rawKey, endpoint, model)
-}
-
-// AuthorizeHeader parses and checks one exact Bearer value.
-func AuthorizeHeader(ctx context.Context, db *gorm.DB, hmacKey []byte, header, endpoint, model string) (Principal, error) {
-	return NewAuthorizer(db, hmacKey).AuthorizeHeader(ctx, header, endpoint, model)
-}
-
 func contains(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {

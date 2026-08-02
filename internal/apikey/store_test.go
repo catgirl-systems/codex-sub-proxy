@@ -33,6 +33,7 @@ func testAPIKeyDatabase(t *testing.T) *gorm.DB {
 func TestCreateStoresOnlySafeKeyDataAndAuthorizesPolicy(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("01234567890123456789012345678901")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey, created, err := Create(context.Background(), db, hmacKey, Policy{
 		Name:             "local key",
 		Owner:            "owner",
@@ -58,17 +59,17 @@ func TestCreateStoresOnlySafeKeyDataAndAuthorizesPolicy(t *testing.T) {
 	if strings.Contains(stored.AllowedEndpoints[0], rawKey) || strings.Contains(stored.AllowedModels[0], rawKey) {
 		t.Fatal("full key was included in stored policy")
 	}
-	principal, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/responses", "gpt-a")
+	principal, err := authorizer.Authorize(context.Background(), rawKey, "/v1/responses", "gpt-a")
 	if err != nil {
 		t.Fatalf("authorize valid key: %v", err)
 	}
 	if got, want := principal.AllowedModels, []string{"gpt-z", "gpt-a"}; !slicesEqual(got, want) {
 		t.Fatalf("models = %v, want %v", got, want)
 	}
-	if _, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/images/generations", "gpt-a"); !errors.Is(err, ErrForbidden) {
+	if _, err := authorizer.Authorize(context.Background(), rawKey, "/v1/images/generations", "gpt-a"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("endpoint error = %v, want forbidden", err)
 	}
-	if _, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/responses", "gpt-no"); !errors.Is(err, ErrForbidden) {
+	if _, err := authorizer.Authorize(context.Background(), rawKey, "/v1/responses", "gpt-no"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("model error = %v, want forbidden", err)
 	}
 }
@@ -110,6 +111,7 @@ func TestCreateRejectsMissingOwner(t *testing.T) {
 func TestAuthenticateRejectsMalformedExpiredAndDisabledKeys(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("01234567890123456789012345678901")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey, record, err := Create(context.Background(), db, hmacKey, Policy{
 		Name:             "key",
 		Owner:            "owner",
@@ -120,7 +122,7 @@ func TestAuthenticateRejectsMalformedExpiredAndDisabledKeys(t *testing.T) {
 		t.Fatalf("create API key: %v", err)
 	}
 	for _, malformed := range []string{"", "csp_live_bad", "csp_live_abc_def", "CSP_LIVE_abc_def"} {
-		if _, err := Authenticate(context.Background(), db, hmacKey, malformed); !errors.Is(err, ErrInvalidKey) {
+		if _, err := authorizer.Authenticate(context.Background(), malformed); !errors.Is(err, ErrInvalidKey) {
 			t.Errorf("malformed key %q error = %v", malformed, err)
 		}
 	}
@@ -128,13 +130,13 @@ func TestAuthenticateRejectsMalformedExpiredAndDisabledKeys(t *testing.T) {
 	if err := db.Model(&Record{}).Where("id = ?", record.ID).Update("expires_at", past).Error; err != nil {
 		t.Fatalf("expire API key: %v", err)
 	}
-	if _, err := Authenticate(context.Background(), db, hmacKey, rawKey); !errors.Is(err, ErrInvalidKey) {
+	if _, err := authorizer.Authenticate(context.Background(), rawKey); !errors.Is(err, ErrInvalidKey) {
 		t.Fatalf("expired key error = %v, want invalid key", err)
 	}
 	if err := db.Model(&Record{}).Where("id = ?", record.ID).Updates(map[string]any{"expires_at": nil, "disabled_at": time.Now().UTC()}).Error; err != nil {
 		t.Fatalf("disable API key: %v", err)
 	}
-	if _, err := Authenticate(context.Background(), db, hmacKey, rawKey); !errors.Is(err, ErrInvalidKey) {
+	if _, err := authorizer.Authenticate(context.Background(), rawKey); !errors.Is(err, ErrInvalidKey) {
 		t.Fatalf("disabled key error = %v, want invalid key", err)
 	}
 }
@@ -171,6 +173,7 @@ func TestAuthorizeHeaderBoundsAndExactSyntax(t *testing.T) {
 func TestAuthenticateDatabaseErrorDoesNotBecomeUnauthorized(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("01234567890123456789012345678901")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey := KeyPrefix + "0123456789abcdef_" + strings.Repeat("a", minSecretSize)
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -180,7 +183,7 @@ func TestAuthenticateDatabaseErrorDoesNotBecomeUnauthorized(t *testing.T) {
 		t.Fatalf("close database: %v", err)
 	}
 	gotErr := func() error {
-		_, err := Authenticate(context.Background(), db, hmacKey, rawKey)
+		_, err := authorizer.Authenticate(context.Background(), rawKey)
 		return err
 	}()
 	if gotErr == nil || errors.Is(gotErr, ErrInvalidKey) || strings.Contains(gotErr.Error(), rawKey) {
@@ -191,6 +194,7 @@ func TestAuthenticateDatabaseErrorDoesNotBecomeUnauthorized(t *testing.T) {
 func TestConcurrentAuthorization(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("01234567890123456789012345678901")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey, _, err := Create(context.Background(), db, hmacKey, Policy{
 		Name:             "key",
 		Owner:            "owner",
@@ -206,7 +210,7 @@ func TestConcurrentAuthorization(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			_, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/models", "")
+			_, err := authorizer.Authorize(context.Background(), rawKey, "/v1/models", "")
 			if err != nil {
 				errorsCh <- err
 			}
@@ -222,6 +226,7 @@ func TestConcurrentAuthorization(t *testing.T) {
 func TestAuthorizePersistsMonotonicLastUsedAtAndSkipsDeniedRequests(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("weak")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey, created, err := Create(context.Background(), db, hmacKey, Policy{
 		Name:             "key",
 		Owner:            "owner",
@@ -231,7 +236,7 @@ func TestAuthorizePersistsMonotonicLastUsedAtAndSkipsDeniedRequests(t *testing.T
 	if err != nil {
 		t.Fatalf("create API key: %v", err)
 	}
-	if _, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/models", "gpt a"); err != nil {
+	if _, err := authorizer.Authorize(context.Background(), rawKey, "/v1/models", "gpt a"); err != nil {
 		t.Fatalf("authorize valid policy: %v", err)
 	}
 	var used Record
@@ -242,7 +247,7 @@ func TestAuthorizePersistsMonotonicLastUsedAtAndSkipsDeniedRequests(t *testing.T
 		t.Fatal("last-used timestamp was not stored")
 	}
 	firstUse := *used.LastUsedAt
-	if _, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/denied", "gpt a"); !errors.Is(err, ErrForbidden) {
+	if _, err := authorizer.Authorize(context.Background(), rawKey, "/v1/denied", "gpt a"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("denied endpoint error = %v, want forbidden", err)
 	}
 	var denied Record
@@ -256,7 +261,7 @@ func TestAuthorizePersistsMonotonicLastUsedAtAndSkipsDeniedRequests(t *testing.T
 	if err := db.Model(&Record{}).Where("id = ?", created.ID).Update("last_used_at", future).Error; err != nil {
 		t.Fatalf("set future last-used timestamp: %v", err)
 	}
-	if _, err := Authorize(context.Background(), db, hmacKey, rawKey, "models", "gpt a"); err != nil {
+	if _, err := authorizer.Authorize(context.Background(), rawKey, "models", "gpt a"); err != nil {
 		t.Fatalf("authorize exact endpoint: %v", err)
 	}
 	var unchanged Record
@@ -271,6 +276,7 @@ func TestAuthorizePersistsMonotonicLastUsedAtAndSkipsDeniedRequests(t *testing.T
 func TestAuthorizeFailsClosedWhenLastUsedUpdateFails(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("key")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey, created, err := Create(context.Background(), db, hmacKey, Policy{
 		Name:             "key",
 		Owner:            "owner",
@@ -282,7 +288,7 @@ func TestAuthorizeFailsClosedWhenLastUsedUpdateFails(t *testing.T) {
 	if err := db.Exec("CREATE TRIGGER reject_api_key_last_used BEFORE UPDATE OF last_used_at ON api_keys BEGIN SELECT RAISE(ABORT, 'reject last-used update'); END").Error; err != nil {
 		t.Fatalf("create last-used rejection trigger: %v", err)
 	}
-	if _, err := Authorize(context.Background(), db, hmacKey, rawKey, "/v1/models", ""); err == nil || errors.Is(err, ErrForbidden) || errors.Is(err, ErrInvalidKey) {
+	if _, err := authorizer.Authorize(context.Background(), rawKey, "/v1/models", ""); err == nil || errors.Is(err, ErrForbidden) || errors.Is(err, ErrInvalidKey) {
 		t.Fatalf("last-used update error = %v", err)
 	}
 	var stored Record
@@ -297,6 +303,7 @@ func TestAuthorizeFailsClosedWhenLastUsedUpdateFails(t *testing.T) {
 func TestRecordPolicyRejectsLegacyDuplicateValues(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	hmacKey := []byte("key")
+	authorizer := NewAuthorizer(db, hmacKey)
 	rawKey, created, err := Create(context.Background(), db, hmacKey, Policy{
 		Name:             "key",
 		AllowedEndpoints: []string{"/v1/models"},
@@ -310,7 +317,7 @@ func TestRecordPolicyRejectsLegacyDuplicateValues(t *testing.T) {
 	if err := db.Model(&Record{}).Where("id = ?", created.ID).Update("allowed_models", encoded).Error; err != nil {
 		t.Fatalf("store legacy duplicate policy: %v", err)
 	}
-	if _, err := Authenticate(context.Background(), db, hmacKey, rawKey); err == nil {
+	if _, err := authorizer.Authenticate(context.Background(), rawKey); err == nil {
 		t.Fatal("legacy duplicate policy was accepted")
 	}
 }
