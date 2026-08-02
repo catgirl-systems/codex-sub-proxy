@@ -74,13 +74,16 @@ func run(args []string) error {
 	}
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
-	upstreamAuthReady := false
+	var credentialAvailable func() bool
 	if key, ok := os.LookupEnv(cfg.Security.CredentialEncryptionKeyEnv); ok {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
-			upstreamAuthReady = codex.CredentialAvailable(credentialPath, []byte(key))
+			credentialKey := []byte(key)
+			credentialAvailable = func() bool {
+				return codex.CredentialAvailable(credentialPath, credentialKey)
+			}
 		}
 	}
-	readiness.Set(storageReady, keysReady, upstreamAuthReady)
+	readiness.Set(storageReady, keysReady, credentialAvailable)
 
 	servers, err := server.Start(server.Config{
 		Listen:      cfg.Server.Listen,

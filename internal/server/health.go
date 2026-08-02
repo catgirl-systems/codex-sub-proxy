@@ -10,10 +10,10 @@ import (
 )
 
 type Readiness struct {
-	mu           sync.RWMutex
-	storage      bool
-	keys         bool
-	upstreamAuth bool
+	mu                  sync.RWMutex
+	storage             bool
+	keys                bool
+	credentialAvailable func() bool
 }
 
 type ReadinessSnapshot struct {
@@ -26,22 +26,26 @@ func NewReadiness() *Readiness {
 	return &Readiness{}
 }
 
-func (r *Readiness) Set(storage, keys, upstreamAuth bool) {
+func (r *Readiness) Set(storage, keys bool, credentialAvailable func() bool) {
 	r.mu.Lock()
 	r.storage = storage
 	r.keys = keys
-	r.upstreamAuth = upstreamAuth
+	r.credentialAvailable = credentialAvailable
 	r.mu.Unlock()
 }
 
 func (r *Readiness) Snapshot() ReadinessSnapshot {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return ReadinessSnapshot{
-		Storage:      r.storage,
-		Keys:         r.keys,
-		UpstreamAuth: r.upstreamAuth,
+	snapshot := ReadinessSnapshot{
+		Storage: r.storage,
+		Keys:    r.keys,
 	}
+	credentialAvailable := r.credentialAvailable
+	r.mu.RUnlock()
+	if credentialAvailable != nil {
+		snapshot.UpstreamAuth = credentialAvailable()
+	}
+	return snapshot
 }
 
 func (s ReadinessSnapshot) Ready() bool {

@@ -7,9 +7,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 )
 
 func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
@@ -35,13 +39,81 @@ func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 	checkReadiness(t, client, "http://"+servers.DataAddr()+"/readyz", http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{})
 	checkReadiness(t, client, "http://"+servers.AdminAddr()+"/readyz", http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{})
 
-	readiness.Set(true, true, true)
+	readiness.Set(true, true, func() bool { return true })
 	checkReadiness(t, client, "http://"+servers.DataAddr()+"/readyz", http.StatusOK, "ready", ReadinessSnapshot{
 		Storage:      true,
 		Keys:         true,
 		UpstreamAuth: true,
 	})
 	checkReadiness(t, client, "http://"+servers.AdminAddr()+"/readyz", http.StatusOK, "ready", ReadinessSnapshot{
+		Storage:      true,
+		Keys:         true,
+		UpstreamAuth: true,
+	})
+}
+
+func TestReadinessReflectsCredentialChanges(t *testing.T) {
+	credentialPath := filepath.Join(t.TempDir(), "credential.enc")
+	credentialKey := []byte("credential-key")
+	credential := codex.Credential{
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		AccountID:    "account",
+	}
+	if err := codex.SaveCredential(credentialPath, credential, credentialKey); err != nil {
+		t.Fatalf("save credential: %v", err)
+	}
+
+	readiness := NewReadiness()
+	readiness.Set(true, true, func() bool {
+		return codex.CredentialAvailable(credentialPath, credentialKey)
+	})
+	servers, err := Start(Config{
+		Listen:      "127.0.0.1:0",
+		AdminListen: "127.0.0.1:0",
+	}, readiness)
+	if err != nil {
+		t.Fatalf("start servers: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := servers.Shutdown(ctx); err != nil {
+			t.Fatalf("shutdown servers: %v", err)
+		}
+	}()
+
+	client := &http.Client{Timeout: time.Second}
+	url := "http://" + servers.DataAddr() + "/readyz"
+	checkReadiness(t, client, url, http.StatusOK, "ready", ReadinessSnapshot{
+		Storage:      true,
+		Keys:         true,
+		UpstreamAuth: true,
+	})
+
+	if err := os.Remove(credentialPath); err != nil {
+		t.Fatalf("remove credential: %v", err)
+	}
+	checkReadiness(t, client, url, http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{
+		Storage: true,
+		Keys:    true,
+	})
+
+	credential.ExpiresAt = time.Now().Add(-time.Second)
+	if err := codex.SaveCredential(credentialPath, credential, credentialKey); err != nil {
+		t.Fatalf("save expired credential: %v", err)
+	}
+	checkReadiness(t, client, url, http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{
+		Storage: true,
+		Keys:    true,
+	})
+
+	credential.ExpiresAt = time.Now().Add(time.Hour)
+	if err := codex.SaveCredential(credentialPath, credential, credentialKey); err != nil {
+		t.Fatalf("restore credential: %v", err)
+	}
+	checkReadiness(t, client, url, http.StatusOK, "ready", ReadinessSnapshot{
 		Storage:      true,
 		Keys:         true,
 		UpstreamAuth: true,
