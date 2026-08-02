@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/go-playground/validator/v10"
 )
 
 type requestFixtures struct {
@@ -236,7 +238,138 @@ func TestPublicInputStrictDecodingRejectsUnknownNestedFields(t *testing.T) {
 	}
 }
 
+func TestPublicResponsesCollectionBoundaries(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit int
+		raw   func(int) string
+	}{
+		{
+			name:  "input items",
+			limit: maxResponsesInputItems,
+			raw: func(count int) string {
+				return responsesJSONList(count, `{"type":"message"}`)
+			},
+		},
+		{
+			name:  "content parts",
+			limit: maxResponsesContentParts,
+			raw: func(count int) string {
+				return `[{"type":"message","content":` + responsesJSONList(count, `{"type":"input_text","text":"x"}`) + `}]`
+			},
+		},
+		{
+			name:  "output parts",
+			limit: maxResponsesContentParts,
+			raw: func(count int) string {
+				return `[{"type":"computer_call_output","output":` + responsesJSONList(count, `{"type":"computer_screenshot","file_id":"x"}`) + `}]`
+			},
+		},
+		{
+			name:  "per-item tools",
+			limit: maxResponsesItemTools,
+			raw: func(count int) string {
+				return `[{"type":"additional_tools","tools":` + responsesJSONList(count, `{"type":"function","name":"f"}`) + `}]`
+			},
+		},
+		{
+			name:  "pending safety checks",
+			limit: maxResponsesSafetyChecks,
+			raw: func(count int) string {
+				return `[{"type":"computer_call","pending_safety_checks":` + responsesJSONList(count, `{"id":"check"}`) + `}]`
+			},
+		},
+		{
+			name:  "acknowledged safety checks",
+			limit: maxResponsesSafetyChecks,
+			raw: func(count int) string {
+				return `[{"type":"computer_call_output","acknowledged_safety_checks":` + responsesJSONList(count, `{"id":"check"}`) + `}]`
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, count := range []int{test.limit, test.limit + 1} {
+				var input Input
+				err := json.Unmarshal([]byte(test.raw(count)), &input)
+				if count == test.limit {
+					if err != nil {
+						t.Fatalf("decode exact limit: %v", err)
+					}
+					if test.name == "input items" {
+						if input.Items == nil || len(input.Items) != count {
+							t.Fatalf("decoded input boundary = %#v", input)
+						}
+					} else if input.Items == nil || len(input.Items) != 1 {
+						t.Fatalf("decoded nested boundary = %#v", input)
+					}
+					continue
+				}
+				if err == nil {
+					t.Fatalf("accepted limit+1 collection")
+				}
+			}
+		})
+	}
+}
+
+func TestPublicInputRejectsTinyItemAmplification(t *testing.T) {
+	raw := responsesJSONList(maxResponsesInputItems*192, `{"type":"message"}`)
+	if len(raw) < 3*1024*1024 {
+		t.Fatalf("stress input size = %d, want at least 3 MiB", len(raw))
+	}
+	var input Input
+	if err := json.Unmarshal([]byte(raw), &input); err == nil {
+		t.Fatal("accepted oversized tiny-item input")
+	}
+}
+
+func responsesJSONList(count int, value string) string {
+	var builder strings.Builder
+	builder.Grow(count * (len(value) + 1))
+	builder.WriteByte('[')
+	for index := range count {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(value)
+	}
+	builder.WriteByte(']')
+	return builder.String()
+}
+
+func TestPublicInputValidationTraversesBoundedCollections(t *testing.T) {
+	tests := []struct {
+		name  string
+		input Input
+	}{
+		{
+			name:  "input items",
+			input: Input{Items: make([]InputItem, maxResponsesInputItems+1)},
+		},
+		{
+			name:  "per-item tools",
+			input: Input{Items: []InputItem{{Tools: make([]Tool, maxResponsesItemTools+1)}}},
+		},
+		{
+			name:  "pending safety checks",
+			input: Input{Items: []InputItem{{PendingSafetyChecks: make([]SafetyCheck, maxResponsesSafetyChecks+1)}}},
+		},
+		{
+			name:  "acknowledged safety checks",
+			input: Input{Items: []InputItem{{AcknowledgedSafetyChecks: make([]SafetyCheck, maxResponsesSafetyChecks+1)}}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validator.New().Struct(ResponseRequest{Model: "gpt-5.6-sol", Input: &test.input}); err == nil {
+				t.Fatal("nested collection exceeded its validation limit")
+			}
+		})
+	}
+}
 func TestPublicStreamEventArgumentsAndAnnotationRoundTrip(t *testing.T) {
+
 	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}","annotation":{"type":"url_citation","url":"https://example.test"}}`)
 	var event ResponseStreamEvent
 	if err := json.Unmarshal(raw, &event); err != nil {

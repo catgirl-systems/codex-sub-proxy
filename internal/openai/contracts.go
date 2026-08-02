@@ -33,6 +33,12 @@ const (
 	ResponseStatusFailed     = "failed"
 	ResponseStatusIncomplete = "incomplete"
 )
+const (
+	maxResponsesInputItems   = 1024
+	maxResponsesContentParts = 1024
+	maxResponsesItemTools    = 128
+	maxResponsesSafetyChecks = maxResponsesItemTools
+)
 
 // ResponseRequest is the public OpenAI Responses request body.
 type ResponseRequest struct {
@@ -95,7 +101,7 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 // Input is the public Responses input string-or-array union.
 type Input struct {
 	String *string     `json:"-"`
-	Items  []InputItem `json:"-"`
+	Items  []InputItem `json:"-" validate:"max=1024,dive"`
 }
 
 func (input Input) MarshalJSON() ([]byte, error) {
@@ -123,118 +129,152 @@ func (input *Input) UnmarshalJSON(data []byte) error {
 		*input = Input{String: &text}
 		return nil
 	case '[':
-		var rawItems []json.RawMessage
-		decoder := json.NewDecoder(bytes.NewReader(value))
-		if err := decoder.Decode(&rawItems); err != nil {
-			return fmt.Errorf("decode public input array: %w", err)
-		}
-		var extra json.RawMessage
-		if err := decoder.Decode(&extra); err != io.EOF {
-			if err == nil {
-				return fmt.Errorf("decode public input array: multiple JSON values")
-			}
-			return fmt.Errorf("decode public input array: %w", err)
-		}
-		items := make([]InputItem, len(rawItems))
-		for index, rawItem := range rawItems {
-			itemValue := bytes.TrimSpace(rawItem)
-			if len(itemValue) == 0 || itemValue[0] != '{' {
-				return fmt.Errorf("decode public input item %d: item must be a JSON object", index)
-			}
-			itemDecoder := json.NewDecoder(bytes.NewReader(itemValue))
-			itemDecoder.DisallowUnknownFields()
-			if err := itemDecoder.Decode(&items[index]); err != nil {
-				return fmt.Errorf("decode public input item %d: %w", index, err)
-			}
-			if err := itemDecoder.Decode(&extra); err != io.EOF {
-				if err == nil {
-					return fmt.Errorf("decode public input item %d: multiple JSON values", index)
+		items := make([]InputItem, 0)
+		err := decodeResponsesArray(value, "decode public input array", "input items", maxResponsesInputItems,
+			func(decoder *json.Decoder, index int) error {
+				var item InputItem
+				if err := decoder.Decode(&item); err != nil {
+					return err
 				}
-				return fmt.Errorf("decode public input item %d: %w", index, err)
-			}
-			if nested := bytes.TrimSpace(items[index].Content); len(nested) != 0 && !bytes.Equal(nested, []byte("null")) {
-				switch nested[0] {
-				case '"':
-					var content string
-					contentDecoder := json.NewDecoder(bytes.NewReader(nested))
-					contentDecoder.DisallowUnknownFields()
-					if err := contentDecoder.Decode(&content); err != nil {
-						return fmt.Errorf("decode public input item %d content: %w", index, err)
-					}
-					if err := contentDecoder.Decode(&extra); err != io.EOF {
-						if err == nil {
-							return fmt.Errorf("decode public input item %d content: multiple JSON values", index)
-						}
-						return fmt.Errorf("decode public input item %d content: %w", index, err)
-					}
-				case '[':
-					var content []InputContent
-					contentDecoder := json.NewDecoder(bytes.NewReader(nested))
-					contentDecoder.DisallowUnknownFields()
-					if err := contentDecoder.Decode(&content); err != nil {
-						return fmt.Errorf("decode public input item %d content: %w", index, err)
-					}
-					if err := contentDecoder.Decode(&extra); err != io.EOF {
-						if err == nil {
-							return fmt.Errorf("decode public input item %d content: multiple JSON values", index)
-						}
-						return fmt.Errorf("decode public input item %d content: %w", index, err)
-					}
-				default:
-					return fmt.Errorf("decode public input item %d content: must be a string or array", index)
-				}
-			}
-			if nested := bytes.TrimSpace(items[index].Output); len(nested) != 0 && !bytes.Equal(nested, []byte("null")) {
-				switch nested[0] {
-				case '"':
-					var output string
-					outputDecoder := json.NewDecoder(bytes.NewReader(nested))
-					outputDecoder.DisallowUnknownFields()
-					if err := outputDecoder.Decode(&output); err != nil {
-						return fmt.Errorf("decode public input item %d output: %w", index, err)
-					}
-					if err := outputDecoder.Decode(&extra); err != io.EOF {
-						if err == nil {
-							return fmt.Errorf("decode public input item %d output: multiple JSON values", index)
-						}
-						return fmt.Errorf("decode public input item %d output: %w", index, err)
-					}
-				case '{':
-					var output InputContent
-					outputDecoder := json.NewDecoder(bytes.NewReader(nested))
-					outputDecoder.DisallowUnknownFields()
-					if err := outputDecoder.Decode(&output); err != nil {
-						return fmt.Errorf("decode public input item %d output: %w", index, err)
-					}
-					if err := outputDecoder.Decode(&extra); err != io.EOF {
-						if err == nil {
-							return fmt.Errorf("decode public input item %d output: multiple JSON values", index)
-						}
-						return fmt.Errorf("decode public input item %d output: %w", index, err)
-					}
-				case '[':
-					var output []InputContent
-					outputDecoder := json.NewDecoder(bytes.NewReader(nested))
-					outputDecoder.DisallowUnknownFields()
-					if err := outputDecoder.Decode(&output); err != nil {
-						return fmt.Errorf("decode public input item %d output: %w", index, err)
-					}
-					if err := outputDecoder.Decode(&extra); err != io.EOF {
-						if err == nil {
-							return fmt.Errorf("decode public input item %d output: multiple JSON values", index)
-						}
-						return fmt.Errorf("decode public input item %d output: %w", index, err)
-					}
-				default:
-					return fmt.Errorf("decode public input item %d output: must be a string, object, or array", index)
-				}
-			}
+				items = append(items, item)
+				return nil
+			})
+		if err != nil {
+			return err
 		}
 		*input = Input{Items: items}
 		return nil
 	default:
 		return fmt.Errorf("public input must be a string or array")
 	}
+}
+
+func decodeResponsesArray(data []byte, field, itemName string, limit int, decode func(*json.Decoder, int) error) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '[' {
+		return fmt.Errorf("%s: must be an array", field)
+	}
+	for index := 0; decoder.More(); index++ {
+		if index >= limit {
+			return fmt.Errorf("%s: too many %s (maximum %d)", field, itemName, limit)
+		}
+		if err := decode(decoder, index); err != nil {
+			return fmt.Errorf("%s %d: %w", field, index, err)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("%s: multiple JSON values", field)
+		}
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
+}
+
+func decodeResponsesJSONValue(data []byte, target any, field string) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("%s: multiple JSON values", field)
+		}
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
+}
+
+func decodeResponsesInputContentParts(data []byte, field string) ([]InputContent, error) {
+	parts := make([]InputContent, 0)
+	err := decodeResponsesArray(data, field, "content parts", maxResponsesContentParts,
+		func(decoder *json.Decoder, index int) error {
+			var part InputContent
+			if err := decoder.Decode(&part); err != nil {
+				return err
+			}
+			parts = append(parts, part)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+func decodeResponsesInputItemField(data []byte, field string, allowObject bool) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return nil
+	}
+	switch value[0] {
+	case '"':
+		var text string
+		return decodeResponsesJSONValue(value, &text, field)
+	case '[':
+		_, err := decodeResponsesInputContentParts(value, field)
+		return err
+	case '{':
+		if !allowObject {
+			return fmt.Errorf("%s: must be a string or array", field)
+		}
+		var content InputContent
+		return decodeResponsesJSONValue(value, &content, field)
+	default:
+		if allowObject {
+			return fmt.Errorf("%s: must be a string, object, or array", field)
+		}
+		return fmt.Errorf("%s: must be a string or array", field)
+	}
+}
+
+func decodeResponsesTools(data []byte, field string) ([]Tool, error) {
+	tools := make([]Tool, 0)
+	err := decodeResponsesArray(data, field, "tools", maxResponsesItemTools,
+		func(decoder *json.Decoder, index int) error {
+			var tool Tool
+			if err := decoder.Decode(&tool); err != nil {
+				return err
+			}
+			tools = append(tools, tool)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return tools, nil
+}
+
+func decodeResponsesSafetyChecks(data []byte, field string) ([]SafetyCheck, error) {
+	checks := make([]SafetyCheck, 0)
+	err := decodeResponsesArray(data, field, "safety checks", maxResponsesSafetyChecks,
+		func(decoder *json.Decoder, index int) error {
+			var check SafetyCheck
+			if err := decoder.Decode(&check); err != nil {
+				return err
+			}
+			checks = append(checks, check)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return checks, nil
 }
 
 // InputItem is one public Responses input item. Content and output are
@@ -251,9 +291,66 @@ type InputItem struct {
 	Output                   json.RawMessage `json:"output,omitempty"`
 	Action                   json.RawMessage `json:"action,omitempty"`
 	Actions                  json.RawMessage `json:"actions,omitempty"`
-	PendingSafetyChecks      []SafetyCheck   `json:"pending_safety_checks,omitempty"`
-	AcknowledgedSafetyChecks []SafetyCheck   `json:"acknowledged_safety_checks,omitempty"`
-	Tools                    []Tool          `json:"tools,omitempty"`
+	PendingSafetyChecks      []SafetyCheck   `json:"pending_safety_checks,omitempty" validate:"max=128,dive"`
+	AcknowledgedSafetyChecks []SafetyCheck   `json:"acknowledged_safety_checks,omitempty" validate:"max=128,dive"`
+	Tools                    []Tool          `json:"tools,omitempty" validate:"max=128,dive"`
+}
+
+func (item *InputItem) UnmarshalJSON(data []byte) error {
+	*item = InputItem{}
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || value[0] != '{' {
+		return fmt.Errorf("public input item must be a JSON object")
+	}
+	type inputItem InputItem
+	wire := struct {
+		*inputItem
+		PendingSafetyChecks      json.RawMessage `json:"pending_safety_checks"`
+		AcknowledgedSafetyChecks json.RawMessage `json:"acknowledged_safety_checks"`
+		Tools                    json.RawMessage `json:"tools"`
+	}{
+		inputItem: (*inputItem)(item),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode public input item: multiple JSON values")
+		}
+		return fmt.Errorf("decode public input item: %w", err)
+	}
+	if wire.PendingSafetyChecks != nil {
+		checks, err := decodeResponsesSafetyChecks(wire.PendingSafetyChecks, "decode public input item pending_safety_checks")
+		if err != nil {
+			return err
+		}
+		item.PendingSafetyChecks = checks
+	}
+	if wire.AcknowledgedSafetyChecks != nil {
+		checks, err := decodeResponsesSafetyChecks(wire.AcknowledgedSafetyChecks, "decode public input item acknowledged_safety_checks")
+		if err != nil {
+			return err
+		}
+		item.AcknowledgedSafetyChecks = checks
+	}
+	if wire.Tools != nil {
+		tools, err := decodeResponsesTools(wire.Tools, "decode public input item tools")
+		if err != nil {
+			return err
+		}
+		item.Tools = tools
+	}
+	if err := decodeResponsesInputItemField(item.Content, "decode public input item content", false); err != nil {
+		return err
+	}
+	if err := decodeResponsesInputItemField(item.Output, "decode public input item output", true); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SafetyCheck is one computer-call safety check.

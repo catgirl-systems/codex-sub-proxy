@@ -370,6 +370,96 @@ func TestResponsesBoundaryAndAuthorizationRejectBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestResponsesCollectionLimitsRejectBeforeUpstream(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	tests := []struct {
+		name  string
+		limit int
+		body  func(int) string
+	}{
+		{
+			name:  "input items",
+			limit: 1024,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","input":` + responsesTestJSONList(count, `{"type":"message"}`) + `}`
+			},
+		},
+		{
+			name:  "content parts",
+			limit: 1024,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","input":[{"type":"message","content":` + responsesTestJSONList(count, `{"type":"input_text","text":"x"}`) + `}]}`
+			},
+		},
+		{
+			name:  "output parts",
+			limit: 1024,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","input":[{"type":"computer_call_output","output":` + responsesTestJSONList(count, `{"type":"computer_screenshot","file_id":"x"}`) + `}]}`
+			},
+		},
+		{
+			name:  "per-item tools",
+			limit: 128,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","tools":` + responsesTestJSONList(count, `{"type":"function","name":"f"}`) + `}]}`
+			},
+		},
+		{
+			name:  "pending safety checks",
+			limit: 128,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","input":[{"type":"computer_call","pending_safety_checks":` + responsesTestJSONList(count, `{"id":"check"}`) + `}]}`
+			},
+		},
+		{
+			name:  "acknowledged safety checks",
+			limit: 128,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","input":[{"type":"computer_call_output","acknowledged_safety_checks":` + responsesTestJSONList(count, `{"id":"check"}`) + `}]}`
+			},
+		},
+	}
+	accepted := 0
+	for _, test := range tests {
+		for _, count := range []int{test.limit, test.limit + 1} {
+			response := doResponsesRequest(t, servers.DataAddr(), rawKey, test.body(count), "application/json")
+			body, readErr := io.ReadAll(response.Body)
+			response.Body.Close()
+			if readErr != nil {
+				t.Fatalf("%s count %d: read response: %v", test.name, count, readErr)
+			}
+			if count == test.limit {
+				if response.StatusCode != http.StatusOK {
+					t.Fatalf("%s exact limit status = %d, body = %s", test.name, response.StatusCode, body)
+				}
+				accepted++
+				continue
+			}
+			if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte(`"invalid_json"`)) {
+				t.Fatalf("%s limit+1 status = %d, body = %s", test.name, response.StatusCode, body)
+			}
+		}
+	}
+	if upstreamCalls.Load() != int32(accepted) {
+		t.Fatalf("upstream calls = %d, want %d", upstreamCalls.Load(), accepted)
+	}
+}
+
 func TestResponsesCancellationCancelsUpstream(t *testing.T) {
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
@@ -502,6 +592,20 @@ func TestResponsesSSEFirstEventSurvivesWriteTimeout(t *testing.T) {
 	case <-time.After(13 * time.Second):
 		t.Fatal("SSE stream did not survive write timeout")
 	}
+}
+
+func responsesTestJSONList(count int, value string) string {
+	var builder strings.Builder
+	builder.Grow(count * (len(value) + 1))
+	builder.WriteByte('[')
+	for index := range count {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(value)
+	}
+	builder.WriteByte(']')
+	return builder.String()
 }
 
 func newResponsesTestServer(t *testing.T, upstreamURL string, policy *apikey.Policy) (*Servers, string) {
