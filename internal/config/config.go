@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"crypto/subtle"
 	"github.com/BurntSushi/toml"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
@@ -218,6 +219,20 @@ func (s SecurityConfig) CredentialKeySet(lookup func(string) (string, bool)) (en
 		s.CredentialEncryptionPreviousKeyVersions,
 		lookup,
 	)
+}
+
+// ValidateActiveKeyIndependence rejects reuse of one active key across domains.
+func ValidateActiveKeyIndependence(payload, credential envelope.KeySet) error {
+	if err := payload.Validate(); err != nil {
+		return fmt.Errorf("payload encryption keys: %w", err)
+	}
+	if err := credential.Validate(); err != nil {
+		return fmt.Errorf("credential encryption keys: %w", err)
+	}
+	if subtle.ConstantTimeCompare(payload.Active.Bytes[:], credential.Active.Bytes[:]) == 1 {
+		return fmt.Errorf("active payload and credential encryption keys must differ")
+	}
+	return nil
 }
 
 func loadEncryptionKeySet(kind, activeName string, activeVersion uint32, previousNames []string, previousVersions []uint32, lookup func(string) (string, bool)) (envelope.KeySet, error) {

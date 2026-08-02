@@ -13,6 +13,7 @@ import (
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/payload"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/server"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 	"gorm.io/gorm"
@@ -48,6 +49,14 @@ func run(args []string) error {
 		return err
 	}
 
+	payloadKeys, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
+	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
+	if payloadErr == nil && credentialErr == nil {
+		if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
+			return err
+		}
+	}
+
 	readiness := server.NewReadiness()
 	var db *gorm.DB
 	storageReady := false
@@ -57,6 +66,8 @@ func run(args []string) error {
 	} else {
 		db, err = storage.Open(context.Background(), databasePath, cfg.Storage.BusyTimeout)
 		if err != nil {
+			log.Printf("storage is unavailable: %v", err)
+		} else if err := payload.Migrate(db); err != nil {
 			log.Printf("storage is unavailable: %v", err)
 		} else {
 			storageReady = true
@@ -73,8 +84,6 @@ func run(args []string) error {
 	}
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
-	_, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
-	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
 	keysReady = keysReady && payloadErr == nil && credentialErr == nil
 	var credentialAvailable func() bool
 	if credentialErr == nil {

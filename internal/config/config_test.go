@@ -214,3 +214,38 @@ func TestCredentialKeyRotationReadsOldAndWritesNewVersion(t *testing.T) {
 		t.Fatalf("new key version = %d, want 2", got)
 	}
 }
+
+func TestValidateActiveKeyIndependenceRejectsEqualBytes(t *testing.T) {
+	value := strings.Repeat("x", envelope.KeySize)
+	payloadKey, err := envelope.NewKey(1, []byte(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialKey, err := envelope.NewKey(2, []byte(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadKeys, err := envelope.NewKeySet(payloadKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialKeys, err := envelope.NewKeySet(credentialKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err == nil {
+		t.Fatal("equal active encryption keys were accepted")
+	}
+
+	differentKey, err := envelope.NewKey(2, []byte(strings.Repeat("y", envelope.KeySize)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	differentKeys, err := envelope.NewKeySet(differentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateActiveKeyIndependence(payloadKeys, differentKeys); err != nil {
+		t.Fatalf("different active encryption keys rejected: %v", err)
+	}
+}
