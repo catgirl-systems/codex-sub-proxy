@@ -12,6 +12,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 )
 
 func TestResponsesProviderErrorAfterStreamHeadersIsSafeSSE(t *testing.T) {
@@ -165,7 +168,8 @@ func TestResponsesPrivateTopLevelErrorIsSafeSSE(t *testing.T) {
 			t.Fatalf("private error field %q leaked: %s", private, body)
 		}
 	}
-	if strings.Count(stream, `"type":"error"`) != 1 || strings.Count(stream, "[DONE]") != 1 {
+	if strings.Count(stream, `"type":"error"`) != 1 || strings.Count(stream, "[DONE]") != 1 ||
+		strings.Contains(stream, `"type":"response.completed"`) {
 		t.Fatalf("stream = %s", body)
 	}
 	for _, record := range strings.Split(stream, "\n") {
@@ -226,6 +230,102 @@ func TestResponsesFailedStreamHasOneSafeTerminal(t *testing.T) {
 	}
 	if strings.Contains(string(body), "synthetic upstream failure") {
 		t.Fatal("provider failure body leaked")
+	}
+}
+
+func TestResponsesMissingTerminalResponseIsSafeSSE(t *testing.T) {
+	for _, eventType := range []string{
+		codex.CodexEventResponseCompleted,
+		codex.CodexEventResponseDone,
+		codex.CodexEventResponseIncomplete,
+		codex.CodexEventResponseFailed,
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(writer, fmt.Sprintf("data: {\"type\":%q,\"sequence_number\":0}\n\n", eventType))
+			}))
+			defer upstream.Close()
+			servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+			defer shutdownResponsesTestServer(t, servers)
+
+			response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := string(body)
+			if response.StatusCode != http.StatusOK || strings.Count(stream, `"type":"error"`) != 1 ||
+				strings.Count(stream, "[DONE]") != 1 || strings.Contains(stream, eventType) {
+				t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+			}
+			var errorEvent struct {
+				Type    string `json:"type"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			for _, record := range strings.Split(stream, "\n") {
+				if !strings.HasPrefix(record, "data: ") || strings.TrimPrefix(record, "data: ") == "[DONE]" {
+					continue
+				}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(record, "data: ")), &errorEvent); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if errorEvent.Type != "error" || errorEvent.Code != "upstream_protocol_error" ||
+				errorEvent.Message != "The upstream service returned an invalid response." {
+				t.Fatalf("safe terminal error = %#v", errorEvent)
+			}
+		})
+	}
+}
+
+func TestResponsesErrorCallbackStopsBeforeLaterTerminal(t *testing.T) {
+	releaseTerminal := make(chan struct{})
+	terminalStarted := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		flusher, ok := writer.(http.Flusher)
+		if !ok {
+			return
+		}
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"visible\",\"error\":{\"code\":\"provider-code\",\"message\":\"private\"}}\n\n")
+		flusher.Flush()
+		<-releaseTerminal
+		close(terminalStarted)
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+	defer response.Body.Close()
+	bodyCh := make(chan []byte, 1)
+	go func() {
+		body, _ := io.ReadAll(response.Body)
+		bodyCh <- body
+	}()
+	var body []byte
+	select {
+	case body = <-bodyCh:
+	case <-time.After(2 * time.Second):
+		close(releaseTerminal)
+		t.Fatal("public stream did not stop after provider error")
+	}
+	close(releaseTerminal)
+	select {
+	case <-terminalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("upstream terminal was not released")
+	}
+	stream := string(body)
+	if strings.Count(stream, `"type":"error"`) != 1 || strings.Count(stream, "[DONE]") != 1 ||
+		strings.Contains(stream, `"type":"response.completed"`) {
+		t.Fatalf("stream = %s", body)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 )
 
 const (
@@ -122,9 +123,112 @@ func (input *Input) UnmarshalJSON(data []byte) error {
 		*input = Input{String: &text}
 		return nil
 	case '[':
-		var items []InputItem
-		if err := json.Unmarshal(value, &items); err != nil {
+		var rawItems []json.RawMessage
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		if err := decoder.Decode(&rawItems); err != nil {
 			return fmt.Errorf("decode public input array: %w", err)
+		}
+		var extra json.RawMessage
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("decode public input array: multiple JSON values")
+			}
+			return fmt.Errorf("decode public input array: %w", err)
+		}
+		items := make([]InputItem, len(rawItems))
+		for index, rawItem := range rawItems {
+			itemValue := bytes.TrimSpace(rawItem)
+			if len(itemValue) == 0 || itemValue[0] != '{' {
+				return fmt.Errorf("decode public input item %d: item must be a JSON object", index)
+			}
+			itemDecoder := json.NewDecoder(bytes.NewReader(itemValue))
+			itemDecoder.DisallowUnknownFields()
+			if err := itemDecoder.Decode(&items[index]); err != nil {
+				return fmt.Errorf("decode public input item %d: %w", index, err)
+			}
+			if err := itemDecoder.Decode(&extra); err != io.EOF {
+				if err == nil {
+					return fmt.Errorf("decode public input item %d: multiple JSON values", index)
+				}
+				return fmt.Errorf("decode public input item %d: %w", index, err)
+			}
+			if nested := bytes.TrimSpace(items[index].Content); len(nested) != 0 && !bytes.Equal(nested, []byte("null")) {
+				switch nested[0] {
+				case '"':
+					var content string
+					contentDecoder := json.NewDecoder(bytes.NewReader(nested))
+					contentDecoder.DisallowUnknownFields()
+					if err := contentDecoder.Decode(&content); err != nil {
+						return fmt.Errorf("decode public input item %d content: %w", index, err)
+					}
+					if err := contentDecoder.Decode(&extra); err != io.EOF {
+						if err == nil {
+							return fmt.Errorf("decode public input item %d content: multiple JSON values", index)
+						}
+						return fmt.Errorf("decode public input item %d content: %w", index, err)
+					}
+				case '[':
+					var content []InputContent
+					contentDecoder := json.NewDecoder(bytes.NewReader(nested))
+					contentDecoder.DisallowUnknownFields()
+					if err := contentDecoder.Decode(&content); err != nil {
+						return fmt.Errorf("decode public input item %d content: %w", index, err)
+					}
+					if err := contentDecoder.Decode(&extra); err != io.EOF {
+						if err == nil {
+							return fmt.Errorf("decode public input item %d content: multiple JSON values", index)
+						}
+						return fmt.Errorf("decode public input item %d content: %w", index, err)
+					}
+				default:
+					return fmt.Errorf("decode public input item %d content: must be a string or array", index)
+				}
+			}
+			if nested := bytes.TrimSpace(items[index].Output); len(nested) != 0 && !bytes.Equal(nested, []byte("null")) {
+				switch nested[0] {
+				case '"':
+					var output string
+					outputDecoder := json.NewDecoder(bytes.NewReader(nested))
+					outputDecoder.DisallowUnknownFields()
+					if err := outputDecoder.Decode(&output); err != nil {
+						return fmt.Errorf("decode public input item %d output: %w", index, err)
+					}
+					if err := outputDecoder.Decode(&extra); err != io.EOF {
+						if err == nil {
+							return fmt.Errorf("decode public input item %d output: multiple JSON values", index)
+						}
+						return fmt.Errorf("decode public input item %d output: %w", index, err)
+					}
+				case '{':
+					var output InputContent
+					outputDecoder := json.NewDecoder(bytes.NewReader(nested))
+					outputDecoder.DisallowUnknownFields()
+					if err := outputDecoder.Decode(&output); err != nil {
+						return fmt.Errorf("decode public input item %d output: %w", index, err)
+					}
+					if err := outputDecoder.Decode(&extra); err != io.EOF {
+						if err == nil {
+							return fmt.Errorf("decode public input item %d output: multiple JSON values", index)
+						}
+						return fmt.Errorf("decode public input item %d output: %w", index, err)
+					}
+				case '[':
+					var output []InputContent
+					outputDecoder := json.NewDecoder(bytes.NewReader(nested))
+					outputDecoder.DisallowUnknownFields()
+					if err := outputDecoder.Decode(&output); err != nil {
+						return fmt.Errorf("decode public input item %d output: %w", index, err)
+					}
+					if err := outputDecoder.Decode(&extra); err != io.EOF {
+						if err == nil {
+							return fmt.Errorf("decode public input item %d output: multiple JSON values", index)
+						}
+						return fmt.Errorf("decode public input item %d output: %w", index, err)
+					}
+				default:
+					return fmt.Errorf("decode public input item %d output: must be a string, object, or array", index)
+				}
+			}
 		}
 		*input = Input{Items: items}
 		return nil

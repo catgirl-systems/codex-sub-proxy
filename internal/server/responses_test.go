@@ -87,7 +87,7 @@ func TestResponsesComputerCallFieldsReachCodex(t *testing.T) {
 	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
 	defer shutdownResponsesTestServer(t, servers)
 
-	requestBody := `{"model":"gpt-5.6-sol","input":[{"type":"computer_call","id":"public-computer","call_id":"public-call","action":{"type":"click","button":"left","x":4,"y":5},"actions":[{"type":"screenshot"}],"pending_safety_checks":[{"id":"public-safety","code":"confirm","message":"public safety"}],"status":"completed"},{"type":"computer_call_output","call_id":"public-call","output":{"type":"computer_screenshot","file_id":"public-screen"},"acknowledged_safety_checks":[{"id":"public-safety","code":"confirm","message":"public safety"}],"status":"completed"},{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"public-function","parameters":{"type":"object"},"strict":false}]}]}`
+	requestBody := `{"model":"gpt-5.6-sol","input":[{"type":"computer_call","id":"public-computer","call_id":"public-call","action":{"type":"click","button":"left","x":4,"y":5},"actions":[{"type":"screenshot"}],"pending_safety_checks":[{"id":"public-safety","code":"confirm","message":"public safety"}],"status":"completed"},{"type":"computer_call_output","call_id":"public-call","output":{"type":"computer_screenshot","file_id":"public-screen"},"acknowledged_safety_checks":[{"id":"public-safety","code":"confirm","message":"public safety"}],"status":"completed"},{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"public-function","parameters":{"type":"object"},"strict":false}]},{"type":"function_call","call_id":"public-function-call","name":"public-function","arguments":"{\"value\":1}"}]}`
 	response := doResponsesRequest(t, servers.DataAddr(), rawKey, requestBody, "application/json")
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -101,7 +101,7 @@ func TestResponsesComputerCallFieldsReachCodex(t *testing.T) {
 	if err := json.Unmarshal(body, &privateRequest); err != nil {
 		t.Fatalf("decode private computer-call request: %v", err)
 	}
-	if privateRequest.Input == nil || len(privateRequest.Input.Items) != 3 {
+	if privateRequest.Input == nil || len(privateRequest.Input.Items) != 4 {
 		t.Fatalf("private computer-call input = %#v", privateRequest.Input)
 	}
 	computerCall := privateRequest.Input.Items[0]
@@ -116,10 +116,22 @@ func TestResponsesComputerCallFieldsReachCodex(t *testing.T) {
 		computerOutput.AcknowledgedSafetyChecks[0].ID != "public-safety" {
 		t.Fatalf("private computer output = %#v", computerOutput)
 	}
-	additionalTools := privateRequest.Input.Items[2]
-	if len(additionalTools.Tools) != 1 || additionalTools.Tools[0].Name != "public-function" ||
-		string(additionalTools.Tools[0].Parameters) != `{"type":"object"}` {
-		t.Fatalf("private additional tools = %#v", additionalTools)
+	functionCall := privateRequest.Input.Items[3]
+	if functionCall.Arguments == nil || string(functionCall.Arguments) != `"{\"value\":1}"` {
+		t.Fatalf("private function call arguments = %s", functionCall.Arguments)
+	}
+	for index, item := range privateRequest.Input.Items[:3] {
+		var fields map[string]json.RawMessage
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			t.Fatalf("encode private input item %d: %v", index, err)
+		}
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatalf("decode private input item %d: %v", index, err)
+		}
+		if _, found := fields["arguments"]; found {
+			t.Fatalf("private input item %d has unsupported empty arguments: %s", index, encoded)
+		}
 	}
 }
 func TestPublicComputerOutputMappingPreservesSafetyChecks(t *testing.T) {
@@ -210,6 +222,18 @@ func TestResponsesSupportedFieldsReachCodexAndUnknownFieldsReject(t *testing.T) 
 	response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown field status = %d", response.StatusCode)
+	}
+	for _, body := range []string{
+		`{"model":"gpt-5.6-sol","input":[{"type":"message","content":[{"type":"input_text","txet":"fixture"}]}]}`,
+		`{"model":"gpt-5.6-sol","input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"fixture","filed_id":"typo"}}]}`,
+		`{"model":"gpt-5.6-sol","input":[{"type":"computer_call","pending_safety_checks":[{"id":"fixture","idd":"typo"}]}]}`,
+		`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","tools":[{"type":"function","nam":"fixture"}]}]}`,
+	} {
+		response = doResponsesRequest(t, servers.DataAddr(), rawKey, body, "application/json")
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("nested unknown field status = %d, body = %s", response.StatusCode, body)
+		}
 	}
 	if upstreamCalls.Load() != 1 {
 		t.Fatalf("upstream calls after unknown field = %d", upstreamCalls.Load())

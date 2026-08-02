@@ -161,6 +161,24 @@ func TestPublicRequestUnionsRoundTripAndRejectInvalidForms(t *testing.T) {
 	}
 }
 
+func TestPublicInputStrictDecodingRejectsUnknownNestedFields(t *testing.T) {
+	tests := []string{
+		`[{"typo":"message"}]`,
+		`[{"type":"message","content":[{"type":"input_text","txet":"fixture"}]}]`,
+		`[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"fixture","filed_id":"typo"}}]`,
+		`[{"type":"computer_call","pending_safety_checks":[{"id":"fixture","idd":"typo"}]}]`,
+		`[{"type":"additional_tools","tools":[{"type":"function","nam":"fixture"}]}]`,
+		`[null]`,
+		`[1]`,
+	}
+	for _, raw := range tests {
+		var input Input
+		if err := json.Unmarshal([]byte(raw), &input); err == nil {
+			t.Fatalf("invalid input accepted: %s", raw)
+		}
+	}
+}
+
 func TestPublicStreamEventArgumentsAndAnnotationRoundTrip(t *testing.T) {
 	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}","annotation":{"type":"url_citation","url":"https://example.test"}}`)
 	var event ResponseStreamEvent

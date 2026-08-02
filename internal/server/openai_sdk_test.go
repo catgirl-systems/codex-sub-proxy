@@ -74,6 +74,44 @@ func TestOfficialOpenAISDKUsesOnlyBaseURLAndAPIKey(t *testing.T) {
 		t.Fatalf("official SDK stream events = %d, terminals = %d, typed completed = %t", eventCount, terminalCount, sawTypedCompleted)
 	}
 }
+
+func TestOfficialOpenAISDKReceivesTypedStreamError(t *testing.T) {
+	fixture := []byte("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"visible\",\"error\":{\"code\":\"provider-code\",\"type\":\"provider_error\",\"message\":\"private provider message\"}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	upstream := newResponseFixtureUpstream(t, fixture)
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	stream := client.Responses.NewStreaming(context.Background(), responses.ResponseNewParams{
+		Model: shared.ResponsesModel("gpt-5.6-sol"),
+		Input: responses.ResponseNewParamsInputUnion{OfString: sdk.String("fixture input")},
+	})
+	errorCount := 0
+	var errorEvent responses.ResponseErrorEvent
+	for stream.Next() {
+		event := stream.Current()
+		if event.Type != "error" {
+			continue
+		}
+		var ok bool
+		errorEvent, ok = event.AsAny().(responses.ResponseErrorEvent)
+		if !ok {
+			t.Fatalf("official SDK error union = %T", event.AsAny())
+		}
+		errorCount++
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("official SDK stream error event: %v", err)
+	}
+	if errorCount != 1 || errorEvent.Code != "provider-code" ||
+		errorEvent.Message != "The upstream service returned an error." {
+		t.Fatalf("official SDK error events = %d, event = %#v", errorCount, errorEvent)
+	}
+}
 func TestOfficialOpenAISDKComputerCallRoundTrip(t *testing.T) {
 	fixture := []byte("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"computer-response\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}}\n\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"computer-response\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}]}}\n\ndata: [DONE]\n\n")
 	upstream := newResponseFixtureUpstream(t, fixture)

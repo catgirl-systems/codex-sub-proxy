@@ -182,9 +182,13 @@ func privateInput(input *openai.Input) (*codex.CodexInput, error) {
 	case input.String == nil && input.Items != nil:
 		items := make([]codex.CodexInputItem, 0, len(input.Items))
 		for _, item := range input.Items {
-			arguments, err := json.Marshal(item.Arguments)
-			if err != nil {
-				return nil, fmt.Errorf("encode private input arguments: %w", err)
+			var arguments json.RawMessage
+			if item.Arguments != "" {
+				var err error
+				arguments, err = json.Marshal(item.Arguments)
+				if err != nil {
+					return nil, fmt.Errorf("encode private input arguments: %w", err)
+				}
 			}
 			tools, err := privateTools(item.Tools)
 			if err != nil {
@@ -337,6 +341,9 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		if isCodexTerminal(event.Type) || event.Error != nil {
 			terminalWritten = true
 		}
+		if event.Error != nil || event.Type == codex.CodexEventError {
+			return errors.New("upstream error event terminated public stream")
+		}
 		return nil
 	})
 	if requestContext.Err() != nil {
@@ -395,18 +402,13 @@ func isCodexTerminal(eventType string) bool {
 }
 
 func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, error) {
-	if event.Type == codex.CodexEventResponseMetadata {
-		return nil, false, nil
-	}
-	if event.Type == codex.CodexEventResponseDone {
-		event.Type = codex.CodexEventResponseCompleted
-		event.Raw = normalizeCompletedEvent(event.Raw)
-	}
-	if event.Type == codex.CodexEventError ||
-		(event.Error != nil && (event.Type != codex.CodexEventResponseFailed || event.Response == nil)) {
-		code := "upstream_error"
+	if event.Error != nil || event.Type == codex.CodexEventError {
+		code := event.Code
 		if event.Error != nil && event.Error.Code != "" {
 			code = event.Error.Code
+		}
+		if code == "" {
+			code = "upstream_error"
 		}
 		payload, err := json.Marshal(openai.ResponseErrorEvent{
 			Type:           openai.EventError,
@@ -422,6 +424,16 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 			return nil, false, errors.New("public Responses error event exceeds limit")
 		}
 		return payload, true, nil
+	}
+	if event.Type == codex.CodexEventResponseMetadata {
+		return nil, false, nil
+	}
+	if isCodexTerminal(event.Type) && event.Type != codex.CodexEventError && event.Response == nil {
+		return nil, false, fmt.Errorf("%w: terminal event response is missing", codex.ErrCodexStreamMalformed)
+	}
+	if event.Type == codex.CodexEventResponseDone {
+		event.Type = codex.CodexEventResponseCompleted
+		event.Raw = normalizeCompletedEvent(event.Raw)
 	}
 	eventCode, eventMessage := event.Code, event.Message
 	if event.Type == codex.CodexEventResponseFailed {
