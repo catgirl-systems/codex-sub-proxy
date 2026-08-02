@@ -104,6 +104,47 @@ func TestOfficialOpenAISDKNormalizesResponseDone(t *testing.T) {
 		t.Fatalf("normalized completed response = %#v", completed.Response)
 	}
 }
+func TestOfficialOpenAISDKReceivesTypedFailedResponse(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_failed.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := newResponseFixtureUpstream(t, fixture)
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	stream := client.Responses.NewStreaming(context.Background(), responses.ResponseNewParams{
+		Model: shared.ResponsesModel("gpt-5.6-sol"),
+		Input: responses.ResponseNewParamsInputUnion{OfString: sdk.String("fixture input")},
+	})
+	var failed responses.ResponseFailedEvent
+	for stream.Next() {
+		event := stream.Current()
+		if event.Type != "response.failed" {
+			continue
+		}
+		var ok bool
+		failed, ok = event.AsAny().(responses.ResponseFailedEvent)
+		if !ok {
+			t.Fatalf("official SDK failed union = %T", event.AsAny())
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("official SDK failed stream: %v", err)
+	}
+	if string(failed.Response.Status) != "failed" || string(failed.Response.Error.Code) != "server_error" ||
+		failed.Response.Error.Message != "The upstream service returned an error." {
+		t.Fatalf("official SDK failed response = %#v", failed.Response)
+	}
+	if bytes.Contains([]byte(failed.RawJSON()), []byte("synthetic upstream failure")) {
+		t.Fatal("private provider failure message leaked through SDK failed event")
+	}
+}
 
 func TestOfficialOpenAISDKReceivesTypedSafeError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -141,6 +182,45 @@ func TestOfficialOpenAISDKReceivesTypedSafeError(t *testing.T) {
 	}
 	if bytes.Contains([]byte(safeError.RawJSON()), []byte("private provider message")) {
 		t.Fatal("private provider message leaked through SDK error")
+	}
+}
+
+func TestOfficialOpenAISDKReceivesTypedPrivateEventError(t *testing.T) {
+	fixture := []byte("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"visible\",\"param\":\"prompt\",\"error\":{\"code\":\"server_error\",\"type\":\"provider_error\",\"message\":\"private provider message\",\"plan_type\":\"pro\",\"retry_after\":4.5,\"resets_at\":1738888890}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	upstream := newResponseFixtureUpstream(t, fixture)
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	stream := client.Responses.NewStreaming(context.Background(), responses.ResponseNewParams{
+		Model: shared.ResponsesModel("gpt-5.6-sol"),
+		Input: responses.ResponseNewParamsInputUnion{OfString: sdk.String("fixture input")},
+	})
+	var safeError responses.ResponseErrorEvent
+	for stream.Next() {
+		event := stream.Current()
+		if event.Type != "error" {
+			continue
+		}
+		var ok bool
+		safeError, ok = event.AsAny().(responses.ResponseErrorEvent)
+		if !ok {
+			t.Fatalf("official SDK private error union = %T", event.AsAny())
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("official SDK private error stream: %v", err)
+	}
+	if safeError.Code != "server_error" || safeError.Message != "The upstream service returned an error." ||
+		safeError.Param != "prompt" || safeError.SequenceNumber != 1 {
+		t.Fatalf("official SDK private error = %#v", safeError)
+	}
+	if bytes.Contains([]byte(safeError.RawJSON()), []byte("private provider message")) {
+		t.Fatal("private provider message leaked through SDK private error")
 	}
 }
 

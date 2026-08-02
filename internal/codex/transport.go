@@ -256,10 +256,10 @@ func (transport *ResponsesTransport) Stream(ctx context.Context, request CodexRe
 }
 
 func (transport *ResponsesTransport) streamAttempt(ctx context.Context, body, webSocketBody []byte, headers HeaderConfig, onEvent func(CodexResponseStreamEvent) error) (CodexStreamResult, *http.Response, error) {
-	buffer := &codexReplayBuffer{onEvent: onEvent}
 	if transport.policy == ResponsesTransportSSE {
-		return transport.trySSE(ctx, body, headers, buffer.emit)
+		return transport.trySSE(ctx, body, headers, onEvent)
 	}
+	buffer := &codexReplayBuffer{onEvent: onEvent}
 	result, authResponse, err, fallback := transport.tryWebSocket(ctx, webSocketBody, headers, buffer.emit)
 	if authResponse != nil || err == nil {
 		return result, authResponse, err
@@ -271,8 +271,7 @@ func (transport *ResponsesTransport) streamAttempt(ctx context.Context, body, we
 		return result, nil, err
 	}
 	buffer.discard()
-	sseBuffer := &codexReplayBuffer{onEvent: onEvent}
-	return transport.trySSE(ctx, body, headers, sseBuffer.emit)
+	return transport.trySSE(ctx, body, headers, onEvent)
 }
 
 type codexReplayBuffer struct {
@@ -508,6 +507,7 @@ func decodeCodexErrorEvent(frame []byte) (CodexResponseStreamEvent, error) {
 		Error          *CodexError                `json:"error,omitempty"`
 		Code           string                     `json:"code,omitempty"`
 		Message        string                     `json:"message,omitempty"`
+		Param          string                     `json:"param,omitempty"`
 		Headers        map[string]json.RawMessage `json:"headers,omitempty"`
 	}
 	if err := json.Unmarshal(frame, &wire); err != nil {
@@ -519,6 +519,7 @@ func decodeCodexErrorEvent(frame []byte) (CodexResponseStreamEvent, error) {
 		Error:          wire.Error,
 		Code:           wire.Code,
 		Message:        wire.Message,
+		Param:          wire.Param,
 		Raw:            append([]byte(nil), frame...),
 	}
 	if len(wire.Headers) != 0 {

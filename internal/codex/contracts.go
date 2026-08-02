@@ -367,6 +367,7 @@ type CodexResponseStreamEvent struct {
 	Logprobs          []CodexTextLogprob `json:"logprobs,omitempty"`
 	Code              string             `json:"code,omitempty"`
 	Message           string             `json:"message,omitempty"`
+	Param             string             `json:"param,omitempty"`
 	ItemID            string             `json:"item_id,omitempty"`
 	OutputIndex       int                `json:"output_index"`
 	ContentIndex      int                `json:"content_index"`

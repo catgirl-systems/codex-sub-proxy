@@ -167,6 +167,56 @@ func TestResponsesTransportStreamDeliversIncrementally(t *testing.T) {
 		t.Fatal("transport.Stream did not finish")
 	}
 }
+func TestResponsesTransportSSEDeliversPreambleBeforeAbruptClose(t *testing.T) {
+	firstEvent := []byte("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\"}}\n\n")
+	firstReceived := make(chan struct{})
+	release := make(chan struct{})
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		flusher, ok := writer.(http.Flusher)
+		if !ok {
+			return
+		}
+		_, _ = writer.Write(firstEvent)
+		flusher.Flush()
+		close(firstReceived)
+		<-release
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+	events := make(chan CodexResponseStreamEvent, 1)
+	errorsReturned := make(chan error, 1)
+	go func() {
+		errorsReturned <- transport.Stream(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}, func(event CodexResponseStreamEvent) error {
+			events <- event
+			return nil
+		})
+	}()
+	select {
+	case <-firstReceived:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush response.created")
+	}
+	select {
+	case event := <-events:
+		if event.Type != CodexEventResponseCreated {
+			t.Fatalf("first event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("response.created was not delivered before upstream close")
+	}
+	close(release)
+	select {
+	case err := <-errorsReturned:
+		if !errors.Is(err, ErrCodexStreamAbruptClose) {
+			t.Fatalf("transport.Stream error = %v, want abrupt close", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transport.Stream did not finish")
+	}
+}
 func TestResponsesTransportStreamFallbackDiscardsReplayPreamble(t *testing.T) {
 	var sseRequests atomic.Int32
 	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {

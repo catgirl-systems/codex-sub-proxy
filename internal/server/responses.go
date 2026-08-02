@@ -298,7 +298,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
 			return err
 		}
-		if isCodexTerminal(event.Type) {
+		if isCodexTerminal(event.Type) || event.Error != nil {
 			terminalWritten = true
 		}
 		return nil
@@ -366,11 +366,17 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		event.Type = codex.CodexEventResponseCompleted
 		event.Raw = normalizeCompletedEvent(event.Raw)
 	}
-	if event.Type == codex.CodexEventError {
+	if event.Type == codex.CodexEventError ||
+		(event.Error != nil && (event.Type != codex.CodexEventResponseFailed || event.Response == nil)) {
+		code := "upstream_error"
+		if event.Error != nil && event.Error.Code != "" {
+			code = event.Error.Code
+		}
 		payload, err := json.Marshal(openai.ResponseErrorEvent{
 			Type:           openai.EventError,
-			Code:           "upstream_error",
+			Code:           code,
 			Message:        "The upstream service returned an error.",
+			Param:          event.Param,
 			SequenceNumber: event.SequenceNumber,
 		})
 		if err != nil {
@@ -381,6 +387,11 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		}
 		return payload, true, nil
 	}
+	eventCode, eventMessage := event.Code, event.Message
+	if event.Type == codex.CodexEventResponseFailed {
+		eventCode, eventMessage = "", ""
+	}
+
 	if len(event.Raw) != 0 && rawPublicEvent(event.Raw, event.Type) {
 		payload := bytes.TrimSpace(event.Raw)
 		if json.Valid(payload) && !bytes.ContainsAny(payload, "\r\n") && len(payload) <= maxResponsesEventBytes {
@@ -403,8 +414,8 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		Annotation:        append([]byte(nil), event.Annotation...),
 		Text:              event.Text,
 		Logprobs:          publicLogprobs(event.Logprobs),
-		Code:              event.Code,
-		Message:           event.Message,
+		Code:              eventCode,
+		Message:           eventMessage,
 		ItemID:            event.ItemID,
 		OutputIndex:       event.OutputIndex,
 		ContentIndex:      event.ContentIndex,
@@ -444,6 +455,9 @@ func rawPublicEvent(raw []byte, eventType string) bool {
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false
+	}
+	if errorValue, found := fields["error"]; found && !bytes.Equal(bytes.TrimSpace(errorValue), []byte("null")) {
 		return false
 	}
 	if _, found := fields["headers"]; found {

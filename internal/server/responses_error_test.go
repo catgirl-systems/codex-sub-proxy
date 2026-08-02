@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -34,6 +35,96 @@ func TestResponsesProviderErrorAfterStreamHeadersIsSafeSSE(t *testing.T) {
 	}
 	if strings.Contains(string(body), `"error":`) || strings.Contains(string(body), "private provider body") {
 		t.Fatalf("unsafe provider error reached public stream: %s", body)
+	}
+}
+func TestResponsesAbruptSSEPublishesPreambleBeforeSafeError(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\"}}\n\n")
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := string(body)
+	if response.StatusCode != http.StatusOK ||
+		strings.Count(stream, `"type":"response.created"`) != 1 ||
+		strings.Count(stream, `"type":"error"`) != 1 ||
+		strings.Count(stream, "[DONE]") != 1 {
+		t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+	}
+	if strings.Index(stream, `"type":"response.created"`) > strings.Index(stream, `"type":"error"`) {
+		t.Fatalf("safe error preceded response.created: %s", body)
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
+	}
+}
+
+func TestResponsesPrivateTopLevelErrorIsSafeSSE(t *testing.T) {
+	fixture := []byte("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"visible\",\"code\":\"provider-code\",\"message\":\"provider message\",\"param\":\"prompt\",\"error\":{\"code\":\"server_error\",\"type\":\"provider_error\",\"message\":\"nested provider message\",\"plan_type\":\"pro\",\"retry_after\":4.5,\"resets_at\":1738888890}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := string(body)
+	for _, private := range []string{"provider-code", "provider message", "nested provider message", "plan_type", "retry_after", "resets_at"} {
+		if strings.Contains(stream, private) {
+			t.Fatalf("private error field %q leaked: %s", private, body)
+		}
+	}
+	if strings.Count(stream, `"type":"error"`) != 1 || strings.Count(stream, "[DONE]") != 1 {
+		t.Fatalf("stream = %s", body)
+	}
+	for _, record := range strings.Split(stream, "\n") {
+		if !strings.HasPrefix(record, "data: ") || strings.TrimPrefix(record, "data: ") == "[DONE]" {
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(record, "data: ")), &fields); err != nil {
+			t.Fatalf("decode public event: %v", err)
+		}
+		if string(fields["type"]) != `"error"` {
+			continue
+		}
+		for name := range fields {
+			switch name {
+			case "type", "code", "message", "param", "sequence_number":
+			default:
+				t.Fatalf("public error field %q is not official: %s", name, record)
+			}
+		}
+		var code, message, param string
+		if err := json.Unmarshal(fields["code"], &code); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(fields["message"], &message); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(fields["param"], &param); err != nil {
+			t.Fatal(err)
+		}
+		if code != "server_error" || message != "The upstream service returned an error." || param != "prompt" {
+			t.Fatalf("public error fields = code %q message %q param %q", code, message, param)
+		}
 	}
 }
 
