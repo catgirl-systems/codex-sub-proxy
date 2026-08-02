@@ -1,0 +1,13 @@
+providers:
+  codex-sub-proxy:
+    baseUrl: http://127.0.0.1:4000/v1
+    api: openai-responses
+    apiKey: CODEX_SUB_PROXY_API_KEY
+    models:
+      - id: gpt-5.6-sol
+        name: GPT-5.6 Sol via Codex Subscription Proxy
+        reasoning: true
+        input: [text, image]
+        hostedImageGeneration: true
+        contextWindow: 372000
+        maxTokens: 128000
