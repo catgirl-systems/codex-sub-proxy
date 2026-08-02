@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/go-playground/validator/v10"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -34,9 +35,9 @@ var credentialSaveMu sync.Mutex
 // Credential contains Codex OAuth material and its non-secret identity.
 // SaveCredential encrypts the credential before it writes it to disk.
 type Credential struct {
-	AccessToken      string    `json:"access_token"`
-	IDToken          string    `json:"id_token,omitempty"`
-	RefreshToken     string    `json:"refresh_token"`
+	AccessToken      string    `json:"access_token" validate:"required,max=65536"`
+	IDToken          string    `json:"id_token,omitempty" validate:"max=65536"`
+	RefreshToken     string    `json:"refresh_token" validate:"required,max=65536"`
 	ExpiresAt        time.Time `json:"expires_at"`
 	AccountID        string    `json:"account_id"`
 	UserID           string    `json:"user_id"`
@@ -44,6 +45,31 @@ type Credential struct {
 	PlanType         string    `json:"plan_type"`
 	AccountIsFedRAMP bool      `json:"account_is_fedramp"`
 	Email            string    `json:"email,omitempty"`
+}
+
+var credentialValidation = func() *validator.Validate {
+	instance := validator.New()
+	instance.RegisterStructValidation(credentialStructValidation, Credential{})
+	return instance
+}()
+
+func credentialStructValidation(sl validator.StructLevel) {
+	credential, ok := sl.Current().Interface().(Credential)
+	if !ok {
+		return
+	}
+	if strings.ContainsAny(credential.AccessToken, "\r\n") {
+		sl.ReportError(credential.AccessToken, "AccessToken", "AccessToken", "no_line_breaks", "")
+	}
+	if strings.ContainsAny(credential.IDToken, "\r\n") {
+		sl.ReportError(credential.IDToken, "IDToken", "IDToken", "no_line_breaks", "")
+	}
+	if strings.ContainsAny(credential.RefreshToken, "\r\n") {
+		sl.ReportError(credential.RefreshToken, "RefreshToken", "RefreshToken", "no_line_breaks", "")
+	}
+	if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.Before(time.Unix(0, 0)) {
+		sl.ReportError(credential.ExpiresAt, "ExpiresAt", "ExpiresAt", "non_negative", "")
+	}
 }
 
 type codexAuthFile struct {
@@ -108,11 +134,8 @@ type standardClaims struct {
 
 // EncryptCredential returns a versioned authenticated credential envelope.
 func EncryptCredential(credential Credential, keys envelope.KeySet) ([]byte, error) {
-	if err := keys.Validate(); err != nil {
-		return nil, err
-	}
-	if err := validateCredential(credential, false); err != nil {
-		return nil, err
+	if err := credentialValidation.Struct(credential); err != nil {
+		return nil, fmt.Errorf("invalid credential: %w", err)
 	}
 	plain, err := json.Marshal(credential)
 	if err != nil {
@@ -127,9 +150,6 @@ func EncryptCredential(credential Credential, keys envelope.KeySet) ([]byte, err
 
 // DecryptCredential opens a credential envelope written by SaveCredential.
 func DecryptCredential(data []byte, keys envelope.KeySet) (Credential, error) {
-	if err := keys.Validate(); err != nil {
-		return Credential{}, err
-	}
 	plain, err := envelope.Decrypt(data, envelope.CredentialDomain, keys)
 	if err != nil {
 		return Credential{}, fmt.Errorf("decrypt credential: %w", err)
@@ -138,7 +158,7 @@ func DecryptCredential(data []byte, keys envelope.KeySet) (Credential, error) {
 	if err := json.Unmarshal(plain, &credential); err != nil {
 		return Credential{}, errors.New("decode credential")
 	}
-	if err := validateCredential(credential, false); err != nil {
+	if err := credentialValidation.Struct(credential); err != nil {
 		return Credential{}, errors.New("invalid credential")
 	}
 	return credential, nil
@@ -156,14 +176,10 @@ func saveCredential(ctx context.Context, path string, credential Credential, key
 	if err := checkCredentialContext(ctx, "save credential"); err != nil {
 		return err
 	}
-	path = strings.TrimSpace(path)
-	if path == "" {
+	if strings.TrimSpace(path) == "" {
 		return errors.New("credential path is empty")
 	}
-	if err := keys.Validate(); err != nil {
-		return err
-	}
-	if err := validateCredential(credential, false); err != nil {
+	if err := credentialValidation.Struct(credential); err != nil {
 		return err
 	}
 	encoded, err := EncryptCredential(credential, keys)
@@ -188,14 +204,10 @@ func saveCredentialIfUnchanged(ctx context.Context, path string, expected, repla
 	if err := checkCredentialContext(ctx, "compare credential"); err != nil {
 		return Credential{}, false, err
 	}
-	path = strings.TrimSpace(path)
-	if path == "" {
+	if strings.TrimSpace(path) == "" {
 		return Credential{}, false, errors.New("credential path is empty")
 	}
-	if err := keys.Validate(); err != nil {
-		return Credential{}, false, err
-	}
-	if err := validateCredential(replacement, false); err != nil {
+	if err := credentialValidation.Struct(replacement); err != nil {
 		return Credential{}, false, err
 	}
 	encoded, err := EncryptCredential(replacement, keys)
@@ -388,16 +400,41 @@ func writeCredential(ctx context.Context, path string, encoded []byte) error {
 
 // LoadCredential reads and decrypts a credential without exposing token bytes.
 func LoadCredential(path string, keys envelope.KeySet) (Credential, error) {
-	if err := keys.Validate(); err != nil {
+	if _, err := envelope.NewKeySet(keys.Active, keys.Previous...); err != nil {
 		return Credential{}, err
 	}
 	return loadCredential(path, keys)
 }
 
 func loadCredential(path string, keys envelope.KeySet) (Credential, error) {
-	data, err := readRegularFile(path, maxCredentialFileBytes)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return Credential{}, errors.New("credential path is empty")
+	}
+	linkInfo, err := os.Lstat(path)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, fmt.Errorf("stat credential file: %w", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink != 0 {
+		return Credential{}, errors.New("credential file is a symbolic link")
+	}
+	if !linkInfo.Mode().IsRegular() {
+		return Credential{}, errors.New("credential file is not a regular file")
+	}
+	if linkInfo.Size() > maxCredentialFileBytes {
+		return Credential{}, errors.New("credential file is too large")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return Credential{}, fmt.Errorf("open credential file: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxCredentialFileBytes+1))
+	if err != nil {
+		return Credential{}, fmt.Errorf("read credential file: %w", err)
+	}
+	if int64(len(data)) > maxCredentialFileBytes {
+		return Credential{}, errors.New("credential file is too large")
 	}
 	return DecryptCredential(data, keys)
 }
@@ -420,7 +457,7 @@ func ImportCredential(ctx context.Context, sourcePath, destinationPath string, k
 	if ctx == nil {
 		return Credential{}, errors.New("credential import context is nil")
 	}
-	if err := keys.Validate(); err != nil {
+	if _, err := envelope.NewKeySet(keys.Active, keys.Previous...); err != nil {
 		return Credential{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -494,7 +531,7 @@ func readImportedCredential(ctx context.Context, sourcePath string) (Credential,
 		authInfo, authErr := os.Stat(authPath)
 		switch {
 		case authErr == nil && !authInfo.Mode().IsRegular():
-			return Credential{}, nil, errors.New("Codex auth file is not a regular file")
+			return Credential{}, nil, errors.New("codex auth file is not a regular file")
 		case authErr == nil:
 			credential, err := readCredentialJSON(authPath)
 			if err != nil {
@@ -502,7 +539,7 @@ func readImportedCredential(ctx context.Context, sourcePath string) (Credential,
 			}
 			return credential, authInfo, nil
 		case !os.IsNotExist(authErr):
-			return Credential{}, nil, fmt.Errorf("inspect Codex auth file: %w", authErr)
+			return Credential{}, nil, fmt.Errorf("inspect codex auth file: %w", authErr)
 		}
 		data, keyringErr := readCodexKeyring(ctx, sourcePath)
 		if keyringErr != nil {
@@ -524,9 +561,34 @@ func readImportedCredential(ctx context.Context, sourcePath string) (Credential,
 }
 
 func readCredentialJSON(path string) (Credential, error) {
-	data, err := readRegularFile(path, maxCredentialJSONBytes)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return Credential{}, errors.New("credential path is empty")
+	}
+	linkInfo, err := os.Lstat(path)
 	if err != nil {
-		return Credential{}, fmt.Errorf("read credential source: %w", err)
+		return Credential{}, fmt.Errorf("stat credential file: %w", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink != 0 {
+		return Credential{}, errors.New("credential file is a symbolic link")
+	}
+	if !linkInfo.Mode().IsRegular() {
+		return Credential{}, errors.New("credential file is not a regular file")
+	}
+	if linkInfo.Size() > maxCredentialJSONBytes {
+		return Credential{}, errors.New("credential file is too large")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return Credential{}, fmt.Errorf("open credential file: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxCredentialJSONBytes+1))
+	if err != nil {
+		return Credential{}, fmt.Errorf("read credential file: %w", err)
+	}
+	if int64(len(data)) > maxCredentialJSONBytes {
+		return Credential{}, errors.New("credential file is too large")
 	}
 	credential, err := parseCredentialJSON(data)
 	if err != nil {
@@ -616,14 +678,14 @@ func readOMPCredential(ctx context.Context, path string) (Credential, error) {
 		return Credential{}, errors.New("read OMP credential database")
 	}
 	if strings.TrimSpace(row.Data) == "" {
-		return Credential{}, errors.New("OMP Codex credential is missing")
+		return Credential{}, errors.New("omp codex credential is missing")
 	}
 	return parseCredentialJSON([]byte(row.Data))
 }
 
 func readCodexKeyring(ctx context.Context, codexHome string) ([]byte, error) {
 	if runtime.GOOS != "darwin" {
-		return nil, errors.New("Codex keyring import is not supported on this platform")
+		return nil, errors.New("codex keyring import is not supported on this platform")
 	}
 	absolute, err := filepath.Abs(codexHome)
 	if err != nil {
@@ -643,19 +705,19 @@ func readCodexKeyring(ctx context.Context, codexHome string) ([]byte, error) {
 	command := exec.CommandContext(keyringContext, "security", "find-generic-password", "-s", "Codex Auth", "-a", account, "-w")
 	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return nil, errors.New("read Codex keyring")
+		return nil, errors.New("read codex keyring")
 	}
 	command.Stderr = io.Discard
 	if err := command.Start(); err != nil {
-		return nil, errors.New("read Codex keyring")
+		return nil, errors.New("read codex keyring")
 	}
 	data, readErr := io.ReadAll(io.LimitReader(stdout, maxCredentialJSONBytes+1))
 	waitErr := command.Wait()
 	if readErr != nil || waitErr != nil {
-		return nil, errors.New("Codex keyring credential is unavailable")
+		return nil, errors.New("codex keyring credential is unavailable")
 	}
 	if len(data) > maxCredentialJSONBytes {
-		return nil, errors.New("Codex keyring credential is too large")
+		return nil, errors.New("codex keyring credential is too large")
 	}
 	return data, nil
 }
@@ -725,8 +787,11 @@ func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.T
 			idClaims.ProfileEmail(),
 		)
 	}
-	if err := validateCredential(credential, requireIdentity); err != nil {
-		return Credential{}, err
+	if err := credentialValidation.Struct(credential); err != nil {
+		return Credential{}, errors.New("invalid credential")
+	}
+	if requireIdentity && credential.AccountID == "" {
+		return Credential{}, errors.New("credential is missing account identity")
 	}
 	return credential, nil
 }
@@ -768,28 +833,6 @@ func (claims identityClaims) ProfileEmail() string {
 		return ""
 	}
 	return claims.Profile.Email
-}
-func validateCredential(credential Credential, requireIdentity bool) error {
-	if credential.AccessToken == "" || credential.RefreshToken == "" {
-		return errors.New("credential is missing OAuth tokens")
-	}
-	if len(credential.AccessToken) > maxTokenBytes ||
-		len(credential.IDToken) > maxTokenBytes ||
-		len(credential.RefreshToken) > maxTokenBytes {
-		return errors.New("credential token is too large")
-	}
-	if strings.ContainsAny(credential.AccessToken, "\r\n") ||
-		strings.ContainsAny(credential.IDToken, "\r\n") ||
-		strings.ContainsAny(credential.RefreshToken, "\r\n") {
-		return errors.New("credential token contains invalid characters")
-	}
-	if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.Before(time.Unix(0, 0)) {
-		return errors.New("credential expiry is invalid")
-	}
-	if requireIdentity && credential.AccountID == "" {
-		return errors.New("credential is missing account identity")
-	}
-	return nil
 }
 
 func jwtIdentity(token string) identityClaims {
@@ -842,37 +885,4 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func readRegularFile(path string, maxBytes int64) ([]byte, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil, errors.New("credential path is empty")
-	}
-	linkInfo, err := os.Lstat(path)
-	if err != nil {
-		return nil, fmt.Errorf("stat credential file: %w", err)
-	}
-	if linkInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("credential file is a symbolic link")
-	}
-	if !linkInfo.Mode().IsRegular() {
-		return nil, errors.New("credential file is not a regular file")
-	}
-	if linkInfo.Size() > maxBytes {
-		return nil, errors.New("credential file is too large")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open credential file: %w", err)
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read credential file: %w", err)
-	}
-	if int64(len(data)) > maxBytes {
-		return nil, errors.New("credential file is too large")
-	}
-	return data, nil
 }

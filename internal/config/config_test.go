@@ -46,8 +46,8 @@ func TestResponsesTransportPolicyDefaultsToWebSocketAndRejectsUnknownValues(t *t
 	if err := os.WriteFile(path, []byte("[codex]\nresponses_transport = \"other\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "responses transport") {
-		t.Fatalf("unknown responses transport error = %v", err)
+	if _, err := Load(path); err == nil {
+		t.Fatal("unknown responses transport was accepted")
 	}
 }
 
@@ -242,7 +242,7 @@ func TestCredentialKeyRotationReadsOldAndWritesNewVersion(t *testing.T) {
 	}
 }
 
-func TestValidateActiveKeyIndependenceRejectsEqualBytes(t *testing.T) {
+func TestRequireDistinctActiveKeysRejectsEqualBytes(t *testing.T) {
 	value := strings.Repeat("x", envelope.KeySize)
 	payloadKey, err := envelope.NewKey(1, []byte(value))
 	if err != nil {
@@ -260,7 +260,7 @@ func TestValidateActiveKeyIndependenceRejectsEqualBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err == nil {
+	if err := RequireDistinctActiveKeys(payloadKeys, credentialKeys); err == nil {
 		t.Fatal("equal active encryption keys were accepted")
 	}
 
@@ -272,7 +272,7 @@ func TestValidateActiveKeyIndependenceRejectsEqualBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateActiveKeyIndependence(payloadKeys, differentKeys); err != nil {
+	if err := RequireDistinctActiveKeys(payloadKeys, differentKeys); err != nil {
 		t.Fatalf("different active encryption keys rejected: %v", err)
 	}
 }

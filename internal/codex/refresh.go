@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,8 +40,8 @@ type CredentialSnapshot struct {
 
 // RefresherOptions selects the OAuth endpoint and HTTP client.
 type RefresherOptions struct {
-	Issuer     string
-	ClientID   string
+	Issuer     string `validate:"required,max=65536,url,issuer"`
+	ClientID   string `validate:"required,max=65536"`
 	HTTPClient *http.Client
 }
 
@@ -114,30 +115,18 @@ func NewRefresher(path string, keys envelope.KeySet, options RefresherOptions) (
 	if path == "" {
 		return nil, errors.New("credential path is empty")
 	}
-	if err := keys.Validate(); err != nil {
-		return nil, err
-	}
-	issuer := strings.TrimSpace(options.Issuer)
-	if issuer == "" {
-		issuer = defaultIssuer
-	}
-	var err error
-	issuer, err = validateIssuer(issuer)
+	validatedKeys, err := envelope.NewKeySet(keys.Active, keys.Previous...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid credential encryption keys: %w", err)
 	}
-	clientID := strings.TrimSpace(options.ClientID)
-	if clientID == "" {
-		clientID = defaultClientID
-	}
-	if len(clientID) > maxOAuthValueBytes {
-		return nil, errors.New("OAuth client ID is too large")
+	if err := oauthValidation.Struct(options); err != nil {
+		return nil, fmt.Errorf("invalid OAuth refresh options: %w", err)
 	}
 	return &Refresher{
 		path:     path,
-		keys:     keys,
-		issuer:   issuer,
-		clientID: clientID,
+		keys:     validatedKeys,
+		issuer:   options.Issuer,
+		clientID: options.ClientID,
 		client:   oauthClient(options.HTTPClient),
 	}, nil
 }

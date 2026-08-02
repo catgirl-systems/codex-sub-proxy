@@ -56,7 +56,7 @@ func TestRefresherSingleFlightPersistsRotatedCredential(t *testing.T) {
 	}))
 	defer server.Close()
 
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestRefresherSnapshotDoesNotWaitForActiveRefresh(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
 	}))
 	defer server.Close()
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestRefresherCanceledWaiterDoesNotCancelRefresh(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
 	}))
 	defer server.Close()
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +269,7 @@ func TestRefresherLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
 	}))
 	defer server.Close()
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestRefresherConcurrentCredentialReplacementWins(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"access_token":"refresh-access","refresh_token":"refresh-token","expires_in":3600}`)
 	}))
 	defer server.Close()
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +407,7 @@ func TestRefresherRejectsMissingRotatedRefreshToken(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"access_token":"new-access","expires_in":3600}`)
 	}))
 	defer server.Close()
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestRefresherPlainTextUnauthorizedClassification(t *testing.T) {
 			_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
 		}))
 		defer server.Close()
-		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -485,7 +485,7 @@ func TestRefresherPlainTextUnauthorizedClassification(t *testing.T) {
 			http.Error(writer, "invalid grant "+secret, http.StatusUnauthorized)
 		}))
 		defer server.Close()
-		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -507,7 +507,7 @@ func TestRefresherPlainTextUnauthorizedClassification(t *testing.T) {
 func TestRefresherSnapshotTransitions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credential.enc")
 	keys := testCredentialKeys(t)
-	refresher, err := NewRefresher(path, keys, RefresherOptions{})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: "http://127.0.0.1", ClientID: "client"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +568,7 @@ func TestRefresherPermanentAndTransientFailures(t *testing.T) {
 			http.Error(writer, `{"error":"invalid_grant","error_description":"`+secret+`"}`, http.StatusBadRequest)
 		}))
 		defer server.Close()
-		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -614,7 +614,7 @@ func TestRefresherPermanentAndTransientFailures(t *testing.T) {
 			_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
 		}))
 		defer server.Close()
-		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -657,7 +657,7 @@ func TestRefresherRetriesOnlyReplaySafe401Once(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
 	}))
 	defer server.Close()
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}

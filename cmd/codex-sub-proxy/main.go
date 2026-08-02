@@ -57,7 +57,7 @@ func run(args []string) error {
 	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
 	apiKeyHMACKey, apiKeyHMACErr := cfg.Security.APIKeyHMACKey(os.LookupEnv)
 	if payloadErr == nil && credentialErr == nil {
-		if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
+		if err := config.RequireDistinctActiveKeys(payloadKeys, credentialKeys); err != nil {
 			return err
 		}
 	}
@@ -95,7 +95,10 @@ func run(args []string) error {
 	var credentialSnapshot func() server.CredentialSnapshot
 	if credentialErr == nil {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
-			if refresher, refreshErr := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{}); refreshErr == nil {
+			if refresher, refreshErr := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{
+				Issuer:   "https://auth.openai.com",
+				ClientID: "app_EMoamEEZ73f0CkXaXp7hrann",
+			}); refreshErr == nil {
 				credentialSnapshot = func() server.CredentialSnapshot {
 					snapshot := refresher.Snapshot()
 					return server.CredentialSnapshot{
@@ -287,7 +290,7 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
+	if err := config.RequireDistinctActiveKeys(payloadKeys, credentialKeys); err != nil {
 		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
@@ -304,8 +307,10 @@ func runLogin(args []string) error {
 	flags := flag.NewFlagSet("codex-sub-proxy login", flag.ContinueOnError)
 	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
 	issuer := flags.String("issuer", "", "OAuth issuer URL")
+	clientID := flags.String("client-id", "", "OAuth client ID")
 	port := flags.Int("port", 0, "local OAuth callback port")
 	device := flags.Bool("device", false, "use device-code login")
+	pollInterval := flags.Duration("poll-interval", 0, "device-code polling interval")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -324,7 +329,7 @@ func runLogin(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
+	if err := config.RequireDistinctActiveKeys(payloadKeys, credentialKeys); err != nil {
 		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
@@ -335,8 +340,10 @@ func runLogin(args []string) error {
 	defer stop()
 	_, err = codex.LoginAndSave(ctx, codex.LoginOptions{
 		Issuer:       *issuer,
+		ClientID:     *clientID,
 		CallbackPort: *port,
 		Device:       *device,
+		PollInterval: *pollInterval,
 		OnAuthorizationURL: func(url string) {
 			fmt.Fprintln(os.Stdout, url)
 		},

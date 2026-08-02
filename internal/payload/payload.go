@@ -53,9 +53,11 @@ func Save(ctx context.Context, db *gorm.DB, id string, body []byte, keys envelop
 	if err := validateCall(ctx, db, id); err != nil {
 		return err
 	}
-	if err := keys.Validate(); err != nil {
+	validatedKeys, err := envelope.NewKeySet(keys.Active, keys.Previous...)
+	if err != nil {
 		return fmt.Errorf("validate payload encryption keys: %w", err)
 	}
+	keys = validatedKeys
 	if len(body) > MaxBodySize {
 		return errors.New("conversation body is too large")
 	}
@@ -84,16 +86,18 @@ func Load(ctx context.Context, db *gorm.DB, id string, keys envelope.KeySet) ([]
 	if err := validateCall(ctx, db, id); err != nil {
 		return nil, err
 	}
-	if err := keys.Validate(); err != nil {
+	validatedKeys, err := envelope.NewKeySet(keys.Active, keys.Previous...)
+	if err != nil {
 		return nil, fmt.Errorf("validate payload encryption keys: %w", err)
 	}
+	keys = validatedKeys
 
 	var record struct {
 		KeyVersion   uint32 `gorm:"column:key_version"`
 		Envelope     []byte `gorm:"column:encrypted_envelope"`
 		EnvelopeSize int64  `gorm:"column:envelope_size"`
 	}
-	err := db.WithContext(ctx).
+	err = db.WithContext(ctx).
 		Model(&Record{}).
 		Select(
 			"id, key_version, "+

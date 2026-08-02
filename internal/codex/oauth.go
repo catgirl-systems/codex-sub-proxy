@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/go-playground/validator/v10"
 	"io"
 	"net"
 	"net/http"
@@ -18,14 +20,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
 const (
-	defaultIssuer            = "https://auth.openai.com"
-	defaultClientID          = "app_EMoamEEZ73f0CkXaXp7hrann"
-	defaultCallbackPort      = 1455
 	oauthCallbackPath        = "/auth/callback"
 	deviceRedirectPath       = "/deviceauth/callback"
 	oauthScope               = "openid profile email offline_access api.connectors.read api.connectors.invoke"
@@ -33,7 +30,6 @@ const (
 	maxOAuthValueBytes       = 64 << 10
 	maxOAuthBodyBytes        = 64 << 10
 	oauthRequestTimeout      = 15 * time.Second
-	devicePollInterval       = 5 * time.Second
 	devicePollLifetime       = 15 * time.Minute
 	browserCallbackLifetime  = 5 * time.Minute
 	maxDeviceLifetimeSeconds = int64((1<<63 - 1) / int64(time.Second))
@@ -41,21 +37,96 @@ const (
 
 // PKCE contains the verifier and S256 challenge for one OAuth attempt.
 type PKCE struct {
-	Verifier  string
-	Challenge string
+	Verifier  string `validate:"required,max=65536"`
+	Challenge string `validate:"required,max=65536"`
 }
 
 // LoginOptions controls the standalone browser or device login flow.
 type LoginOptions struct {
-	Issuer             string
-	ClientID           string
-	CallbackPort       int
+	Issuer             string `validate:"required,max=65536,url,issuer"`
+	ClientID           string `validate:"required,max=65536"`
+	CallbackPort       int    `validate:"gte=0,lte=65535"`
 	Device             bool
 	HTTPClient         *http.Client
-	PollInterval       time.Duration
-	MaxPolls           int
+	PollInterval       time.Duration `validate:"omitempty,gt=0,lte=60000000000"`
+	MaxPolls           int           `validate:"gte=0"`
 	OnAuthorizationURL func(string)
 	OnDeviceCode       func(string, string)
+}
+
+type oauthAuthorizationRequest struct {
+	Issuer      string `validate:"required,max=65536,url,issuer"`
+	ClientID    string `validate:"required,max=65536"`
+	RedirectURI string `validate:"required,max=65536,url"`
+	PKCE        PKCE   `validate:"required"`
+	State       string `validate:"required,max=65536"`
+}
+
+type oauthExchangeRequest struct {
+	Issuer      string `validate:"required,max=65536,url,issuer"`
+	ClientID    string `validate:"required,max=65536"`
+	RedirectURI string `validate:"required,max=65536,url"`
+	Code        string `validate:"required,max=65536"`
+	Verifier    string `validate:"required,max=65536"`
+}
+
+type oauthCallback struct {
+	Path     string `validate:"required"`
+	Fragment string `validate:"max=0"`
+	Host     string
+	Absolute bool
+	State    []string `validate:"required,len=1,dive,required,max=65536"`
+	Code     []string `validate:"max=1,dive,required,max=65536"`
+	Error    []string `validate:"max=1,dive,required,max=65536"`
+}
+
+var oauthValidation = func() *validator.Validate {
+	instance := validator.New()
+	_ = instance.RegisterValidation("issuer", issuerURLValidation)
+	instance.RegisterStructValidation(loginOptionsStructValidation, LoginOptions{})
+	instance.RegisterStructValidation(oauthCallbackStructValidation, oauthCallback{})
+	return instance
+}()
+
+func issuerURLValidation(fl validator.FieldLevel) bool {
+	issuer, ok := fl.Field().Interface().(string)
+	if !ok {
+		return false
+	}
+	parsed, err := url.Parse(issuer)
+	return err == nil &&
+		parsed.Host != "" &&
+		(parsed.Scheme == "https" || parsed.Scheme == "http") &&
+		parsed.User == nil &&
+		parsed.RawQuery == "" &&
+		parsed.Fragment == "" &&
+		!strings.HasSuffix(issuer, "/")
+}
+
+func loginOptionsStructValidation(sl validator.StructLevel) {
+	options, ok := sl.Current().Interface().(LoginOptions)
+	if !ok {
+		return
+	}
+	if options.Device && options.PollInterval <= 0 {
+		sl.ReportError(options.PollInterval, "PollInterval", "PollInterval", "required_for_device", "")
+	}
+}
+
+func oauthCallbackStructValidation(sl validator.StructLevel) {
+	callback, ok := sl.Current().Interface().(oauthCallback)
+	if !ok {
+		return
+	}
+	if callback.Path != oauthCallbackPath {
+		sl.ReportError(callback.Path, "Path", "Path", "oauth_callback_path", oauthCallbackPath)
+	}
+	if callback.Absolute && callback.Host != "localhost" && callback.Host != "127.0.0.1" {
+		sl.ReportError(callback.Host, "Host", "Host", "oauth_callback_host", "localhost")
+	}
+	if (len(callback.Code) == 0) == (len(callback.Error) == 0) {
+		sl.ReportError(callback.Code, "Code", "Code", "success_or_error", "")
+	}
 }
 
 type tokenResponse struct {
@@ -154,30 +225,15 @@ func GenerateOAuthState() (string, error) {
 
 // BuildAuthorizationURL builds the Codex browser authorization URL.
 func BuildAuthorizationURL(issuer, clientID, redirectURI string, pkce PKCE, state string) (string, error) {
-	issuer, err := validateIssuer(issuer)
-	if err != nil {
-		return "", err
+	input := oauthAuthorizationRequest{
+		Issuer:      issuer,
+		ClientID:    clientID,
+		RedirectURI: redirectURI,
+		PKCE:        pkce,
+		State:       state,
 	}
-	if strings.TrimSpace(clientID) == "" {
-		return "", errors.New("OAuth client ID is empty")
-	}
-	if len(clientID) > maxOAuthValueBytes {
-		return "", errors.New("OAuth client ID is too large")
-	}
-	if strings.TrimSpace(redirectURI) == "" {
-		return "", errors.New("OAuth redirect URI is empty")
-	}
-	if len(redirectURI) > maxOAuthValueBytes {
-		return "", errors.New("OAuth redirect URI is too large")
-	}
-	if pkce.Verifier == "" || pkce.Challenge == "" {
-		return "", errors.New("PKCE values are empty")
-	}
-	if strings.TrimSpace(state) == "" {
-		return "", errors.New("OAuth state is empty")
-	}
-	if len(state) > maxOAuthValueBytes {
-		return "", errors.New("OAuth state is too large")
+	if err := oauthValidation.Struct(input); err != nil {
+		return "", fmt.Errorf("invalid OAuth authorization request: %w", err)
 	}
 	query := url.Values{
 		"response_type":              {"code"},
@@ -198,12 +254,11 @@ func BuildAuthorizationURL(issuer, clientID, redirectURI string, pkce PKCE, stat
 	return authorizationURL, nil
 }
 
-// ValidateOAuthCallback checks the callback path, state, and authorization code.
-func ValidateOAuthCallback(rawURL, expectedState string) (string, error) {
+func parseOAuthCallback(rawURL, expectedState string) (string, error) {
 	if len(rawURL) > maxOAuthURLBytes {
 		return "", errors.New("OAuth callback is too large")
 	}
-	if strings.TrimSpace(expectedState) == "" {
+	if expectedState == "" {
 		return "", errors.New("OAuth state is empty")
 	}
 	if len(expectedState) > maxOAuthValueBytes {
@@ -213,34 +268,47 @@ func ValidateOAuthCallback(rawURL, expectedState string) (string, error) {
 	if err != nil {
 		return "", errors.New("invalid OAuth callback URL")
 	}
-	if parsed.IsAbs() && parsed.Hostname() != "localhost" && parsed.Hostname() != "127.0.0.1" {
+	query := parsed.Query()
+	callback := oauthCallback{
+		Path:     parsed.Path,
+		Fragment: parsed.Fragment,
+		Host:     parsed.Hostname(),
+		Absolute: parsed.IsAbs(),
+		State:    query["state"],
+		Code:     query["code"],
+		Error:    query["error"],
+	}
+	if callback.Absolute && callback.Host != "localhost" && callback.Host != "127.0.0.1" {
 		return "", errors.New("invalid OAuth callback host")
 	}
-	if parsed.Path != oauthCallbackPath || parsed.Fragment != "" {
+	if callback.Path != oauthCallbackPath || callback.Fragment != "" {
 		return "", errors.New("invalid OAuth callback path")
 	}
-	query := parsed.Query()
-	states, ok := query["state"]
-	if !ok || len(states) != 1 || len(states[0]) > maxOAuthValueBytes {
+	if len(callback.State) != 1 || len(callback.State[0]) > maxOAuthValueBytes {
 		return "", errors.New("OAuth callback state is missing")
 	}
-	if subtle.ConstantTimeCompare([]byte(states[0]), []byte(expectedState)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(callback.State[0]), []byte(expectedState)) != 1 {
 		return "", errors.New("OAuth callback state mismatch")
 	}
-	if errorValues := query["error"]; len(errorValues) > 0 {
-		if len(errorValues) != 1 || strings.TrimSpace(errorValues[0]) == "" {
+	if len(callback.Error) > 0 {
+		if len(callback.Error) != 1 || strings.TrimSpace(callback.Error[0]) == "" {
 			return "", errors.New("OAuth callback error is invalid")
 		}
-		return "", fmt.Errorf("OAuth provider rejected login: %s", safeOAuthCode(errorValues[0]))
+		if len(callback.Code) > 0 {
+			return "", errors.New("OAuth callback success and error are both present")
+		}
+		if err := oauthValidation.Struct(callback); err != nil {
+			return "", errors.New("invalid OAuth callback")
+		}
+		return "", fmt.Errorf("OAuth provider rejected login: %s", safeOAuthCode(callback.Error[0]))
 	}
-	codes, ok := query["code"]
-	if !ok || len(codes) != 1 || strings.TrimSpace(codes[0]) == "" {
+	if len(callback.Code) != 1 || strings.TrimSpace(callback.Code[0]) == "" {
 		return "", errors.New("OAuth callback authorization code is missing")
 	}
-	if len(codes[0]) > maxOAuthValueBytes {
-		return "", errors.New("OAuth callback authorization code is too large")
+	if err := oauthValidation.Struct(callback); err != nil {
+		return "", errors.New("invalid OAuth callback")
 	}
-	return codes[0], nil
+	return callback.Code[0], nil
 }
 
 // ExchangeCode exchanges one authorization code for an encrypted-store-ready credential.
@@ -248,33 +316,15 @@ func ExchangeCode(ctx context.Context, client *http.Client, issuer, clientID, re
 	if ctx == nil {
 		return Credential{}, errors.New("OAuth exchange context is nil")
 	}
-	issuer, err := validateIssuer(issuer)
-	if err != nil {
-		return Credential{}, err
+	input := oauthExchangeRequest{
+		Issuer:      issuer,
+		ClientID:    clientID,
+		RedirectURI: redirectURI,
+		Code:        code,
+		Verifier:    verifier,
 	}
-	if strings.TrimSpace(clientID) == "" {
-		return Credential{}, errors.New("OAuth client ID is empty")
-	}
-	if len(clientID) > maxOAuthValueBytes {
-		return Credential{}, errors.New("OAuth client ID is too large")
-	}
-	if strings.TrimSpace(redirectURI) == "" {
-		return Credential{}, errors.New("OAuth redirect URI is empty")
-	}
-	if len(redirectURI) > maxOAuthValueBytes {
-		return Credential{}, errors.New("OAuth redirect URI is too large")
-	}
-	if strings.TrimSpace(code) == "" {
-		return Credential{}, errors.New("OAuth authorization code is empty")
-	}
-	if len(code) > maxOAuthValueBytes {
-		return Credential{}, errors.New("OAuth authorization code is too large")
-	}
-	if strings.TrimSpace(verifier) == "" {
-		return Credential{}, errors.New("OAuth PKCE verifier is empty")
-	}
-	if len(verifier) > maxOAuthValueBytes {
-		return Credential{}, errors.New("OAuth PKCE verifier is too large")
+	if err := oauthValidation.Struct(input); err != nil {
+		return Credential{}, fmt.Errorf("invalid OAuth exchange request: %w", err)
 	}
 	values := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -315,7 +365,9 @@ func Login(ctx context.Context, options LoginOptions) (Credential, error) {
 	if ctx == nil {
 		return Credential{}, errors.New("OAuth login context is nil")
 	}
-	options = normalizeLoginOptions(options)
+	if err := oauthValidation.Struct(options); err != nil {
+		return Credential{}, fmt.Errorf("invalid OAuth login options: %w", err)
+	}
 	if options.Device {
 		return deviceLogin(ctx, options)
 	}
@@ -334,32 +386,7 @@ func LoginAndSave(ctx context.Context, options LoginOptions, path string, keys e
 	return credential, nil
 }
 
-func normalizeLoginOptions(options LoginOptions) LoginOptions {
-	if strings.TrimSpace(options.Issuer) == "" {
-		options.Issuer = defaultIssuer
-	}
-	if strings.TrimSpace(options.ClientID) == "" {
-		options.ClientID = defaultClientID
-	}
-	if options.CallbackPort == 0 && !options.Device {
-		options.CallbackPort = defaultCallbackPort
-	}
-	if options.PollInterval <= 0 {
-		options.PollInterval = devicePollInterval
-	}
-	if options.PollInterval > time.Minute {
-		options.PollInterval = time.Minute
-	}
-	if options.MaxPolls < 0 {
-		options.MaxPolls = 0
-	}
-	return options
-}
-
 func browserLogin(ctx context.Context, options LoginOptions) (Credential, error) {
-	if options.CallbackPort < 0 || options.CallbackPort > 65535 {
-		return Credential{}, errors.New("OAuth callback port is invalid")
-	}
 	pkce, err := GeneratePKCE()
 	if err != nil {
 		return Credential{}, err
@@ -394,7 +421,7 @@ func browserLogin(ctx context.Context, options LoginOptions) (Credential, error)
 				http.Error(writer, "callback too large", http.StatusRequestURITooLong)
 				return
 			}
-			code, callbackErr := ValidateOAuthCallback(request.URL.RequestURI(), state)
+			code, callbackErr := parseOAuthCallback(request.URL.RequestURI(), state)
 			if callbackErr != nil {
 				http.Error(writer, callbackErr.Error(), http.StatusBadRequest)
 				if callbackStateMatches(request.URL, state) && callbackHasProviderError(request.URL) {
@@ -442,10 +469,7 @@ func browserLogin(ctx context.Context, options LoginOptions) (Credential, error)
 }
 
 func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) {
-	issuer, err := validateIssuer(options.Issuer)
-	if err != nil {
-		return Credential{}, err
-	}
+	issuer := options.Issuer
 	initBody, err := json.Marshal(struct {
 		ClientID string `json:"client_id"`
 	}{options.ClientID})
@@ -481,9 +505,6 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 	}
 	if device.Interval > 0 {
 		interval = time.Duration(device.Interval) * time.Second
-	}
-	if interval <= 0 {
-		interval = devicePollInterval
 	}
 	lifetime := devicePollLifetime
 	if device.ExpiresIn > 0 {
@@ -563,15 +584,6 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 		}
 		return ExchangeCode(pollContext, options.HTTPClient, issuer, options.ClientID, issuer+deviceRedirectPath, token.AuthorizationCode, token.CodeVerifier)
 	}
-}
-
-func validateIssuer(issuer string) (string, error) {
-	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
-	parsed, err := url.Parse(issuer)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", errors.New("OAuth issuer URL is invalid")
-	}
-	return issuer, nil
 }
 
 func callbackStateMatches(parsed *url.URL, expectedState string) bool {

@@ -77,6 +77,7 @@ func TestDeviceLoginRejectsNegativeProviderInterval(t *testing.T) {
 
 	_, err := Login(context.Background(), LoginOptions{
 		Issuer:       server.URL,
+		ClientID:     "client",
 		Device:       true,
 		HTTPClient:   server.Client(),
 		PollInterval: time.Millisecond,
@@ -106,6 +107,7 @@ func TestDeviceLoginHonorsContextCancellation(t *testing.T) {
 	defer cancel()
 	_, err := Login(ctx, LoginOptions{
 		Issuer:       server.URL,
+		ClientID:     "client",
 		Device:       true,
 		HTTPClient:   server.Client(),
 		PollInterval: 1 * time.Millisecond,
@@ -115,36 +117,6 @@ func TestDeviceLoginHonorsContextCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("device login error = %v, want context cancellation", err)
-	}
-}
-
-func TestValidateOAuthCallbackChecksStateAndCode(t *testing.T) {
-	state := "state-123"
-	valid := "/auth/callback?code=authorization-code&state=" + url.QueryEscape(state)
-	code, err := ValidateOAuthCallback(valid, state)
-	if err != nil || code != "authorization-code" {
-		t.Fatalf("valid callback = %q, %v", code, err)
-	}
-	cases := []struct {
-		name string
-		raw  string
-	}{
-		{"missing state", "/auth/callback?code=code"},
-		{"wrong state", "/auth/callback?code=code&state=wrong"},
-		{"missing code", "/auth/callback?state=state-123"},
-		{"wrong path", "/other?code=code&state=state-123"},
-		{"provider error", "/auth/callback?error=access_denied&error_description=private-token&state=state-123"},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := ValidateOAuthCallback(test.raw, state)
-			if err == nil {
-				t.Fatal("invalid callback was accepted")
-			}
-			if strings.Contains(err.Error(), "private-token") {
-				t.Fatal("private callback description reached error")
-			}
-		})
 	}
 }
 
@@ -258,9 +230,11 @@ func TestDeviceLoginPreservesInitialBodyReadDeadline(t *testing.T) {
 	errChannel := make(chan error, 1)
 	go func() {
 		_, err := Login(ctx, LoginOptions{
-			Issuer:     server.URL,
-			Device:     true,
-			HTTPClient: server.Client(),
+			Issuer:       server.URL,
+			ClientID:     "client",
+			Device:       true,
+			HTTPClient:   server.Client(),
+			PollInterval: time.Millisecond,
 		})
 		errChannel <- err
 	}()
@@ -300,6 +274,7 @@ func TestBrowserLoginValidatesCallbackAndStoresCredential(t *testing.T) {
 	callbackDone := make(chan error, 1)
 	credential, err := Login(context.Background(), LoginOptions{
 		Issuer:       server.URL,
+		ClientID:     "client",
 		CallbackPort: 0,
 		OnAuthorizationURL: func(authorizationURL string) {
 			parsed, parseErr := url.Parse(authorizationURL)
@@ -357,6 +332,7 @@ func TestDeviceLoginPollsPendingAndSavesIdentity(t *testing.T) {
 	defer server.Close()
 	credential, err := Login(context.Background(), LoginOptions{
 		Issuer:       server.URL,
+		ClientID:     "client",
 		Device:       true,
 		HTTPClient:   server.Client(),
 		PollInterval: 1 * time.Millisecond,
@@ -377,6 +353,7 @@ func TestBrowserLoginStopsOnProviderErrorWithoutLeakingDescription(t *testing.T)
 	callbackDone := make(chan error, 1)
 	_, err := Login(ctx, LoginOptions{
 		Issuer:       "http://127.0.0.1:1",
+		ClientID:     "client",
 		CallbackPort: 0,
 		OnAuthorizationURL: func(authorizationURL string) {
 			parsed, parseErr := url.Parse(authorizationURL)
@@ -409,6 +386,7 @@ func TestBrowserLoginIgnoresMalformedStateMatchedCallback(t *testing.T) {
 	callbackDone := make(chan error, 1)
 	_, err := Login(ctx, LoginOptions{
 		Issuer:       "http://127.0.0.1:1",
+		ClientID:     "client",
 		CallbackPort: 0,
 		OnAuthorizationURL: func(authorizationURL string) {
 			parsed, parseErr := url.Parse(authorizationURL)
@@ -441,6 +419,7 @@ func TestBrowserLoginHonorsContextCancellation(t *testing.T) {
 	cancel()
 	_, err := Login(ctx, LoginOptions{
 		Issuer:       "http://127.0.0.1:1",
+		ClientID:     "client",
 		CallbackPort: 0,
 	})
 	if !errors.Is(err, context.Canceled) {

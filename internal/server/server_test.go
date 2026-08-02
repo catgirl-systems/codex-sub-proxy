@@ -94,7 +94,10 @@ func TestReadinessReflectsCredentialChanges(t *testing.T) {
 	}
 
 	readiness := NewReadiness()
-	refresher, err := codex.NewRefresher(credentialPath, credentialKey, codex.RefresherOptions{})
+	refresher, err := codex.NewRefresher(credentialPath, credentialKey, codex.RefresherOptions{
+		Issuer:   "https://auth.openai.com",
+		ClientID: "app_EMoamEEZ73f0CkXaXp7hrann",
+	})
 	if err != nil {
 		t.Fatalf("new refresher: %v", err)
 	}

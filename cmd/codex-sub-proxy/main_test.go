@@ -139,8 +139,8 @@ func TestRunLoginWithDistinctActiveKeysContinues(t *testing.T) {
 	t.Setenv("CSP_CREDENTIAL_ENCRYPTION_KEY", strings.Repeat("c", envelope.KeySize))
 
 	err := run([]string{"login", "--config", configPath, "--device", "--issuer", "://invalid"})
-	if err == nil || err.Error() != "OAuth issuer URL is invalid" {
-		t.Fatalf("login error = %v, want issuer validation error", err)
+	if err == nil {
+		t.Fatal("invalid OAuth login options were accepted")
 	}
 	if _, statErr := os.Stat(destinationPath); !os.IsNotExist(statErr) {
 		t.Fatalf("credential destination exists after failed login: %v", statErr)

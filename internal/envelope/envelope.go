@@ -6,6 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
+
+	"github.com/go-playground/validator/v10"
 )
 
 const (
@@ -30,14 +33,39 @@ const (
 
 // Key is one AES-256 key with its stored version.
 type Key struct {
-	Version uint32
+	Version uint32 `validate:"gt=0"`
 	Bytes   [KeySize]byte
 }
 
 // KeySet contains the active key and keys that can decrypt old records.
 type KeySet struct {
 	Active   Key
-	Previous []Key
+	Previous []Key `validate:"max=4,unique=Version,dive"`
+}
+
+var keySetValidation = func() *validator.Validate {
+	instance := validator.New()
+	instance.RegisterStructValidation(keySetStructValidation, KeySet{})
+	return instance
+}()
+
+func keySetStructValidation(sl validator.StructLevel) {
+	keys, ok := sl.Current().Interface().(KeySet)
+	if !ok {
+		return
+	}
+	for index, key := range keys.Previous {
+		if key.Version == keys.Active.Version {
+			sl.ReportError(
+				keys.Previous,
+				"Previous",
+				"Previous",
+				"different_from_active",
+				fmt.Sprintf("%d", index),
+			)
+			return
+		}
+	}
 }
 
 var envelopeMagic = [4]byte{'C', 'S', 'P', 'E'}
@@ -59,40 +87,15 @@ func NewKey(version uint32, value []byte) (Key, error) {
 // NewKeySet validates the active and previous keys.
 func NewKeySet(active Key, previous ...Key) (KeySet, error) {
 	keys := KeySet{Active: active, Previous: append([]Key(nil), previous...)}
-	if err := keys.Validate(); err != nil {
-		return KeySet{}, err
+	if err := keySetValidation.Struct(keys); err != nil {
+		return KeySet{}, fmt.Errorf("invalid encryption key set: %w", err)
 	}
 	return keys, nil
 }
 
-// Validate checks key versions and the bounded previous-key list.
-func (keys KeySet) Validate() error {
-	if keys.Active.Version == 0 {
-		return errors.New("active encryption key is invalid")
-	}
-	if len(keys.Previous) > MaxPreviousKeys {
-		return errors.New("too many previous encryption keys")
-	}
-	for index, key := range keys.Previous {
-		if key.Version == 0 {
-			return errors.New("previous encryption key is invalid")
-		}
-		if key.Version == keys.Active.Version {
-			return errors.New("encryption key versions must be unique")
-		}
-		for previousIndex := range index {
-			if key.Version == keys.Previous[previousIndex].Version {
-				return errors.New("encryption key versions must be unique")
-			}
-		}
-	}
-	return nil
-}
-
-// Encrypt creates a versioned authenticated envelope with the active key.
 func Encrypt(plaintext []byte, domain Domain, keys KeySet) ([]byte, error) {
-	if err := keys.Validate(); err != nil {
-		return nil, err
+	if err := keySetValidation.Struct(keys); err != nil {
+		return nil, fmt.Errorf("invalid encryption key set: %w", err)
 	}
 	domainTag, err := domainTag(domain)
 	if err != nil {
@@ -131,10 +134,9 @@ func Encrypt(plaintext []byte, domain Domain, keys KeySet) ([]byte, error) {
 	return envelope, nil
 }
 
-// Decrypt authenticates an envelope with the active or previous key.
 func Decrypt(data []byte, domain Domain, keys KeySet) ([]byte, error) {
-	if err := keys.Validate(); err != nil {
-		return nil, err
+	if err := keySetValidation.Struct(keys); err != nil {
+		return nil, fmt.Errorf("invalid encryption key set: %w", err)
 	}
 	domainTag, err := domainTag(domain)
 	if err != nil {

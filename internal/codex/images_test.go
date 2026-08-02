@@ -237,7 +237,7 @@ func TestImagesClientRefreshesOnceAfterUnauthorized(t *testing.T) {
 	}, keys); err != nil {
 		t.Fatal(err)
 	}
-	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestImagesClientLiveOptIn(t *testing.T) {
 	if err != nil {
 		t.Skip("CSP_CREDENTIAL_ENCRYPTION_KEY is not a usable credential key")
 	}
-	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{})
+	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: "https://auth.openai.com", ClientID: "client"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +549,7 @@ func newTestImagesClient(t *testing.T, server *httptest.Server, accessToken, acc
 	}, keys); err != nil {
 		t.Fatal(err)
 	}
-	refresher, err := NewRefresher(path, keys, RefresherOptions{HTTPClient: server.Client()})
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 
 	if err != nil {
 		t.Fatal(err)

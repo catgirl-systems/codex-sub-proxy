@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,18 +36,18 @@ type ServerConfig struct {
 
 type StorageConfig struct {
 	SQLitePath  string        `toml:"sqlite_path" validate:"required"`
-	BusyTimeout time.Duration `toml:"busy_timeout" validate:"gt=0"`
+	BusyTimeout time.Duration `toml:"busy_timeout" validate:"gt=0,lte=86400000000000"`
 }
 
 type SecurityConfig struct {
 	PayloadEncryptionKeyEnv                 string   `toml:"payload_encryption_key_env" validate:"required"`
 	PayloadEncryptionKeyVersion             uint32   `toml:"payload_encryption_key_version" validate:"gt=0"`
-	PayloadEncryptionPreviousKeyEnvs        []string `toml:"payload_encryption_previous_key_envs" validate:"max=4,dive,required"`
-	PayloadEncryptionPreviousKeyVersions    []uint32 `toml:"payload_encryption_previous_key_versions" validate:"max=4,dive,gt=0"`
+	PayloadEncryptionPreviousKeyEnvs        []string `toml:"payload_encryption_previous_key_envs" validate:"max=4,unique,dive,required"`
+	PayloadEncryptionPreviousKeyVersions    []uint32 `toml:"payload_encryption_previous_key_versions" validate:"max=4,unique,dive,gt=0"`
 	CredentialEncryptionKeyEnv              string   `toml:"credential_encryption_key_env" validate:"required"`
 	CredentialEncryptionKeyVersion          uint32   `toml:"credential_encryption_key_version" validate:"gt=0"`
-	CredentialEncryptionPreviousKeyEnvs     []string `toml:"credential_encryption_previous_key_envs" validate:"max=4,dive,required"`
-	CredentialEncryptionPreviousKeyVersions []uint32 `toml:"credential_encryption_previous_key_versions" validate:"max=4,dive,gt=0"`
+	CredentialEncryptionPreviousKeyEnvs     []string `toml:"credential_encryption_previous_key_envs" validate:"max=4,unique,dive,required"`
+	CredentialEncryptionPreviousKeyVersions []uint32 `toml:"credential_encryption_previous_key_versions" validate:"max=4,unique,dive,gt=0"`
 	APIKeyHMACKeyEnv                        string   `toml:"api_key_hmac_key_env" validate:"required"`
 	AdminTokenHMACKeyEnv                    string   `toml:"admin_token_hmac_key_env" validate:"required"`
 }
@@ -63,12 +64,80 @@ type CodexConfig struct {
 	ResponsesTransport ResponsesTransport `toml:"responses_transport" validate:"oneof=websocket_preferred sse"`
 }
 
-func (c CodexConfig) Validate() error {
-	switch c.ResponsesTransport {
-	case ResponsesTransportWebSocketPreferred, ResponsesTransportSSE:
-		return nil
-	default:
-		return fmt.Errorf("responses transport %q is not supported", c.ResponsesTransport)
+var configurationValidation = func() *validator.Validate {
+	instance := validator.New()
+	instance.RegisterStructValidation(securityConfigStructValidation, SecurityConfig{})
+	instance.RegisterStructValidation(activeKeySetPairStructValidation, activeKeySetPair{})
+	return instance
+}()
+
+type activeKeySetPair struct {
+	Payload    envelope.KeySet
+	Credential envelope.KeySet
+}
+
+func activeKeySetPairStructValidation(sl validator.StructLevel) {
+	pair, ok := sl.Current().Interface().(activeKeySetPair)
+	if !ok {
+		return
+	}
+	if subtle.ConstantTimeCompare(pair.Payload.Active.Bytes[:], pair.Credential.Active.Bytes[:]) == 1 {
+		sl.ReportError(
+			pair.Credential.Active.Bytes,
+			"CredentialActiveKey",
+			"CredentialActiveKey",
+			"different_from_payload",
+			"",
+		)
+	}
+}
+
+func securityConfigStructValidation(sl validator.StructLevel) {
+	security, ok := sl.Current().Interface().(SecurityConfig)
+	if !ok {
+		return
+	}
+	if len(security.PayloadEncryptionPreviousKeyEnvs) != len(security.PayloadEncryptionPreviousKeyVersions) {
+		sl.ReportError(
+			security.PayloadEncryptionPreviousKeyVersions,
+			"PayloadEncryptionPreviousKeyVersions",
+			"payload_encryption_previous_key_versions",
+			"same_length",
+			"PayloadEncryptionPreviousKeyEnvs",
+		)
+	}
+	if len(security.CredentialEncryptionPreviousKeyEnvs) != len(security.CredentialEncryptionPreviousKeyVersions) {
+		sl.ReportError(
+			security.CredentialEncryptionPreviousKeyVersions,
+			"CredentialEncryptionPreviousKeyVersions",
+			"credential_encryption_previous_key_versions",
+			"same_length",
+			"CredentialEncryptionPreviousKeyEnvs",
+		)
+	}
+	for _, version := range security.PayloadEncryptionPreviousKeyVersions {
+		if version == security.PayloadEncryptionKeyVersion {
+			sl.ReportError(
+				security.PayloadEncryptionPreviousKeyVersions,
+				"PayloadEncryptionPreviousKeyVersions",
+				"payload_encryption_previous_key_versions",
+				"different_from_active",
+				"",
+			)
+			break
+		}
+	}
+	for _, version := range security.CredentialEncryptionPreviousKeyVersions {
+		if version == security.CredentialEncryptionKeyVersion {
+			sl.ReportError(
+				security.CredentialEncryptionPreviousKeyVersions,
+				"CredentialEncryptionPreviousKeyVersions",
+				"credential_encryption_previous_key_versions",
+				"different_from_active",
+				"",
+			)
+			break
+		}
 	}
 }
 
@@ -113,90 +182,10 @@ func Load(path string) (Config, error) {
 	if err := applyEnvironment(&cfg); err != nil {
 		return Config{}, err
 	}
-	if err := cfg.Validate(); err != nil {
-		return Config{}, err
+	if err := configurationValidation.Struct(cfg); err != nil {
+		return Config{}, fmt.Errorf("validate configuration: %w", err)
 	}
 	return cfg, nil
-}
-
-func (c Config) Validate() error {
-	if err := c.Codex.Validate(); err != nil {
-		return fmt.Errorf("codex configuration: %w", err)
-	}
-	if err := validator.New().Struct(c); err != nil {
-		return fmt.Errorf("validate configuration: %w", err)
-	}
-	if strings.TrimSpace(c.Server.Listen) == "" {
-		return fmt.Errorf("server listen address is empty")
-	}
-	if strings.TrimSpace(c.Server.AdminListen) == "" {
-		return fmt.Errorf("server admin listen address is empty")
-	}
-	if strings.TrimSpace(c.Storage.SQLitePath) == "" {
-		return fmt.Errorf("storage sqlite path is empty")
-	}
-	if c.Storage.BusyTimeout <= 0 {
-		return fmt.Errorf("storage busy timeout must be positive")
-	}
-	if c.Storage.BusyTimeout > 24*time.Hour {
-		return fmt.Errorf("storage busy timeout is too large")
-	}
-	if err := c.Security.Validate(); err != nil {
-		return fmt.Errorf("security configuration: %w", err)
-	}
-	return nil
-}
-
-// Validate checks key names, versions, and rotation bounds.
-func (s SecurityConfig) Validate() error {
-	if strings.TrimSpace(s.PayloadEncryptionKeyEnv) == "" ||
-		strings.TrimSpace(s.CredentialEncryptionKeyEnv) == "" ||
-		strings.TrimSpace(s.APIKeyHMACKeyEnv) == "" ||
-		strings.TrimSpace(s.AdminTokenHMACKeyEnv) == "" {
-		return fmt.Errorf("encryption and HMAC key environment names are required")
-	}
-	if s.PayloadEncryptionKeyVersion == 0 || s.CredentialEncryptionKeyVersion == 0 {
-		return fmt.Errorf("encryption key versions must be positive")
-	}
-	if len(s.PayloadEncryptionPreviousKeyEnvs) != len(s.PayloadEncryptionPreviousKeyVersions) ||
-		len(s.CredentialEncryptionPreviousKeyEnvs) != len(s.CredentialEncryptionPreviousKeyVersions) {
-		return fmt.Errorf("previous encryption key names and versions must match")
-	}
-	if len(s.PayloadEncryptionPreviousKeyEnvs) > envelope.MaxPreviousKeys ||
-		len(s.CredentialEncryptionPreviousKeyEnvs) > envelope.MaxPreviousKeys {
-		return fmt.Errorf("too many previous encryption keys")
-	}
-	for index, version := range s.PayloadEncryptionPreviousKeyVersions {
-		if version == 0 || version == s.PayloadEncryptionKeyVersion {
-			return fmt.Errorf("payload encryption key versions are invalid")
-		}
-		for previousIndex := range index {
-			if version == s.PayloadEncryptionPreviousKeyVersions[previousIndex] {
-				return fmt.Errorf("payload encryption key versions are invalid")
-			}
-		}
-	}
-	for index, version := range s.CredentialEncryptionPreviousKeyVersions {
-		if version == 0 || version == s.CredentialEncryptionKeyVersion {
-			return fmt.Errorf("credential encryption key versions are invalid")
-		}
-		for previousIndex := range index {
-			if version == s.CredentialEncryptionPreviousKeyVersions[previousIndex] {
-				return fmt.Errorf("credential encryption key versions are invalid")
-			}
-		}
-	}
-	for _, name := range s.PayloadEncryptionPreviousKeyEnvs {
-		if strings.TrimSpace(name) == "" {
-			return fmt.Errorf("previous encryption key environment names are required")
-		}
-	}
-	for _, name := range s.CredentialEncryptionPreviousKeyEnvs {
-		if strings.TrimSpace(name) == "" {
-			return fmt.Errorf("previous encryption key environment names are required")
-		}
-	}
-	return nil
 }
 
 // KeysAvailable checks that all configured key variables are present.
@@ -210,8 +199,7 @@ func (s SecurityConfig) KeysAvailable(lookup func(string) (string, bool)) bool {
 	names = append(names, s.PayloadEncryptionPreviousKeyEnvs...)
 	names = append(names, s.CredentialEncryptionPreviousKeyEnvs...)
 	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name == "" {
+		if strings.TrimSpace(name) == "" {
 			return false
 		}
 		value, ok := lookup(name)
@@ -224,6 +212,9 @@ func (s SecurityConfig) KeysAvailable(lookup func(string) (string, bool)) bool {
 
 // PayloadKeySet loads the active and previous payload keys.
 func (s SecurityConfig) PayloadKeySet(lookup func(string) (string, bool)) (envelope.KeySet, error) {
+	if err := configurationValidation.Struct(s); err != nil {
+		return envelope.KeySet{}, fmt.Errorf("payload encryption configuration: %w", err)
+	}
 	return loadEncryptionKeySet(
 		"payload",
 		s.PayloadEncryptionKeyEnv,
@@ -236,6 +227,9 @@ func (s SecurityConfig) PayloadKeySet(lookup func(string) (string, bool)) (envel
 
 // CredentialKeySet loads the active and previous credential keys.
 func (s SecurityConfig) CredentialKeySet(lookup func(string) (string, bool)) (envelope.KeySet, error) {
+	if err := configurationValidation.Struct(s); err != nil {
+		return envelope.KeySet{}, fmt.Errorf("credential encryption configuration: %w", err)
+	}
 	return loadEncryptionKeySet(
 		"credential",
 		s.CredentialEncryptionKeyEnv,
@@ -248,8 +242,8 @@ func (s SecurityConfig) CredentialKeySet(lookup func(string) (string, bool)) (en
 
 // APIKeyHMACKey loads the configured server-side API-key HMAC key.
 func (s SecurityConfig) APIKeyHMACKey(lookup func(string) (string, bool)) ([]byte, error) {
-	name := strings.TrimSpace(s.APIKeyHMACKeyEnv)
-	if name == "" {
+	name := s.APIKeyHMACKeyEnv
+	if strings.TrimSpace(name) == "" {
 		return nil, fmt.Errorf("API-key HMAC key environment name is empty")
 	}
 	value, ok := lookup(name)
@@ -259,23 +253,21 @@ func (s SecurityConfig) APIKeyHMACKey(lookup func(string) (string, bool)) ([]byt
 	return []byte(value), nil
 }
 
-// ValidateActiveKeyIndependence rejects reuse of one active key across domains.
-func ValidateActiveKeyIndependence(payload, credential envelope.KeySet) error {
-	if err := payload.Validate(); err != nil {
+// RequireDistinctActiveKeys rejects reuse of one active key across domains.
+func RequireDistinctActiveKeys(payload, credential envelope.KeySet) error {
+	if _, err := envelope.NewKeySet(payload.Active, payload.Previous...); err != nil {
 		return fmt.Errorf("payload encryption keys: %w", err)
 	}
-	if err := credential.Validate(); err != nil {
+	if _, err := envelope.NewKeySet(credential.Active, credential.Previous...); err != nil {
 		return fmt.Errorf("credential encryption keys: %w", err)
 	}
-	if subtle.ConstantTimeCompare(payload.Active.Bytes[:], credential.Active.Bytes[:]) == 1 {
-		return fmt.Errorf("active payload and credential encryption keys must differ")
+	if err := configurationValidation.Struct(activeKeySetPair{Payload: payload, Credential: credential}); err != nil {
+		return errors.New("active payload and credential encryption keys must differ")
 	}
 	return nil
 }
-
 func loadEncryptionKeySet(kind, activeName string, activeVersion uint32, previousNames []string, previousVersions []uint32, lookup func(string) (string, bool)) (envelope.KeySet, error) {
-	activeName = strings.TrimSpace(activeName)
-	if activeName == "" {
+	if strings.TrimSpace(activeName) == "" {
 		return envelope.KeySet{}, fmt.Errorf("%s encryption key environment name is empty", kind)
 	}
 	activeValue, ok := lookup(activeName)
@@ -291,8 +283,7 @@ func loadEncryptionKeySet(kind, activeName string, activeVersion uint32, previou
 	}
 	previous := make([]envelope.Key, 0, len(previousNames))
 	for index, name := range previousNames {
-		name = strings.TrimSpace(name)
-		if name == "" {
+		if strings.TrimSpace(name) == "" {
 			return envelope.KeySet{}, fmt.Errorf("%s previous encryption key environment name is empty", kind)
 		}
 		value, ok := lookup(name)

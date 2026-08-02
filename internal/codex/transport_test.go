@@ -679,7 +679,7 @@ func TestResponsesTransportWrapped401RefreshesOnce(t *testing.T) {
 		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	})
 	defer server.Close()
-	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +742,7 @@ func TestResponsesTransportDoesNotRefreshWrapped401AfterOutput(t *testing.T) {
 		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"error","status":401,"error":{"code":"token_expired","message":"private auth detail"}}`))
 	})
 	defer server.Close()
-	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, ClientID: "client", HTTPClient: server.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1342,7 +1342,7 @@ func newTestResponsesTransportWithClient(t *testing.T, server *httptest.Server, 
 	}, keys); err != nil {
 		t.Fatal(err)
 	}
-	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{})
+	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, ClientID: "client"})
 	if err != nil {
 		t.Fatal(err)
 	}
