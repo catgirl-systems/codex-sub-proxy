@@ -242,6 +242,22 @@ func (s SecurityConfig) CredentialKeySet(lookup func(string) (string, bool)) (en
 	)
 }
 
+// APIKeyHMACKey loads the configured server-side API-key HMAC key.
+func (s SecurityConfig) APIKeyHMACKey(lookup func(string) (string, bool)) ([]byte, error) {
+	name := strings.TrimSpace(s.APIKeyHMACKeyEnv)
+	if name == "" {
+		return nil, fmt.Errorf("API-key HMAC key environment name is empty")
+	}
+	value, ok := lookup(name)
+	if !ok || strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("API-key HMAC key is unavailable")
+	}
+	if len(value) > 4096 {
+		return nil, fmt.Errorf("API-key HMAC key is too large")
+	}
+	return []byte(value), nil
+}
+
 // ValidateActiveKeyIndependence rejects reuse of one active key across domains.
 func ValidateActiveKeyIndependence(payload, credential envelope.KeySet) error {
 	if err := payload.Validate(); err != nil {

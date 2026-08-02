@@ -276,3 +276,19 @@ func TestValidateActiveKeyIndependenceRejectsEqualBytes(t *testing.T) {
 		t.Fatalf("different active encryption keys rejected: %v", err)
 	}
 }
+
+func TestAPIKeyHMACKeyLoadsConfiguredValue(t *testing.T) {
+	security := Default().Security
+	t.Setenv(security.APIKeyHMACKeyEnv, "01234567890123456789012345678901")
+	key, err := security.APIKeyHMACKey(os.LookupEnv)
+	if err != nil {
+		t.Fatalf("load API-key HMAC key: %v", err)
+	}
+	if got := string(key); got != "01234567890123456789012345678901" {
+		t.Fatalf("HMAC key = %q", got)
+	}
+	t.Setenv(security.APIKeyHMACKeyEnv, "")
+	if _, err := security.APIKeyHMACKey(os.LookupEnv); err == nil {
+		t.Fatal("empty API-key HMAC key was accepted")
+	}
+}

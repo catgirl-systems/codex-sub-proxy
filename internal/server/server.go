@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 const (
@@ -17,8 +19,10 @@ const (
 )
 
 type Config struct {
-	Listen      string
-	AdminListen string
+	Listen        string
+	AdminListen   string
+	Database      *gorm.DB
+	APIKeyHMACKey []byte
 }
 
 type Servers struct {
@@ -40,9 +44,9 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
 
-	dataHandler, err := newHealthApplication(readiness)
+	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey)
 	if err != nil {
-		return nil, fmt.Errorf("build data health application: %w", err)
+		return nil, fmt.Errorf("build data application: %w", err)
 	}
 	adminHandler, err := newHealthApplication(readiness)
 	if err != nil {

@@ -8,9 +8,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/payload"
@@ -29,6 +31,8 @@ func main() {
 func run(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
+		case "api-key":
+			return runAPIKey(args[1:])
 		case "import":
 			return runImport(args[1:])
 		case "login":
@@ -51,6 +55,7 @@ func run(args []string) error {
 
 	payloadKeys, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
 	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
+	apiKeyHMACKey, apiKeyHMACErr := cfg.Security.APIKeyHMACKey(os.LookupEnv)
 	if payloadErr == nil && credentialErr == nil {
 		if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
 			return err
@@ -69,6 +74,8 @@ func run(args []string) error {
 			log.Printf("storage is unavailable: %v", err)
 		} else if err := payload.Migrate(db); err != nil {
 			log.Printf("storage is unavailable: %v", err)
+		} else if err := apikey.Migrate(db); err != nil {
+			log.Printf("storage is unavailable: %v", err)
 		} else {
 			storageReady = true
 		}
@@ -84,7 +91,7 @@ func run(args []string) error {
 	}
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
-	keysReady = keysReady && payloadErr == nil && credentialErr == nil
+	keysReady = keysReady && payloadErr == nil && credentialErr == nil && apiKeyHMACErr == nil
 	var credentialSnapshot func() server.CredentialSnapshot
 	if credentialErr == nil {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
@@ -102,8 +109,10 @@ func run(args []string) error {
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 
 	servers, err := server.Start(server.Config{
-		Listen:      cfg.Server.Listen,
-		AdminListen: cfg.Server.AdminListen,
+		Listen:        cfg.Server.Listen,
+		AdminListen:   cfg.Server.AdminListen,
+		Database:      db,
+		APIKeyHMACKey: apiKeyHMACKey,
 	}, readiness)
 	if err != nil {
 		return err
@@ -117,6 +126,144 @@ func run(args []string) error {
 	case <-ctx.Done():
 		return shutdownServers(servers)
 	}
+}
+
+type listFlag []string
+
+func (f *listFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *listFlag) Set(value string) error {
+	parts := strings.Split(value, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return fmt.Errorf("list value is empty")
+		}
+		*f = append(*f, part)
+	}
+	return nil
+}
+
+func runAPIKey(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("API-key command is required")
+	}
+	switch args[0] {
+	case "create":
+		return runAPIKeyCreate(args[1:])
+	default:
+		return fmt.Errorf("unknown API-key command %q", args[0])
+	}
+}
+
+func runAPIKeyCreate(args []string) error {
+	flags := flag.NewFlagSet("codex-sub-proxy api-key create", flag.ContinueOnError)
+	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
+	name := flags.String("name", "", "API-key name")
+	owner := flags.String("owner", "local", "API-key owner")
+	var endpoints listFlag
+	var models listFlag
+	flags.Var(&endpoints, "endpoint", "allowed endpoint; repeat or use a comma-separated list")
+	flags.Var(&endpoints, "endpoints", "allowed endpoint; repeat or use a comma-separated list")
+	flags.Var(&models, "model", "allowed model; repeat or use a comma-separated list")
+	flags.Var(&endpoints, "allowed-endpoint", "allowed endpoint; repeat or use a comma-separated list")
+	flags.Var(&endpoints, "allowed-endpoints", "allowed endpoint; repeat or use a comma-separated list")
+	flags.Var(&models, "allowed-model", "allowed model; repeat or use a comma-separated list")
+	flags.Var(&models, "allowed-models", "allowed model; repeat or use a comma-separated list")
+	flags.Var(&models, "models", "allowed model; repeat or use a comma-separated list")
+	expiresAt := flags.String("expires-at", "", "RFC3339 expiry time")
+	expires := flags.String("expires", "", "RFC3339 expiry time or duration from now")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected command-line argument")
+	}
+	if strings.TrimSpace(*expiresAt) != "" && strings.TrimSpace(*expires) != "" {
+		return fmt.Errorf("only one expiry option is allowed")
+	}
+	expiry, err := parseAPIKeyExpiry(*expiresAt, *expires, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	policy, err := apikey.ValidatePolicy(apikey.Policy{
+		Name:             *name,
+		Owner:            *owner,
+		AllowedEndpoints: endpoints,
+		AllowedModels:    models,
+		ExpiresAt:        expiry,
+	})
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	hmacKey, err := cfg.Security.APIKeyHMACKey(os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	db, err := storage.Open(ctx, databasePath, cfg.Storage.BusyTimeout)
+	if err != nil {
+		return err
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("get sqlite database: %w", err)
+	}
+	defer func() {
+		_ = sqlDB.Close()
+	}()
+	if err := apikey.Migrate(db); err != nil {
+		return err
+	}
+	rawKey, _, err := apikey.Create(ctx, db, hmacKey, policy)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, rawKey)
+	return nil
+}
+
+func parseAPIKeyExpiry(expiryAt, expiry string, now time.Time) (*time.Time, error) {
+	value := strings.TrimSpace(expiryAt)
+	if value == "" {
+		value = strings.TrimSpace(expiry)
+	}
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil && strings.TrimSpace(expiryAt) == "" {
+		duration, durationErr := time.ParseDuration(value)
+		if durationErr != nil {
+			return nil, fmt.Errorf("parse API-key expiry: %w", err)
+		}
+		if duration <= 0 {
+			return nil, fmt.Errorf("API-key expiry duration must be positive")
+		}
+		parsed = now.Add(duration)
+		err = nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("parse API-key expiry: %w", err)
+	}
+	parsed = parsed.UTC()
+	if !parsed.After(now) {
+		return nil, fmt.Errorf("API-key expiry must be in the future")
+	}
+	return &parsed, nil
 }
 
 func runImport(args []string) error {

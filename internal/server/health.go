@@ -62,6 +62,14 @@ func (s ReadinessSnapshot) Ready() bool {
 }
 
 func newHealthApplication(readiness *Readiness) (*iris.Application, error) {
+	app := buildHealthApplication(readiness)
+	if err := app.Build(); err != nil {
+		return nil, fmt.Errorf("build health application: %w", err)
+	}
+	return app, nil
+}
+
+func buildHealthApplication(readiness *Readiness) *iris.Application {
 	app := iris.New()
 	app.Any("/healthz", func(ctx iris.Context) {
 		if ctx.Method() != http.MethodGet {
@@ -94,10 +102,7 @@ func newHealthApplication(readiness *Readiness) (*iris.Application, error) {
 			Checks ReadinessSnapshot `json:"checks"`
 		}{Status: name, Checks: snapshot})
 	})
-	if err := app.Build(); err != nil {
-		return nil, fmt.Errorf("build health application: %w", err)
-	}
-	return app, nil
+	return app
 }
 
 func writeJSON(ctx iris.Context, status int, value any) {
