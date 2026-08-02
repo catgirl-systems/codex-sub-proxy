@@ -13,11 +13,12 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	coderwebsocket "github.com/coder/websocket"
 )
 
 func TestResponsesTransportWebSocketSuccessPreservesEvents(t *testing.T) {
@@ -32,16 +33,16 @@ func TestResponsesTransportWebSocketSuccessPreservesEvents(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
 		for _, frame := range transportWebSocketFixture(t) {
-			if err := connection.WriteMessage(websocket.TextMessage, frame); err != nil {
+			if err := connection.Write(context.Background(), coderwebsocket.MessageText, frame); err != nil {
 				return
 			}
 		}
-		_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+		_ = connection.Close(coderwebsocket.StatusNormalClosure, "")
 	})
 	defer server.Close()
 
@@ -67,13 +68,13 @@ func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		_, message, err := connection.ReadMessage()
+		defer connection.CloseNow()
+		_, message, err := connection.Read(context.Background())
 		if err != nil {
 			return
 		}
 		messageReceived <- string(message)
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	})
 	defer server.Close()
 
@@ -136,8 +137,8 @@ func TestResponsesTransportFallsBackAfterReplaySafeWebSocketEvents(t *testing.T)
 			if err != nil {
 				return
 			}
-			defer connection.Close()
-			if _, _, err := connection.ReadMessage(); err != nil {
+			defer connection.CloseNow()
+			if _, _, err := connection.Read(context.Background()); err != nil {
 				return
 			}
 			frames := [][]byte{
@@ -145,11 +146,11 @@ func TestResponsesTransportFallsBackAfterReplaySafeWebSocketEvents(t *testing.T)
 				[]byte(`{"type":"response.metadata","metadata":{"state":"ready"}}`),
 			}
 			for _, frame := range frames {
-				if err := connection.WriteMessage(websocket.TextMessage, frame); err != nil {
+				if err := connection.Write(context.Background(), coderwebsocket.MessageText, frame); err != nil {
 					return
 				}
 			}
-			_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+			_ = connection.Close(coderwebsocket.StatusNormalClosure, "")
 			return
 		}
 		sseRequests.Add(1)
@@ -200,11 +201,11 @@ func TestResponsesTransportDoesNotReplayAfterPartialWebSocketOutput(t *testing.T
 		if err != nil {
 			return
 		}
-		if _, _, err := connection.ReadMessage(); err == nil {
+		if _, _, err := connection.Read(context.Background()); err == nil {
 			frame := []byte(`{"type":"response.output_text.delta","sequence_number":1,"delta":"partial"}`)
-			_ = connection.WriteMessage(websocket.TextMessage, frame)
+			_ = connection.Write(context.Background(), coderwebsocket.MessageText, frame)
 		}
-		_ = connection.Close()
+		_ = connection.CloseNow()
 	})
 	defer server.Close()
 
@@ -232,15 +233,15 @@ func TestResponsesTransportDoesNotReplayAfterWebSocketToolOutput(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
 		frame := []byte(`{"type":"response.output_item.added","item":{"type":"function_call","name":"lookup","arguments":"{}"}}`)
-		if err := connection.WriteMessage(websocket.TextMessage, frame); err != nil {
+		if err := connection.Write(context.Background(), coderwebsocket.MessageText, frame); err != nil {
 			return
 		}
-		_ = connection.Close()
+		_ = connection.CloseNow()
 	})
 	defer server.Close()
 
@@ -261,12 +262,12 @@ func TestResponsesTransportCancellationClosesWebSocket(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
 		close(requestReceived)
-		_, _, _ = connection.ReadMessage()
+		_, _, _ = connection.Read(context.Background())
 	})
 	defer server.Close()
 
@@ -305,11 +306,11 @@ func TestResponsesTransportRejectsOversizeWebSocketMessage(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", maxCodexStreamLineBytes+1)))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(strings.Repeat("x", maxCodexStreamLineBytes+1)))
 	})
 	defer server.Close()
 
@@ -330,8 +331,8 @@ func TestResponsesTransportCloseCodeFallbackPolicy(t *testing.T) {
 		wantSSE     bool
 		wantSuccess bool
 	}{
-		{name: "unsupported data", code: websocket.CloseUnsupportedData, wantSSE: true, wantSuccess: true},
-		{name: "policy violation", code: websocket.ClosePolicyViolation, wantSSE: false, wantSuccess: false},
+		{name: "unsupported data", code: int(coderwebsocket.StatusUnsupportedData), wantSSE: true, wantSuccess: true},
+		{name: "policy violation", code: int(coderwebsocket.StatusPolicyViolation), wantSSE: false, wantSuccess: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var sseRequests atomic.Int32
@@ -347,11 +348,11 @@ func TestResponsesTransportCloseCodeFallbackPolicy(t *testing.T) {
 				if err != nil {
 					return
 				}
-				defer connection.Close()
-				if _, _, err := connection.ReadMessage(); err != nil {
+				defer connection.CloseNow()
+				if _, _, err := connection.Read(context.Background()); err != nil {
 					return
 				}
-				_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(test.code, ""), time.Now().Add(time.Second))
+				_ = connection.Close(coderwebsocket.StatusCode(test.code), "")
 			})
 			defer server.Close()
 
@@ -408,11 +409,11 @@ func TestResponsesTransportUsesHTTPTransportProxy(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	})
 	defer server.Close()
 
@@ -428,17 +429,108 @@ func TestResponsesTransportUsesHTTPTransportProxy(t *testing.T) {
 	}
 }
 
+func TestResponsesTransportUsesHTTPSProxy(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxy := newTransportTLSConnectProxy(t, &proxyRequests)
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	}))
+	defer server.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(proxy.Certificate())
+	roots.AddCert(server.Certificate())
+	httpTransport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			RootCAs: roots,
+		},
+	}
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+	if _, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}); err != nil {
+		t.Fatalf("transport.Do through HTTPS proxy: %v", err)
+	}
+	if proxyRequests.Load() != 1 {
+		t.Fatalf("HTTPS proxy requests = %d, want 1", proxyRequests.Load())
+	}
+}
+
+func TestResponsesTransportConcurrentCalls(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxy := newTransportConnectProxy(t, &proxyRequests)
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	})
+	defer server.Close()
+
+	httpTransport := server.Client().Transport.(*http.Transport).Clone()
+	httpTransport.Proxy = http.ProxyURL(proxyURL)
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+
+	const calls = 8
+	errs := make(chan error, calls)
+	var group sync.WaitGroup
+	group.Add(calls)
+	for range calls {
+		go func() {
+			defer group.Done()
+			_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+			errs <- err
+		}()
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("transport.Do: %v", err)
+		}
+	}
+	if proxyRequests.Load() != calls {
+		t.Fatalf("proxy requests = %d, want %d", proxyRequests.Load(), calls)
+	}
+}
+
 func TestResponsesTransportUsesCustomTLSRoots(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		connection, err := transportUpgrader.Upgrade(writer, request, nil)
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	}))
 	defer server.Close()
 
@@ -458,11 +550,11 @@ func TestResponsesTransportConditionalProxyBypassUsesCustomTLS(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	}))
 	defer server.Close()
 
@@ -513,11 +605,11 @@ func TestResponsesTransportConditionalProxyUsesProxyRoute(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	}))
 	defer server.Close()
 
@@ -595,11 +687,11 @@ func TestResponsesTransportUsesEnvironmentProxy(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer connection.Close()
-		if _, _, err := connection.ReadMessage(); err != nil {
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
 			return
 		}
-		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
 	})
 	defer server.Close()
 
@@ -619,12 +711,25 @@ func TestResponsesTransportUsesEnvironmentProxy(t *testing.T) {
 
 func newTransportConnectProxy(t *testing.T, requests *atomic.Int32) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	return httptest.NewServer(transportConnectProxyHandler(requests))
+}
+
+func newTransportTLSConnectProxy(t *testing.T, requests *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewTLSServer(transportConnectProxyHandler(requests))
+}
+
+func transportConnectProxyHandler(requests *atomic.Int32) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		targetAddress := request.Host
 		if request.Method != http.MethodConnect {
-			http.Error(writer, "CONNECT required", http.StatusMethodNotAllowed)
-			return
+			if request.URL == nil || request.URL.Host == "" {
+				http.Error(writer, "proxy target is missing", http.StatusBadRequest)
+				return
+			}
+			targetAddress = request.URL.Host
 		}
-		target, err := net.Dial("tcp", request.Host)
+		target, err := net.Dial("tcp", targetAddress)
 		if err != nil {
 			http.Error(writer, "proxy dial failed", http.StatusBadGateway)
 			return
@@ -643,21 +748,36 @@ func newTransportConnectProxy(t *testing.T, requests *atomic.Int32) *httptest.Se
 		requests.Add(1)
 		defer client.Close()
 		defer target.Close()
-		if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-			return
-		}
-		if err := buffered.Flush(); err != nil {
-			return
+		if request.Method == http.MethodConnect {
+			if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+				return
+			}
+			if err := buffered.Flush(); err != nil {
+				return
+			}
+		} else {
+			request.URL.Scheme = ""
+			request.URL.Host = ""
+			request.RequestURI = request.URL.RequestURI()
+			if err := request.Write(target); err != nil {
+				return
+			}
 		}
 		go func() {
 			_, _ = io.Copy(target, client)
 			_ = target.Close()
 		}()
 		_, _ = io.Copy(client, target)
-	}))
+	})
 }
 
-var transportUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+var transportUpgrader transportWebSocketUpgrader
+
+type transportWebSocketUpgrader struct{}
+
+func (transportWebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Request, _ http.Header) (*coderwebsocket.Conn, error) {
+	return coderwebsocket.Accept(writer, request, &coderwebsocket.AcceptOptions{InsecureSkipVerify: true})
+}
 
 func newTransportServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()

@@ -7,12 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
+	coderwebsocket "github.com/coder/websocket"
 )
 
 const (
@@ -20,12 +21,11 @@ const (
 
 	responsesWebSocketBeta = "responses_websockets=2026-02-06"
 
-	codexDialTimeout      = 10 * time.Second
-	codexHandshakeTimeout = 10 * time.Second
-	codexReadTimeout      = 2 * time.Minute
-	codexWriteTimeout     = 10 * time.Second
-	codexHTTPTimeout      = 5 * time.Minute
-	maxCodexRequestBytes  = maxCodexStreamPayloadBytes
+	codexDialTimeout     = 10 * time.Second
+	codexReadTimeout     = 2 * time.Minute
+	codexWriteTimeout    = 10 * time.Second
+	codexHTTPTimeout     = 5 * time.Minute
+	maxCodexRequestBytes = maxCodexStreamPayloadBytes
 )
 
 // ResponsesTransportPolicy selects the private Responses transport.
@@ -54,7 +54,6 @@ type ResponsesTransport struct {
 	httpClient   *http.Client
 	refresher    *Refresher
 	headers      HeaderConfig
-	dialer       websocket.Dialer
 }
 
 type codexWebSocketRequest struct {
@@ -104,29 +103,7 @@ func NewResponsesTransport(options ResponsesTransportOptions) (*ResponsesTranspo
 		httpClient:   client,
 		refresher:    options.Refresher,
 		headers:      options.Headers,
-		dialer:       newResponsesWebSocketDialer(client),
 	}, nil
-}
-
-func newResponsesWebSocketDialer(client *http.Client) websocket.Dialer {
-	dialer := *websocket.DefaultDialer
-	dialer.HandshakeTimeout = codexHandshakeTimeout
-	dialer.EnableCompression = false
-
-	if client == nil {
-		return dialer
-	}
-	httpTransport, ok := client.Transport.(*http.Transport)
-	if !ok || httpTransport == nil {
-		return dialer
-	}
-	dialer.Proxy = httpTransport.Proxy
-	dialer.NetDialContext = httpTransport.DialContext
-	dialer.NetDialTLSContext = httpTransport.DialTLSContext
-	if httpTransport.TLSClientConfig != nil {
-		dialer.TLSClientConfig = httpTransport.TLSClientConfig.Clone()
-	}
-	return dialer
 }
 
 // Do sends one request and returns all validated stream events.
@@ -213,31 +190,16 @@ func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []by
 	defer cancel()
 	wsHeaders := headers
 	wsHeaders.Beta = responsesWebSocketBeta
-	handshakeRequest, err := NewRequest(dialContext, http.MethodGet, transport.webSocketURL, nil, wsHeaders)
+	httpHeaders, err := BuildHeaders(wsHeaders)
 	if err != nil {
 		return CodexStreamResult{}, nil, err, false
 	}
-	handshakeRequest.Header.Set("Accept", "application/json")
-	dialer := transport.dialer
-	if dialer.Proxy != nil {
-		proxyRequest := handshakeRequest.Clone(dialContext)
-		switch proxyRequest.URL.Scheme {
-		case "ws":
-			proxyRequest.URL.Scheme = "http"
-		case "wss":
-			proxyRequest.URL.Scheme = "https"
-		}
-		proxyURL, proxyErr := dialer.Proxy(proxyRequest)
-		if proxyErr != nil {
-			return CodexStreamResult{}, nil, fmt.Errorf("codex proxy callback: %w", proxyErr), false
-		}
-		dialer.Proxy = nil
-		if proxyURL != nil {
-			dialer.Proxy = http.ProxyURL(proxyURL)
-			dialer.NetDialTLSContext = nil
-		}
-	}
-	connection, response, err := dialer.DialContext(dialContext, transport.webSocketURL, handshakeRequest.Header)
+	httpHeaders.Set("Accept", "application/json")
+	connection, response, err := coderwebsocket.Dial(dialContext, transport.webSocketURL, &coderwebsocket.DialOptions{
+		HTTPClient:      transport.httpClient,
+		HTTPHeader:      httpHeaders,
+		CompressionMode: coderwebsocket.CompressionDisabled,
+	})
 	if err != nil {
 		if dialContext.Err() != nil {
 			return CodexStreamResult{}, nil, dialContext.Err(), false
@@ -245,7 +207,8 @@ func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []by
 		if response != nil {
 			return transport.webSocketHandshakeFailure(response)
 		}
-		return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket dial failed", ErrCodexTransport), true
+		dialErr, fallback := webSocketDialFailure(transport.httpClient, err)
+		return CodexStreamResult{}, nil, dialErr, fallback
 	}
 	return readCodexWebSocket(ctx, connection, body)
 }
@@ -261,49 +224,41 @@ func (transport *ResponsesTransport) webSocketHandshakeFailure(response *http.Re
 	return CodexStreamResult{}, nil, MapUpstreamError(response.StatusCode, response.Header, body), fallback
 }
 
-func readCodexWebSocket(ctx context.Context, connection *websocket.Conn, body []byte) (CodexStreamResult, *http.Response, error, bool) {
+func readCodexWebSocket(ctx context.Context, connection *coderwebsocket.Conn, body []byte) (CodexStreamResult, *http.Response, error, bool) {
 	if connection == nil {
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket connection is nil", ErrCodexTransport), true
 	}
-	defer connection.Close()
-	if err := connection.SetWriteDeadline(time.Now().Add(codexWriteTimeout)); err != nil {
-		return CodexStreamResult{}, nil, fmt.Errorf("%w: set WebSocket write limit", ErrCodexTransport), true
-	}
-	if err := connection.WriteMessage(websocket.TextMessage, body); err != nil {
+	defer func() {
+		_ = connection.Close(coderwebsocket.StatusNormalClosure, "")
+	}()
+	writeContext, cancel := context.WithTimeout(ctx, codexWriteTimeout)
+	err := connection.Write(writeContext, coderwebsocket.MessageText, body)
+	cancel()
+	if err != nil {
 		if ctx.Err() != nil {
 			return CodexStreamResult{}, nil, ctx.Err(), false
 		}
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: write WebSocket request", ErrCodexTransport), true
 	}
 	connection.SetReadLimit(maxCodexStreamLineBytes)
-	stopContext := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = connection.Close()
-		case <-stopContext:
-		}
-	}()
-	defer close(stopContext)
 
 	frames := make([][]byte, 0, 16)
 	aggregateBytes := 0
 	replayUnsafe := false
 	for {
-		if err := connection.SetReadDeadline(time.Now().Add(codexReadTimeout)); err != nil {
-			return CodexStreamResult{}, nil, fmt.Errorf("%w: set WebSocket read limit", ErrCodexTransport), !replayUnsafe
-		}
-		messageType, frame, err := connection.ReadMessage()
+		readContext, cancel := context.WithTimeout(ctx, codexReadTimeout)
+		messageType, frame, err := connection.Read(readContext)
+		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return CodexStreamResult{}, nil, ctx.Err(), false
 			}
-			if errors.Is(err, websocket.ErrReadLimit) {
+			if errors.Is(err, coderwebsocket.ErrMessageTooBig) {
 				return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket message exceeds limit", ErrCodexStreamMalformed), false
 			}
 			return CodexStreamResult{}, nil, webSocketReadFailure(err), !replayUnsafe && webSocketReadFallback(err)
 		}
-		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+		if messageType != coderwebsocket.MessageText && messageType != coderwebsocket.MessageBinary {
 			return CodexStreamResult{}, nil, fmt.Errorf("%w: WebSocket message type is invalid", ErrCodexStreamMalformed), false
 		}
 		if len(frame) == 0 || len(frame) > maxCodexStreamLineBytes {
@@ -355,26 +310,35 @@ func codexWebSocketEventReplaySafe(event CodexResponseStreamEvent) bool {
 }
 
 func webSocketReadFailure(err error) error {
-	var closeError *websocket.CloseError
-	if errors.As(err, &closeError) {
-		return fmt.Errorf("%w: WebSocket close code %d", ErrCodexStreamAbruptClose, closeError.Code)
+	if code := coderwebsocket.CloseStatus(err); code != -1 {
+		return fmt.Errorf("%w: WebSocket close code %d", ErrCodexStreamAbruptClose, code)
 	}
 	return fmt.Errorf("%w: WebSocket read failed", ErrCodexStreamAbruptClose)
 }
 
 func webSocketReadFallback(err error) bool {
-	var closeError *websocket.CloseError
-	if errors.As(err, &closeError) {
-		switch closeError.Code {
-		case websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived,
-			websocket.CloseAbnormalClosure, websocket.CloseUnsupportedData, websocket.CloseInternalServerErr,
-			websocket.CloseServiceRestart, websocket.CloseTryAgainLater:
-			return true
-		default:
-			return false
+	switch coderwebsocket.CloseStatus(err) {
+	case coderwebsocket.StatusNormalClosure, coderwebsocket.StatusGoingAway, coderwebsocket.StatusNoStatusRcvd,
+		coderwebsocket.StatusAbnormalClosure, coderwebsocket.StatusUnsupportedData, coderwebsocket.StatusInternalError,
+		coderwebsocket.StatusServiceRestart, coderwebsocket.StatusTryAgainLater:
+		return true
+	default:
+		return false
+	}
+}
+
+func webSocketDialFailure(client *http.Client, err error) (error, bool) {
+	httpTransport, ok := client.Transport.(*http.Transport)
+	if !ok || httpTransport == nil {
+		if client.Transport == nil {
+			httpTransport, ok = http.DefaultTransport.(*http.Transport)
 		}
 	}
-	return true
+	var networkError *net.OpError
+	if ok && httpTransport.Proxy != nil && !errors.As(err, &networkError) {
+		return fmt.Errorf("codex proxy callback: %w", err), false
+	}
+	return fmt.Errorf("%w: WebSocket dial failed", ErrCodexTransport), true
 }
 
 func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, headers HeaderConfig) (CodexStreamResult, *http.Response, error) {
