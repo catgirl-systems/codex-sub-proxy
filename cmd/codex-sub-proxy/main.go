@@ -93,6 +93,7 @@ func run(args []string) error {
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
 	keysReady = keysReady && payloadErr == nil && credentialErr == nil && apiKeyHMACErr == nil
 	var credentialSnapshot func() server.CredentialSnapshot
+	var responsesTransport *codex.ResponsesTransport
 	if credentialErr == nil {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
 			if refresher, refreshErr := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{
@@ -106,16 +107,25 @@ func run(args []string) error {
 						State:     string(snapshot.State),
 					}
 				}
+				responsesTransport, err = codex.NewResponsesTransport(codex.ResponsesTransportOptions{
+					Policy:    codex.ResponsesTransportPolicy(cfg.Codex.ResponsesTransport),
+					Refresher: refresher,
+					Headers:   codex.HeaderConfig{},
+				})
+				if err != nil {
+					return fmt.Errorf("build Responses transport: %w", err)
+				}
 			}
 		}
 	}
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 
 	servers, err := server.Start(server.Config{
-		Listen:        cfg.Server.Listen,
-		AdminListen:   cfg.Server.AdminListen,
-		Database:      db,
-		APIKeyHMACKey: apiKeyHMACKey,
+		Listen:             cfg.Server.Listen,
+		AdminListen:        cfg.Server.AdminListen,
+		Database:           db,
+		APIKeyHMACKey:      apiKeyHMACKey,
+		ResponsesTransport: responsesTransport,
 	}, readiness)
 	if err != nil {
 		return err

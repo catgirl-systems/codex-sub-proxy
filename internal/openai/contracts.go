@@ -35,7 +35,7 @@ const (
 
 // ResponseRequest is the public OpenAI Responses request body.
 type ResponseRequest struct {
-	Model              string           `json:"model"`
+	Model              string           `json:"model" validate:"required,max=256"`
 	Input              *Input           `json:"input,omitempty"`
 	Instructions       string           `json:"instructions,omitempty"`
 	Tools              []Tool           `json:"tools,omitempty"`

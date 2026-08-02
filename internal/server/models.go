@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/kataras/iris/v12"
 	"gorm.io/gorm"
 )
@@ -23,7 +24,7 @@ type modelsResponse struct {
 	Data   []modelObject `json:"data"`
 }
 
-func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte) (*iris.Application, error) {
+func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport) (*iris.Application, error) {
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
 	app.Get(modelsEndpoint, func(ctx iris.Context) {
@@ -48,6 +49,7 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte) (*iri
 		}
 		writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
 	})
+	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport))
 	if err := app.Build(); err != nil {
 		return nil, err
 	}

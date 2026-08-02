@@ -148,6 +148,9 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 			return authResponse, nil
 		}
 		if attemptErr != nil {
+			if len(result.Events) != 0 || result.Response != nil {
+				state.result = result
+			}
 			return nil, attemptErr
 		}
 		state.result = result
@@ -159,9 +162,9 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 			closeHTTPResponse(response)
 		}
 		if contextErr := context.Cause(ctx); contextErr != nil {
-			return CodexStreamResult{}, contextErr
+			return state.result, contextErr
 		}
-		return CodexStreamResult{}, err
+		return state.result, err
 	}
 	if !state.ready {
 		if response != nil {
@@ -318,7 +321,7 @@ func readCodexWebSocket(callerContext, attemptContext context.Context, connectio
 		if isCodexTerminalEvent(event.Type) {
 			result, parseErr := ParseCodexWebSocketFrames(frames)
 			if parseErr != nil {
-				return CodexStreamResult{}, nil, parseErr, false
+				return result, nil, parseErr, false
 			}
 			return result, nil, nil, false
 		}
@@ -383,6 +386,7 @@ func decodeCodexErrorEvent(frame []byte) (CodexResponseStreamEvent, error) {
 		Error:          wire.Error,
 		Code:           wire.Code,
 		Message:        wire.Message,
+		Raw:            append([]byte(nil), frame...),
 	}
 	if len(wire.Headers) != 0 {
 		event.Headers = make(map[string]string, len(wire.Headers))
@@ -600,7 +604,7 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 		if codexSSETimeoutError(err) {
 			return CodexStreamResult{}, nil, context.DeadlineExceeded
 		}
-		return CodexStreamResult{}, nil, err
+		return result, nil, err
 	}
 	if bounded.total > maxCodexStreamPayloadBytes || bounded.exceeded {
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE aggregate limit exceeded", ErrCodexStreamMalformed)

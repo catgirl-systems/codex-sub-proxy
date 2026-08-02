@@ -235,11 +235,12 @@ type CodexTool struct {
 type CodexToolChoice struct {
 	String *string `json:"-"`
 	Type   string  `json:"type"`
+	Name   string  `json:"name,omitempty"`
 }
 
 func (choice CodexToolChoice) MarshalJSON() ([]byte, error) {
 	if choice.String != nil {
-		if choice.Type != "" {
+		if choice.Type != "" || choice.Name != "" {
 			return nil, fmt.Errorf("private tool choice contains multiple variants")
 		}
 		return json.Marshal(*choice.String)
@@ -249,7 +250,8 @@ func (choice CodexToolChoice) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(struct {
 		Type string `json:"type"`
-	}{Type: choice.Type})
+		Name string `json:"name,omitempty"`
+	}{Type: choice.Type, Name: choice.Name})
 }
 
 func (choice *CodexToolChoice) UnmarshalJSON(data []byte) error {
@@ -268,6 +270,7 @@ func (choice *CodexToolChoice) UnmarshalJSON(data []byte) error {
 	case '{':
 		var object struct {
 			Type string `json:"type"`
+			Name string `json:"name,omitempty"`
 		}
 		if err := json.Unmarshal(value, &object); err != nil {
 			return fmt.Errorf("decode private tool choice object: %w", err)
@@ -275,7 +278,7 @@ func (choice *CodexToolChoice) UnmarshalJSON(data []byte) error {
 		if object.Type == "" {
 			return fmt.Errorf("decode private tool choice object: type is required")
 		}
-		*choice = CodexToolChoice{Type: object.Type}
+		*choice = CodexToolChoice{Type: object.Type, Name: object.Name}
 		return nil
 	default:
 		return fmt.Errorf("private tool choice must be a string or object")
@@ -296,18 +299,20 @@ type CodexTextConfig struct {
 
 // CodexResponse is a private Responses result.
 type CodexResponse struct {
-	ID                string                  `json:"id,omitempty"`
-	Object            string                  `json:"object,omitempty"`
-	CreatedAt         int64                   `json:"created_at,omitempty"`
-	Model             string                  `json:"model,omitempty"`
-	Status            string                  `json:"status,omitempty"`
-	OutputText        string                  `json:"output_text,omitempty"`
-	Output            []CodexOutputItem       `json:"output,omitempty"`
-	Usage             *CodexUsage             `json:"usage,omitempty"`
-	Error             *CodexError             `json:"error,omitempty"`
-	IncompleteDetails *CodexIncompleteDetails `json:"incomplete_details,omitempty"`
-	ServiceTier       string                  `json:"service_tier,omitempty"`
-	EndTurn           *bool                   `json:"end_turn,omitempty"`
+	ID                 string                  `json:"id,omitempty"`
+	Object             string                  `json:"object,omitempty"`
+	CreatedAt          int64                   `json:"created_at,omitempty"`
+	CompletedAt        int64                   `json:"completed_at,omitempty"`
+	Model              string                  `json:"model,omitempty"`
+	Status             string                  `json:"status,omitempty"`
+	OutputText         string                  `json:"output_text,omitempty"`
+	Output             []CodexOutputItem       `json:"output,omitempty"`
+	Usage              *CodexUsage             `json:"usage,omitempty"`
+	Error              *CodexError             `json:"error,omitempty"`
+	IncompleteDetails  *CodexIncompleteDetails `json:"incomplete_details,omitempty"`
+	ServiceTier        string                  `json:"service_tier,omitempty"`
+	PreviousResponseID string                  `json:"previous_response_id,omitempty"`
+	EndTurn            *bool                   `json:"end_turn,omitempty"`
 }
 
 // CodexOutputItem is a typed private output item.
@@ -370,6 +375,8 @@ type CodexResponseStreamEvent struct {
 	PartialImageIndex int                `json:"partial_image_index"`
 	Headers           map[string]string  `json:"headers,omitempty"`
 	Metadata          json.RawMessage    `json:"metadata,omitempty"`
+	Annotation        json.RawMessage    `json:"annotation,omitempty"`
+	Raw               json.RawMessage    `json:"-"`
 }
 
 // CodexUsage records token counts reported by Codex.
@@ -558,13 +565,14 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 			data.Reset()
 			return nil
 		}
-		if err := decoder.reservePayload(len(payload)); err != nil {
-			return err
-		}
 		var event CodexResponseStreamEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
 			return fmt.Errorf("%w: decode SSE event: %v", ErrCodexStreamMalformed, err)
 		}
+		if err := decoder.reservePayload(len(payload)); err != nil {
+			return err
+		}
+		event.Raw = append(event.Raw[:0], payload...)
 		if err := decoder.add(event); err != nil {
 			return err
 		}
@@ -637,6 +645,7 @@ func DecodeCodexWebSocketFrame(frame []byte) (CodexResponseStreamEvent, error) {
 	if err := json.Unmarshal(frame, &event); err != nil {
 		return CodexResponseStreamEvent{}, fmt.Errorf("%w: decode WebSocket frame: %v", ErrCodexStreamMalformed, err)
 	}
+	event.Raw = append(event.Raw[:0], frame...)
 	return event, nil
 }
 

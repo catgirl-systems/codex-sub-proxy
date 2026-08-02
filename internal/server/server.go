@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"gorm.io/gorm"
 )
 
@@ -19,10 +20,11 @@ const (
 )
 
 type Config struct {
-	Listen        string
-	AdminListen   string
-	Database      *gorm.DB
-	APIKeyHMACKey []byte
+	Listen             string
+	AdminListen        string
+	Database           *gorm.DB
+	APIKeyHMACKey      []byte
+	ResponsesTransport *codex.ResponsesTransport
 }
 
 type Servers struct {
@@ -44,7 +46,7 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
 
-	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey)
+	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport)
 	if err != nil {
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
@@ -62,19 +64,20 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 		_ = dataListener.Close()
 		return nil, fmt.Errorf("listen for admin plane on %q: %w", cfg.AdminListen, err)
 	}
-
 	servers := &Servers{
 		dataServer: &http.Server{
 			Handler:           dataHandler,
 			ReadHeaderTimeout: readHeaderTimeout,
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    64 * 1024,
 		},
 		adminServer: &http.Server{
 			Handler:           adminHandler,
 			ReadHeaderTimeout: readHeaderTimeout,
 			WriteTimeout:      writeTimeout,
 			IdleTimeout:       idleTimeout,
+			MaxHeaderBytes:    64 * 1024,
 		},
 		dataListener:  dataListener,
 		adminListener: adminListener,
