@@ -313,6 +313,136 @@ func TestPublicResponsesCollectionBoundaries(t *testing.T) {
 	}
 }
 
+func TestPublicResponsesTopLevelCollectionBoundaries(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit int
+		body  func(int) string
+		check func(*ResponseRequest, int) bool
+	}{
+		{
+			name:  "tools",
+			limit: maxResponsesItemTools,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","tools":` + responsesJSONList(count, `{"type":"function","name":"f"}`) + `}`
+			},
+			check: func(request *ResponseRequest, count int) bool {
+				return len(request.Tools) == count
+			},
+		},
+		{
+			name:  "include",
+			limit: maxResponsesInclude,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","include":` + responsesJSONList(count, `"reasoning.encrypted_content"`) + `}`
+			},
+			check: func(request *ResponseRequest, count int) bool {
+				return len(request.Include) == count
+			},
+		},
+		{
+			name:  "metadata",
+			limit: maxResponsesMetadata,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","metadata":` + responsesJSONMetadata(count) + `}`
+			},
+			check: func(request *ResponseRequest, count int) bool {
+				return len(request.Metadata) == count
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request ResponseRequest
+			if err := json.Unmarshal([]byte(test.body(test.limit)), &request); err != nil {
+				t.Fatalf("decode exact limit: %v", err)
+			}
+			if !test.check(&request, test.limit) {
+				t.Fatalf("decoded exact boundary = %#v", request)
+			}
+			if err := json.Unmarshal([]byte(test.body(test.limit+1)), &request); err == nil {
+				t.Fatal("accepted limit+1 collection")
+			}
+		})
+	}
+}
+
+func TestPublicResponsesTopLevelCollectionPresenceAndStrictness(t *testing.T) {
+	tests := []struct {
+		name            string
+		raw             string
+		wantToolsNil    bool
+		wantIncludeNil  bool
+		wantMetadataNil bool
+		wantEmpty       string
+	}{
+		{
+			name:            "omitted",
+			raw:             `{"model":"gpt-5.6-sol"}`,
+			wantToolsNil:    true,
+			wantIncludeNil:  true,
+			wantMetadataNil: true,
+		},
+		{
+			name:            "null",
+			raw:             `{"model":"gpt-5.6-sol","tools":null,"include":null,"metadata":null}`,
+			wantToolsNil:    true,
+			wantIncludeNil:  true,
+			wantMetadataNil: true,
+		},
+		{
+			name:      "empty",
+			raw:       `{"model":"gpt-5.6-sol","tools":[],"include":[],"metadata":{}}`,
+			wantEmpty: "all",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request ResponseRequest
+			if err := json.Unmarshal([]byte(test.raw), &request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if (request.Tools == nil) != test.wantToolsNil ||
+				(request.Include == nil) != test.wantIncludeNil ||
+				(request.Metadata == nil) != test.wantMetadataNil {
+				t.Fatalf("presence semantics = %#v", request)
+			}
+			if test.wantEmpty == "all" &&
+				(len(request.Tools) != 0 || len(request.Include) != 0 || len(request.Metadata) != 0) {
+				t.Fatalf("empty collection semantics = %#v", request)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		`{"model":"gpt-5.6-sol","unknown":true}`,
+		`{"model":"gpt-5.6-sol","metadata":{"trace":null}}`,
+		`{"model":"gpt-5.6-sol","metadata":{"trace":1}}`,
+		`{"model":"gpt-5.6-sol","metadata":{"trace":[]}}`,
+		`{"model":"gpt-5.6-sol","metadata":{"trace":"first","trace":"second"}}`,
+		`{"model":"gpt-5.6-sol","include":[1]}`,
+		`{"model":"gpt-5.6-sol","tools":[]}[{"extra":true}]`,
+	} {
+		var request ResponseRequest
+		if err := json.Unmarshal([]byte(raw), &request); err == nil {
+			t.Fatalf("accepted invalid top-level request: %s", raw)
+		}
+	}
+}
+
+func TestPublicResponsesTopLevelCollectionsAcceptedControls(t *testing.T) {
+	raw := `{"model":"gpt-5.6-sol","tools":[{"type":"function","name":"fixture"}],"include":["reasoning.encrypted_content"],"metadata":{"trace":"fixture","request":"accepted"}}`
+	var request ResponseRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		t.Fatalf("decode accepted controls: %v", err)
+	}
+	if len(request.Tools) != 1 || request.Tools[0].Name != "fixture" ||
+		len(request.Include) != 1 || request.Include[0] != "reasoning.encrypted_content" ||
+		len(request.Metadata) != 2 || request.Metadata["trace"] != "fixture" {
+		t.Fatalf("accepted controls = %#v", request)
+	}
+}
+
 func TestPublicInputRejectsTinyItemAmplification(t *testing.T) {
 	raw := responsesJSONList(maxResponsesInputItems*192, `{"type":"message"}`)
 	if len(raw) < 3*1024*1024 {
@@ -335,6 +465,22 @@ func responsesJSONList(count int, value string) string {
 		builder.WriteString(value)
 	}
 	builder.WriteByte(']')
+	return builder.String()
+}
+
+func responsesJSONMetadata(count int) string {
+	var builder strings.Builder
+	builder.Grow(count * 8)
+	builder.WriteByte('{')
+	for index := range count {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteByte('"')
+		builder.WriteByte(byte('a' + index))
+		builder.WriteString(`":"v"`)
+	}
+	builder.WriteByte('}')
 	return builder.String()
 }
 

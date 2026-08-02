@@ -433,6 +433,27 @@ func TestResponsesCollectionLimitsRejectBeforeUpstream(t *testing.T) {
 				return `{"model":"gpt-5.6-sol","input":[{"type":"computer_call_output","acknowledged_safety_checks":` + responsesTestJSONList(count, `{"id":"check"}`) + `}]}`
 			},
 		},
+		{
+			name:  "top-level tools",
+			limit: 128,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","tools":` + responsesTestJSONList(count, `{"type":"function","name":"f"}`) + `}`
+			},
+		},
+		{
+			name:  "top-level include",
+			limit: 64,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","include":` + responsesTestJSONList(count, `"reasoning.encrypted_content"`) + `}`
+			},
+		},
+		{
+			name:  "top-level metadata",
+			limit: 16,
+			body: func(count int) string {
+				return `{"model":"gpt-5.6-sol","metadata":` + responsesTestJSONMetadata(count) + `}`
+			},
+		},
 	}
 	accepted := 0
 	for _, test := range tests {
@@ -457,6 +478,62 @@ func TestResponsesCollectionLimitsRejectBeforeUpstream(t *testing.T) {
 	}
 	if upstreamCalls.Load() != int32(accepted) {
 		t.Fatalf("upstream calls = %d, want %d", upstreamCalls.Load(), accepted)
+	}
+}
+
+func TestResponsesTopLevelCollectionNearBodyLimitRejectBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+	}))
+	defer upstream.Close()
+
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	tests := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{
+			name:  "tools",
+			field: "tools",
+			value: responsesTestJSONList(129, `{"type":"function","name":"f"}`),
+		},
+		{
+			name:  "include",
+			field: "include",
+			value: responsesTestJSONList(65, `"reasoning.encrypted_content"`),
+		},
+		{
+			name:  "metadata",
+			field: "metadata",
+			value: responsesTestJSONMetadata(17),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := `{"model":"gpt-5.6-sol","input":"`
+			suffix := `","` + test.field + `":` + test.value + `}`
+			padding := maxResponsesBodyBytes - len(prefix) - len(suffix) - 64
+			body := prefix + strings.Repeat("x", padding) + suffix
+			if len(body) < maxResponsesBodyBytes-1024 {
+				t.Fatalf("body size = %d, want near %d", len(body), maxResponsesBodyBytes)
+			}
+			response := doResponsesRequest(t, servers.DataAddr(), rawKey, body, "application/json")
+			responseBody, readErr := io.ReadAll(response.Body)
+			response.Body.Close()
+			if readErr != nil {
+				t.Fatalf("read response: %v", readErr)
+			}
+			if response.StatusCode != http.StatusBadRequest || !bytes.Contains(responseBody, []byte(`"invalid_json"`)) {
+				t.Fatalf("status = %d, body = %s", response.StatusCode, responseBody)
+			}
+		})
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls.Load())
 	}
 }
 
@@ -605,6 +682,22 @@ func responsesTestJSONList(count int, value string) string {
 		builder.WriteString(value)
 	}
 	builder.WriteByte(']')
+	return builder.String()
+}
+
+func responsesTestJSONMetadata(count int) string {
+	var builder strings.Builder
+	builder.Grow(count * 8)
+	builder.WriteByte('{')
+	for index := range count {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteByte('"')
+		builder.WriteByte(byte('a' + index))
+		builder.WriteString(`":"v"`)
+	}
+	builder.WriteByte('}')
 	return builder.String()
 }
 

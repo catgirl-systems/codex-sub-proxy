@@ -37,6 +37,8 @@ const (
 	maxResponsesInputItems   = 1024
 	maxResponsesContentParts = 1024
 	maxResponsesItemTools    = 128
+	maxResponsesInclude      = 64
+	maxResponsesMetadata     = 16
 	maxResponsesSafetyChecks = maxResponsesItemTools
 )
 
@@ -67,6 +69,9 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 		*responseRequest
 		Input      json.RawMessage `json:"input"`
 		ToolChoice json.RawMessage `json:"tool_choice"`
+		Tools      json.RawMessage `json:"tools"`
+		Include    json.RawMessage `json:"include"`
+		Metadata   json.RawMessage `json:"metadata"`
 	}{
 		responseRequest: (*responseRequest)(request),
 	}
@@ -74,6 +79,13 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
 		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode public Responses request: multiple JSON values")
+		}
+		return fmt.Errorf("decode public Responses request: %w", err)
 	}
 	if wire.Input != nil {
 		if bytes.Equal(bytes.TrimSpace(wire.Input), []byte("null")) {
@@ -94,6 +106,35 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		request.ToolChoice = &choice
+	}
+	if wire.Tools != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Tools), []byte("null")) {
+			request.Tools = nil
+		} else {
+			tools, err := decodeResponsesTools(wire.Tools, "decode public request tools")
+			if err != nil {
+				return err
+			}
+			request.Tools = tools
+		}
+	}
+	if wire.Include != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Include), []byte("null")) {
+			request.Include = nil
+		} else {
+			include, err := decodeResponsesInclude(wire.Include, "decode public request include")
+			if err != nil {
+				return err
+			}
+			request.Include = include
+		}
+	}
+	if wire.Metadata != nil {
+		metadata, err := decodeResponsesMetadata(wire.Metadata, "decode public request metadata")
+		if err != nil {
+			return err
+		}
+		request.Metadata = metadata
 	}
 	return nil
 }
@@ -258,6 +299,84 @@ func decodeResponsesTools(data []byte, field string) ([]Tool, error) {
 		return nil, err
 	}
 	return tools, nil
+}
+
+func decodeResponsesInclude(data []byte, field string) ([]string, error) {
+	include := make([]string, 0)
+	err := decodeResponsesArray(data, field, "include entries", maxResponsesInclude,
+		func(decoder *json.Decoder, index int) error {
+			var entry string
+			if err := decoder.Decode(&entry); err != nil {
+				return err
+			}
+			include = append(include, entry)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return include, nil
+}
+
+func decodeResponsesMetadata(data []byte, field string) (map[string]string, error) {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 {
+		return nil, fmt.Errorf("%s: empty JSON value", field)
+	}
+	if bytes.Equal(value, []byte("null")) {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok || delimiter != '{' {
+		return nil, fmt.Errorf("%s: must be a JSON object", field)
+	}
+	metadata := make(map[string]string)
+	for index := 0; decoder.More(); index++ {
+		if index >= maxResponsesMetadata {
+			return nil, fmt.Errorf("%s: too many metadata entries (maximum %d)", field, maxResponsesMetadata)
+		}
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", field, err)
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: metadata key must be a string", field)
+		}
+		if _, exists := metadata[key]; exists {
+			return nil, fmt.Errorf("%s: duplicate metadata key %q", field, key)
+		}
+		valueToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%s %q: %w", field, key, err)
+		}
+		metadataValue, ok := valueToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s %q: metadata value must be a string", field, key)
+		}
+		metadata[key] = metadataValue
+	}
+	token, err = decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	delimiter, ok = token.(json.Delim)
+	if !ok || delimiter != '}' {
+		return nil, fmt.Errorf("%s: must end with a JSON object", field)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("%s: multiple JSON values", field)
+		}
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	return metadata, nil
 }
 
 func decodeResponsesSafetyChecks(data []byte, field string) ([]SafetyCheck, error) {
