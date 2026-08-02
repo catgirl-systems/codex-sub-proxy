@@ -16,6 +16,60 @@
             "detail": "high"
           }
         ]
+      },
+      {
+        "type": "computer_call",
+        "id": "fixture-public-computer",
+        "call_id": "fixture-public-computer-call",
+        "action": {
+          "type": "click",
+          "button": "left",
+          "x": 2,
+          "y": 3
+        },
+        "actions": [
+          {
+            "type": "screenshot"
+          }
+        ],
+        "pending_safety_checks": [
+          {
+            "id": "fixture-public-safety",
+            "code": "confirm",
+            "message": "fixture safety check"
+          }
+        ],
+        "status": "completed"
+      },
+      {
+        "type": "computer_call_output",
+        "call_id": "fixture-public-computer-call",
+        "output": {
+          "type": "computer_screenshot",
+          "file_id": "fixture-public-file-screen"
+        },
+        "acknowledged_safety_checks": [
+          {
+            "id": "fixture-public-safety",
+            "code": "confirm",
+            "message": "fixture safety check"
+          }
+        ],
+        "status": "completed"
+      },
+      {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+          {
+            "type": "function",
+            "name": "fixture_function",
+            "parameters": {
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
       }
     ],
     "tools": [

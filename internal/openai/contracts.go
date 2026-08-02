@@ -136,14 +136,27 @@ func (input *Input) UnmarshalJSON(data []byte) error {
 // InputItem is one public Responses input item. Content and output are
 // polymorphic in the wire contract (a string or a typed content list).
 type InputItem struct {
-	Type      string          `json:"type,omitempty"`
-	Role      string          `json:"role,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments string          `json:"arguments,omitempty"`
-	Output    json.RawMessage `json:"output,omitempty"`
+	Type                     string          `json:"type,omitempty"`
+	Role                     string          `json:"role,omitempty"`
+	Status                   string          `json:"status,omitempty"`
+	Content                  json.RawMessage `json:"content,omitempty"`
+	ID                       string          `json:"id,omitempty"`
+	CallID                   string          `json:"call_id,omitempty"`
+	Name                     string          `json:"name,omitempty"`
+	Arguments                string          `json:"arguments,omitempty"`
+	Output                   json.RawMessage `json:"output,omitempty"`
+	Action                   json.RawMessage `json:"action,omitempty"`
+	Actions                  json.RawMessage `json:"actions,omitempty"`
+	PendingSafetyChecks      []SafetyCheck   `json:"pending_safety_checks,omitempty"`
+	AcknowledgedSafetyChecks []SafetyCheck   `json:"acknowledged_safety_checks,omitempty"`
+	Tools                    []Tool          `json:"tools,omitempty"`
+}
+
+// SafetyCheck is one computer-call safety check.
+type SafetyCheck struct {
+	ID      string `json:"id"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // InputContent is one public input content part.
@@ -286,18 +299,20 @@ type Response struct {
 
 // OutputItem is one public Responses output item.
 type OutputItem struct {
-	ID            string        `json:"id,omitempty"`
-	Type          string        `json:"type"`
-	Role          string        `json:"role,omitempty"`
-	Status        string        `json:"status,omitempty"`
-	Content       []ContentPart `json:"content,omitempty"`
-	CallID        string        `json:"call_id,omitempty"`
-	Name          string        `json:"name,omitempty"`
-	Arguments     string        `json:"arguments,omitempty"`
-	Input         string        `json:"input,omitempty"`
-	Result        string        `json:"result,omitempty"`
-	RevisedPrompt string        `json:"revised_prompt,omitempty"`
-	Action        string        `json:"action,omitempty"`
+	ID                       string          `json:"id,omitempty"`
+	Type                     string          `json:"type"`
+	Role                     string          `json:"role,omitempty"`
+	Status                   string          `json:"status,omitempty"`
+	Content                  []ContentPart   `json:"content,omitempty"`
+	CallID                   string          `json:"call_id,omitempty"`
+	Name                     string          `json:"name,omitempty"`
+	Arguments                string          `json:"arguments,omitempty"`
+	Input                    string          `json:"input,omitempty"`
+	Result                   string          `json:"result,omitempty"`
+	RevisedPrompt            string          `json:"revised_prompt,omitempty"`
+	Action                   json.RawMessage `json:"action,omitempty"`
+	PendingSafetyChecks      []SafetyCheck   `json:"pending_safety_checks,omitempty"`
+	AcknowledgedSafetyChecks []SafetyCheck   `json:"acknowledged_safety_checks,omitempty"`
 }
 
 // ContentPart is one public output content part.

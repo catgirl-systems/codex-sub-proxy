@@ -2,7 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -66,6 +68,78 @@ func TestResponsesAbruptSSEPublishesPreambleBeforeSafeError(t *testing.T) {
 	}
 	if upstreamCalls.Load() != 1 {
 		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
+	}
+}
+func TestResponsesInvalidSequenceProducesBoundedSafeTerminal(t *testing.T) {
+	tests := []struct {
+		name              string
+		fixture           string
+		wantErrorSequence int
+		wantPreamble      bool
+	}{
+		{
+			name:              "negative",
+			fixture:           `data: {"type":"response.created","sequence_number":-1,"response":{"status":"in_progress"}}` + "\n\n",
+			wantErrorSequence: 0,
+		},
+		{
+			name:              "max int",
+			fixture:           fmt.Sprintf("data: {\"type\":\"response.created\",\"sequence_number\":%d,\"response\":{\"status\":\"in_progress\"}}\n\n", math.MaxInt),
+			wantErrorSequence: 0,
+		},
+		{
+			name:              "boundary before max int",
+			fixture:           fmt.Sprintf("data: {\"type\":\"response.created\",\"sequence_number\":%d,\"response\":{\"status\":\"in_progress\"}}\n\n", math.MaxInt-1),
+			wantErrorSequence: math.MaxInt,
+			wantPreamble:      true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(writer, test.fixture)
+			}))
+			defer upstream.Close()
+			servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+			defer shutdownResponsesTestServer(t, servers)
+
+			response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK || strings.Count(string(body), `"type":"error"`) != 1 ||
+				strings.Count(string(body), "[DONE]") != 1 {
+				t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+			}
+			if test.wantPreamble != strings.Contains(string(body), `"type":"response.created"`) {
+				t.Fatalf("preamble presence = %t, body = %s", strings.Contains(string(body), `"type":"response.created"`), body)
+			}
+			var errorSequence int
+			for _, record := range strings.Split(string(body), "\n") {
+				if !strings.HasPrefix(record, "data: ") || strings.TrimPrefix(record, "data: ") == "[DONE]" {
+					continue
+				}
+				var event struct {
+					Type           string `json:"type"`
+					SequenceNumber int    `json:"sequence_number"`
+				}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(record, "data: ")), &event); err != nil {
+					t.Fatalf("decode public event: %v", err)
+				}
+				if event.SequenceNumber < 0 {
+					t.Fatalf("negative public sequence = %d", event.SequenceNumber)
+				}
+				if event.Type == "error" {
+					errorSequence = event.SequenceNumber
+				}
+			}
+			if errorSequence != test.wantErrorSequence {
+				t.Fatalf("safe error sequence = %d, want %d; body = %s", errorSequence, test.wantErrorSequence, body)
+			}
+		})
 	}
 }
 

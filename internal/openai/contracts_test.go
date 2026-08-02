@@ -27,11 +27,25 @@ func TestResponsesRequestFixtureRoundTrips(t *testing.T) {
 	if fixtures.Responses.Model != "gpt-5.6-sol" || !fixtures.Responses.Stream {
 		t.Fatalf("Responses request = %#v", fixtures.Responses)
 	}
-	if fixtures.Responses.Input == nil || len(fixtures.Responses.Input.Items) != 1 || len(fixtures.Responses.Tools) != 2 {
+	if fixtures.Responses.Input == nil || len(fixtures.Responses.Input.Items) != 4 || len(fixtures.Responses.Tools) != 2 {
 		t.Fatalf("Responses input = %#v", fixtures.Responses)
 	}
 	if !strings.Contains(string(fixtures.Responses.Input.Items[0].Content), "fixture-public-file-image") {
 		t.Fatalf("input image = %s", fixtures.Responses.Input.Items[0].Content)
+	}
+	computerCall := fixtures.Responses.Input.Items[1]
+	if computerCall.Status != "completed" || len(computerCall.Action) == 0 || len(computerCall.Actions) == 0 ||
+		len(computerCall.PendingSafetyChecks) != 1 || computerCall.PendingSafetyChecks[0].Message != "fixture safety check" {
+		t.Fatalf("computer call input = %#v", computerCall)
+	}
+	computerOutput := fixtures.Responses.Input.Items[2]
+	if computerOutput.Status != "completed" || len(computerOutput.Output) == 0 ||
+		len(computerOutput.AcknowledgedSafetyChecks) != 1 || computerOutput.AcknowledgedSafetyChecks[0].ID != "fixture-public-safety" {
+		t.Fatalf("computer call output = %#v", computerOutput)
+	}
+	additionalTools := fixtures.Responses.Input.Items[3]
+	if len(additionalTools.Tools) != 1 || additionalTools.Tools[0].Name != "fixture_function" {
+		t.Fatalf("additional tools = %#v", additionalTools)
 	}
 	if fixtures.Responses.ToolChoice == nil || fixtures.Responses.ToolChoice.Type != ToolChoiceImageGeneration {
 		t.Fatalf("tool choice = %#v", fixtures.Responses.ToolChoice)
@@ -67,8 +81,13 @@ func TestResponsesRequestFixtureRoundTrips(t *testing.T) {
 		roundTrip.Tools[1].Strict == nil || *roundTrip.Tools[1].Strict ||
 		roundTrip.Store == nil || *roundTrip.Store ||
 		roundTrip.ParallelToolCalls == nil || *roundTrip.ParallelToolCalls ||
-		roundTrip.Input == nil ||
-		!strings.Contains(string(roundTrip.Input.Items[0].Content), "fixture-public-file-image") {
+		roundTrip.Input == nil || len(roundTrip.Input.Items) != 4 ||
+		!strings.Contains(string(roundTrip.Input.Items[0].Content), "fixture-public-file-image") ||
+		roundTrip.Input.Items[1].Status != "completed" || len(roundTrip.Input.Items[1].Action) == 0 ||
+		len(roundTrip.Input.Items[1].Actions) == 0 || len(roundTrip.Input.Items[1].PendingSafetyChecks) != 1 ||
+		roundTrip.Input.Items[2].Status != "completed" || len(roundTrip.Input.Items[2].Output) == 0 ||
+		len(roundTrip.Input.Items[2].AcknowledgedSafetyChecks) != 1 ||
+		len(roundTrip.Input.Items[3].Tools) != 1 {
 		t.Fatalf("round-trip Responses request = %#v", roundTrip)
 	}
 }

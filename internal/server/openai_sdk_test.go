@@ -9,10 +9,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	sdk "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
@@ -69,6 +72,159 @@ func TestOfficialOpenAISDKUsesOnlyBaseURLAndAPIKey(t *testing.T) {
 	}
 	if eventCount == 0 || terminalCount != 1 || !sawTypedCompleted {
 		t.Fatalf("official SDK stream events = %d, terminals = %d, typed completed = %t", eventCount, terminalCount, sawTypedCompleted)
+	}
+}
+func TestOfficialOpenAISDKComputerCallRoundTrip(t *testing.T) {
+	fixture := []byte("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"computer-response\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}}\n\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"computer-response\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}]}}\n\ndata: [DONE]\n\n")
+	upstream := newResponseFixtureUpstream(t, fixture)
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	params := responses.ResponseNewParams{
+		Model: shared.ResponsesModel("gpt-5.6-sol"),
+		Input: responses.ResponseNewParamsInputUnion{OfString: sdk.String("fixture input")},
+	}
+	result, err := client.Responses.New(context.Background(), params)
+	if err != nil {
+		t.Fatalf("official SDK computer-call response: %v", err)
+	}
+	if result == nil || len(result.Output) != 1 {
+		t.Fatalf("official SDK computer-call output = %#v", result)
+	}
+	computerCall, ok := result.Output[0].AsAny().(responses.ResponseComputerToolCall)
+	if !ok || computerCall.CallID != "computer-call" || computerCall.Action.Type != "click" ||
+		computerCall.Action.X != 4 || computerCall.Action.Y != 5 ||
+		len(computerCall.PendingSafetyChecks) != 1 ||
+		computerCall.PendingSafetyChecks[0].Message != "confirm action" ||
+		!bytes.Contains([]byte(result.Output[0].RawJSON()), []byte(`"acknowledged_safety_checks"`)) {
+		t.Fatalf("official SDK computer-call output = %#v", result.Output[0])
+	}
+
+	stream := client.Responses.NewStreaming(context.Background(), params)
+	var added responses.ResponseOutputItemAddedEvent
+	for stream.Next() {
+		event := stream.Current()
+		if event.Type != "response.output_item.added" {
+			continue
+		}
+		var eventOK bool
+		added, eventOK = event.AsAny().(responses.ResponseOutputItemAddedEvent)
+		if !eventOK {
+			t.Fatalf("official SDK computer-call stream union = %T", event.AsAny())
+		}
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("official SDK computer-call stream: %v", err)
+	}
+	streamComputerCall, ok := added.Item.AsAny().(responses.ResponseComputerToolCall)
+	if !ok || streamComputerCall.Action.Type != "click" ||
+		len(streamComputerCall.PendingSafetyChecks) != 1 ||
+		!bytes.Contains([]byte(added.Item.RawJSON()), []byte(`"acknowledged_safety_checks"`)) {
+		t.Fatalf("official SDK computer-call stream output = %#v", added.Item)
+	}
+}
+func TestOfficialOpenAISDKComputerCallRequestReachesCodex(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamBody atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			t.Errorf("read upstream request: %v", readErr)
+		}
+		upstreamBody.Store(body)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	computerCall := responses.ResponseComputerToolCallParam{
+		ID: "sdk-computer",
+		Action: responses.ResponseComputerToolCallActionUnionParam{
+			OfClick: &responses.ResponseComputerToolCallActionClickParam{
+				Button: "left",
+				X:      4,
+				Y:      5,
+			},
+		},
+		CallID: "sdk-computer-call",
+		PendingSafetyChecks: []responses.ResponseComputerToolCallPendingSafetyCheckParam{{
+			ID:      "sdk-safety",
+			Code:    "confirm",
+			Message: "sdk safety",
+		}},
+		Status: "completed",
+		Type:   "computer_call",
+	}
+	computerOutput := responses.ResponseInputItemComputerCallOutputParam{
+		CallID: "sdk-computer-call",
+		Output: responses.ResponseComputerToolCallOutputScreenshotParam{
+			FileID: param.NewOpt("sdk-screen"),
+			Type:   "computer_screenshot",
+		},
+		AcknowledgedSafetyChecks: []responses.ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam{{
+			ID:      "sdk-safety",
+			Code:    param.NewOpt("confirm"),
+			Message: param.NewOpt("sdk safety"),
+		}},
+		Status: "completed",
+		Type:   "computer_call_output",
+	}
+	params := responses.ResponseNewParams{
+		Model: shared.ResponsesModel("gpt-5.6-sol"),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfInputItemList: responses.ResponseInputParam{
+				{OfComputerCall: &computerCall},
+				{OfComputerCallOutput: &computerOutput},
+			},
+		},
+	}
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	if _, err := client.Responses.New(context.Background(), params); err != nil {
+		t.Fatalf("official SDK computer-call request: %v", err)
+	}
+	body, ok := upstreamBody.Load().([]byte)
+	if !ok {
+		t.Fatal("upstream computer-call request was not captured")
+	}
+	var privateRequest codex.CodexResponseRequest
+	if err := json.Unmarshal(body, &privateRequest); err != nil {
+		t.Fatalf("decode upstream computer-call request: %v", err)
+	}
+	if privateRequest.Input == nil || len(privateRequest.Input.Items) != 2 {
+		t.Fatalf("private SDK computer-call input = %#v", privateRequest.Input)
+	}
+	call := privateRequest.Input.Items[0]
+	var action struct {
+		Type   string `json:"type"`
+		Button string `json:"button"`
+		X      int    `json:"x"`
+		Y      int    `json:"y"`
+	}
+	if err := json.Unmarshal(call.Action, &action); err != nil {
+		t.Fatalf("decode private SDK computer action: %v", err)
+	}
+	if call.Status != "completed" || action.Type != "click" || action.Button != "left" ||
+		action.X != 4 || action.Y != 5 || len(call.PendingSafetyChecks) != 1 ||
+		call.PendingSafetyChecks[0].Message != "sdk safety" {
+		t.Fatalf("private SDK computer call = %#v", call)
+	}
+	output := privateRequest.Input.Items[1]
+	if output.Status != "completed" || string(output.Output) != `{"file_id":"sdk-screen","type":"computer_screenshot"}` ||
+		len(output.AcknowledgedSafetyChecks) != 1 || output.AcknowledgedSafetyChecks[0].ID != "sdk-safety" {
+		t.Fatalf("private SDK computer output = %#v", output)
 	}
 }
 func TestOfficialOpenAISDKNormalizesResponseDone(t *testing.T) {

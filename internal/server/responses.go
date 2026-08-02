@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"time"
@@ -144,7 +145,7 @@ func privateResponseRequest(publicRequest openai.ResponseRequest) (codex.CodexRe
 		Stream:             true,
 		ParallelToolCalls:  publicRequest.ParallelToolCalls,
 		ClientMetadata:     publicRequest.Metadata,
-		Include:            append([]string(nil), publicRequest.Include...),
+		Include:            publicRequest.Include,
 		PreviousResponseID: publicRequest.PreviousResponseID,
 		PromptCacheKey:     publicRequest.PromptCacheKey,
 		ServiceTier:        publicRequest.ServiceTier,
@@ -185,15 +186,47 @@ func privateInput(input *openai.Input) (*codex.CodexInput, error) {
 			if err != nil {
 				return nil, fmt.Errorf("encode private input arguments: %w", err)
 			}
+			tools, err := privateTools(item.Tools)
+			if err != nil {
+				return nil, fmt.Errorf("encode private input tools: %w", err)
+			}
+			var pendingSafetyChecks []codex.CodexSafetyCheck
+			if item.PendingSafetyChecks != nil {
+				pendingSafetyChecks = make([]codex.CodexSafetyCheck, len(item.PendingSafetyChecks))
+				for index, check := range item.PendingSafetyChecks {
+					pendingSafetyChecks[index] = codex.CodexSafetyCheck{
+						ID:      check.ID,
+						Code:    check.Code,
+						Message: check.Message,
+					}
+				}
+			}
+			var acknowledgedSafetyChecks []codex.CodexSafetyCheck
+			if item.AcknowledgedSafetyChecks != nil {
+				acknowledgedSafetyChecks = make([]codex.CodexSafetyCheck, len(item.AcknowledgedSafetyChecks))
+				for index, check := range item.AcknowledgedSafetyChecks {
+					acknowledgedSafetyChecks[index] = codex.CodexSafetyCheck{
+						ID:      check.ID,
+						Code:    check.Code,
+						Message: check.Message,
+					}
+				}
+			}
 			items = append(items, codex.CodexInputItem{
-				Type:      item.Type,
-				Role:      item.Role,
-				Content:   append(json.RawMessage(nil), item.Content...),
-				ID:        item.ID,
-				CallID:    item.CallID,
-				Name:      item.Name,
-				Arguments: arguments,
-				Output:    append(json.RawMessage(nil), item.Output...),
+				Type:                     item.Type,
+				Role:                     item.Role,
+				Status:                   item.Status,
+				Content:                  item.Content,
+				ID:                       item.ID,
+				CallID:                   item.CallID,
+				Name:                     item.Name,
+				Arguments:                arguments,
+				Output:                   item.Output,
+				Action:                   item.Action,
+				Actions:                  item.Actions,
+				PendingSafetyChecks:      pendingSafetyChecks,
+				AcknowledgedSafetyChecks: acknowledgedSafetyChecks,
+				Tools:                    tools,
 			})
 		}
 		return &codex.CodexInput{Items: items}, nil
@@ -217,7 +250,7 @@ func privateTools(tools []openai.Tool) ([]codex.CodexTool, error) {
 			Name:              tool.Name,
 			Description:       tool.Description,
 			Strict:            tool.Strict,
-			Parameters:        append(json.RawMessage(nil), tool.Parameters...),
+			Parameters:        tool.Parameters,
 			Action:            tool.Action,
 			Background:        tool.Background,
 			InputFidelity:     tool.InputFidelity,
@@ -284,6 +317,9 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	streamErr := transport.Stream(requestContext, privateRequest, func(event codex.CodexResponseStreamEvent) error {
 		if requestContext.Err() != nil {
 			return requestContext.Err()
+		}
+		if event.SequenceNumber < 0 || event.SequenceNumber == math.MaxInt {
+			return fmt.Errorf("invalid upstream sequence number %d", event.SequenceNumber)
 		}
 		if event.SequenceNumber > lastSequence {
 			lastSequence = event.SequenceNumber
@@ -395,7 +431,7 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 	if len(event.Raw) != 0 && rawPublicEvent(event.Raw, event.Type) {
 		payload := bytes.TrimSpace(event.Raw)
 		if json.Valid(payload) && !bytes.ContainsAny(payload, "\r\n") && len(payload) <= maxResponsesEventBytes {
-			return append([]byte(nil), payload...), true, nil
+			return payload, true, nil
 		}
 	}
 	var item *openai.OutputItem
@@ -411,7 +447,7 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		Part:              publicContentPart(event.Part),
 		Delta:             event.Delta,
 		Arguments:         event.Arguments,
-		Annotation:        append([]byte(nil), event.Annotation...),
+		Annotation:        event.Annotation,
 		Text:              event.Text,
 		Logprobs:          publicLogprobs(event.Logprobs),
 		Code:              eventCode,
@@ -527,7 +563,7 @@ func privateOutputJSON(raw []byte) bool {
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return true
 	}
-	for _, key := range []string{"output", "actions", "pending_safety_checks", "acknowledged_safety_checks", "created_by", "phase"} {
+	for _, key := range []string{"output", "actions", "created_by", "phase"} {
 		if _, found := item[key]; found {
 			return true
 		}
@@ -540,7 +576,7 @@ func publicResponsePayload(result codex.CodexStreamResult) ([]byte, error) {
 		return nil, errors.New("upstream response is missing")
 	}
 	if raw := rawResponsePayload(result.Events); len(raw) != 0 && !privateResponseJSON(raw) && result.Response.Status != codex.CodexResponseStatusFailed {
-		return append([]byte(nil), raw...), nil
+		return raw, nil
 	}
 	payload, err := json.Marshal(publicResponse(result.Response))
 	if err != nil {
@@ -601,25 +637,36 @@ func publicOutputItem(item *codex.CodexOutputItem) openai.OutputItem {
 		return openai.OutputItem{}
 	}
 	output := openai.OutputItem{
-		ID:            item.ID,
-		Type:          item.Type,
-		Role:          item.Role,
-		Status:        item.Status,
-		Content:       publicContentParts(item.Content),
-		CallID:        item.CallID,
-		Name:          item.Name,
-		Arguments:     item.Arguments,
-		Input:         item.Input,
-		Result:        item.Result,
-		RevisedPrompt: item.RevisedPrompt,
-	}
-	if len(item.Action) != 0 {
-		var action string
-		if json.Unmarshal(item.Action, &action) == nil {
-			output.Action = action
-		}
+		ID:                       item.ID,
+		Type:                     item.Type,
+		Role:                     item.Role,
+		Status:                   item.Status,
+		Content:                  publicContentParts(item.Content),
+		CallID:                   item.CallID,
+		Name:                     item.Name,
+		Arguments:                item.Arguments,
+		Input:                    item.Input,
+		Result:                   item.Result,
+		RevisedPrompt:            item.RevisedPrompt,
+		Action:                   item.Action,
+		PendingSafetyChecks:      publicSafetyChecks(item.PendingSafetyChecks),
+		AcknowledgedSafetyChecks: publicSafetyChecks(item.AcknowledgedSafetyChecks),
 	}
 	return output
+}
+func publicSafetyChecks(checks []codex.CodexSafetyCheck) []openai.SafetyCheck {
+	if checks == nil {
+		return nil
+	}
+	safetyChecks := make([]openai.SafetyCheck, 0, len(checks))
+	for _, check := range checks {
+		safetyChecks = append(safetyChecks, openai.SafetyCheck{
+			ID:      check.ID,
+			Code:    check.Code,
+			Message: check.Message,
+		})
+	}
+	return safetyChecks
 }
 
 func publicContentParts(parts []codex.CodexContentPart) []openai.ContentPart {
@@ -646,7 +693,7 @@ func publicContentPart(part *codex.CodexContentPart) *openai.ContentPart {
 		Refusal:     part.Refusal,
 		ImageURL:    part.ImageURL,
 		Detail:      part.Detail,
-		Annotations: append([]json.RawMessage(nil), part.Annotations...),
+		Annotations: part.Annotations,
 		Logprobs:    publicLogprobs(part.Logprobs),
 	}
 }
@@ -659,7 +706,7 @@ func publicLogprobs(logprobs []codex.CodexTextLogprob) []openai.TextLogprob {
 	for _, logprob := range logprobs {
 		values = append(values, openai.TextLogprob{
 			Token:       logprob.Token,
-			Bytes:       append([]int(nil), logprob.Bytes...),
+			Bytes:       logprob.Bytes,
 			Logprob:     logprob.Logprob,
 			TopLogprobs: publicTopLogprobs(logprob.TopLogprobs),
 		})
@@ -673,7 +720,7 @@ func publicTopLogprobs(logprobs []codex.CodexTopLogprob) []openai.TopLogprob {
 	}
 	values := make([]openai.TopLogprob, 0, len(logprobs))
 	for _, logprob := range logprobs {
-		values = append(values, openai.TopLogprob{Token: logprob.Token, Bytes: append([]int(nil), logprob.Bytes...), Logprob: logprob.Logprob})
+		values = append(values, openai.TopLogprob{Token: logprob.Token, Bytes: logprob.Bytes, Logprob: logprob.Logprob})
 	}
 	return values
 }

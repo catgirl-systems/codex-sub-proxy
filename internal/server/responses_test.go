@@ -68,6 +68,100 @@ func TestResponsesJSONPreservesImageAndUsage(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 1", upstreamCalls.Load())
 	}
 }
+func TestResponsesComputerCallFieldsReachCodex(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamBody atomic.Value
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			t.Errorf("read upstream body: %v", readErr)
+		}
+		upstreamBody.Store(body)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	requestBody := `{"model":"gpt-5.6-sol","input":[{"type":"computer_call","id":"public-computer","call_id":"public-call","action":{"type":"click","button":"left","x":4,"y":5},"actions":[{"type":"screenshot"}],"pending_safety_checks":[{"id":"public-safety","code":"confirm","message":"public safety"}],"status":"completed"},{"type":"computer_call_output","call_id":"public-call","output":{"type":"computer_screenshot","file_id":"public-screen"},"acknowledged_safety_checks":[{"id":"public-safety","code":"confirm","message":"public safety"}],"status":"completed"},{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"public-function","parameters":{"type":"object"},"strict":false}]}]}`
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, requestBody, "application/json")
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("computer-call request status = %d", response.StatusCode)
+	}
+	body, ok := upstreamBody.Load().([]byte)
+	if !ok {
+		t.Fatal("upstream request body was not captured")
+	}
+	var privateRequest codex.CodexResponseRequest
+	if err := json.Unmarshal(body, &privateRequest); err != nil {
+		t.Fatalf("decode private computer-call request: %v", err)
+	}
+	if privateRequest.Input == nil || len(privateRequest.Input.Items) != 3 {
+		t.Fatalf("private computer-call input = %#v", privateRequest.Input)
+	}
+	computerCall := privateRequest.Input.Items[0]
+	if computerCall.Status != "completed" || string(computerCall.Action) != `{"type":"click","button":"left","x":4,"y":5}` ||
+		string(computerCall.Actions) != `[{"type":"screenshot"}]` || len(computerCall.PendingSafetyChecks) != 1 ||
+		computerCall.PendingSafetyChecks[0].Message != "public safety" {
+		t.Fatalf("private computer call = %#v", computerCall)
+	}
+	computerOutput := privateRequest.Input.Items[1]
+	if computerOutput.Status != "completed" || string(computerOutput.Output) != `{"type":"computer_screenshot","file_id":"public-screen"}` ||
+		len(computerOutput.AcknowledgedSafetyChecks) != 1 ||
+		computerOutput.AcknowledgedSafetyChecks[0].ID != "public-safety" {
+		t.Fatalf("private computer output = %#v", computerOutput)
+	}
+	additionalTools := privateRequest.Input.Items[2]
+	if len(additionalTools.Tools) != 1 || additionalTools.Tools[0].Name != "public-function" ||
+		string(additionalTools.Tools[0].Parameters) != `{"type":"object"}` {
+		t.Fatalf("private additional tools = %#v", additionalTools)
+	}
+}
+func TestPublicComputerOutputMappingPreservesSafetyChecks(t *testing.T) {
+	item := codex.CodexOutputItem{
+		ID:      "computer-item",
+		Type:    "computer_call",
+		Status:  "completed",
+		Action:  json.RawMessage(`{"type":"click","button":"left","x":4,"y":5}`),
+		Actions: json.RawMessage(`[{"type":"screenshot"}]`),
+		PendingSafetyChecks: []codex.CodexSafetyCheck{{
+			ID:      "pending",
+			Code:    "confirm",
+			Message: "pending safety",
+		}},
+		AcknowledgedSafetyChecks: []codex.CodexSafetyCheck{{
+			ID:      "acknowledged",
+			Code:    "confirm",
+			Message: "acknowledged safety",
+		}},
+		CreatedBy: "private",
+		Phase:     "private",
+	}
+	output := publicOutputItem(&item)
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("encode public computer output: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode public computer output: %v", err)
+	}
+	if string(fields["action"]) != string(item.Action) ||
+		!bytes.Contains(fields["pending_safety_checks"], []byte(`"pending"`)) ||
+		!bytes.Contains(fields["acknowledged_safety_checks"], []byte(`"acknowledged"`)) {
+		t.Fatalf("public computer output fields = %s", encoded)
+	}
+	for _, privateField := range []string{"actions", "created_by", "phase"} {
+		if _, found := fields[privateField]; found {
+			t.Fatalf("private output field %q reached public output: %s", privateField, encoded)
+		}
+	}
+}
 func TestResponsesSupportedFieldsReachCodexAndUnknownFieldsReject(t *testing.T) {
 	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
 	if err != nil {
