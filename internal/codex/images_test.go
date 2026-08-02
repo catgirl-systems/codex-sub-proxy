@@ -125,6 +125,82 @@ func TestImagesClientEditWireAndDecode(t *testing.T) {
 	}
 }
 
+func TestImagesClientBackgroundValuesWire(t *testing.T) {
+	backgrounds := []string{"auto", "opaque", "transparent"}
+	for _, operation := range []struct {
+		name string
+		edit bool
+		path string
+	}{
+		{name: "generate", path: "/backend-api/codex/images/generations"},
+		{name: "edit", edit: true, path: "/backend-api/codex/images/edits"},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			responseBody := readImageFixture(t, "images_generation.json")
+			if operation.edit {
+				responseBody = readImageFixture(t, "images_edit.json")
+			}
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				index := int(requests.Add(1)) - 1
+				if index >= len(backgrounds) {
+					t.Errorf("unexpected request %d", index+1)
+					writer.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				if request.URL.Path != operation.path {
+					t.Errorf("path = %q, want %q", request.URL.Path, operation.path)
+				}
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				wantKeys := []string{"model", "prompt", "n", "size", "quality", "background"}
+				if operation.edit {
+					wantKeys = append(wantKeys, "images")
+				}
+				assertExactImageJSONKeys(t, body, wantKeys...)
+				if got, want := string(body["background"]), `"`+backgrounds[index]+`"`; got != want {
+					t.Errorf("background = %s, want %s", got, want)
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write(responseBody)
+			}))
+			defer server.Close()
+			client := newTestImagesClient(t, server, "access-token", "account-123")
+			for _, background := range backgrounds {
+				var (
+					result CodexImageResult
+					err    error
+				)
+				if operation.edit {
+					result, err = client.Edit(context.Background(), CodexImageEditRequest{
+						Model: "gpt-image-2", Prompt: "fixture edited icon", N: 1,
+						Size: "1024x1024", Quality: "auto", Background: background,
+						Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}},
+					})
+				} else {
+					result, err = client.Generate(context.Background(), CodexImageGenerationRequest{
+						Model: "gpt-image-2", Prompt: "fixture generated icon", N: 1,
+						Size: "1024x1024", Quality: "auto", Background: background,
+					})
+				}
+				if err != nil {
+					t.Fatalf("%s background %q: %v", operation.name, background, err)
+				}
+				if len(result.Images) != 1 {
+					t.Fatalf("%s background %q result = %#v", operation.name, background, result)
+				}
+			}
+			if got := requests.Load(); got != int32(len(backgrounds)) {
+				t.Fatalf("requests = %d, want %d", got, len(backgrounds))
+			}
+		})
+	}
+}
+
 func TestImagesClientRefreshesOnceAfterUnauthorized(t *testing.T) {
 	responseBody := readImageFixture(t, "images_generation.json")
 	var imageRequests, refreshRequests atomic.Int32
@@ -206,7 +282,8 @@ func TestImagesClientRejectsInvalidInputBeforeDispatch(t *testing.T) {
 		{name: "quality standard", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Quality: "standard"}},
 		{name: "quality unknown", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Quality: "extreme"}},
 		{name: "size", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Size: "17x17"}},
-		{name: "background", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Background: "transparent"}},
+		{name: "background", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Background: "invalid"}},
+		{name: "edit background", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Background: "invalid", Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}}}},
 		{name: "edit no image", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x"}},
 		{name: "edit too many", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Images: tooManyImages}},
 		{name: "edit bad base64", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Images: []CodexImageEditInput{{ImageURL: "data:image/png;base64,not-base64"}}}},

@@ -290,7 +290,7 @@ func validateCodexImageParameters(model, prompt string, n int, size, quality, ba
 	}
 	if background != "" {
 		switch background {
-		case "auto", "opaque":
+		case "auto", "opaque", "transparent":
 		default:
 			return errors.New("Codex Images background is invalid")
 		}
