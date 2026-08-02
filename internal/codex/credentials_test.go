@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,6 +22,31 @@ import (
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
+
+type cancelOnCheckContext struct {
+	cancelAt int
+	checks   int
+}
+
+func (c *cancelOnCheckContext) Deadline() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+func (c *cancelOnCheckContext) Done() <-chan struct{} {
+	return nil
+}
+
+func (c *cancelOnCheckContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelOnCheckContext) Value(any) any {
+	return nil
+}
 
 func TestImportCredentialEncryptsWithoutChangingSource(t *testing.T) {
 	expires := time.Now().Add(time.Hour).Unix()
@@ -178,6 +204,93 @@ func TestCredentialAvailableRequiresUsableEncryptedCredential(t *testing.T) {
 	}
 	if CredentialAvailable(path, testWrongCredentialKeys(t)) {
 		t.Fatal("credential with wrong key reported as available")
+	}
+}
+
+func TestSaveCredentialCanceledBeforeReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	original := Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		AccountID:    "account",
+	}
+	if err := SaveCredential(path, original, keys); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original
+	replacement.AccessToken = "new-access"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := saveCredential(ctx, path, replacement, keys)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("save error = %v, want context.Canceled", err)
+	}
+	stored, err := LoadCredential(path, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameCredential(stored, original) {
+		t.Fatalf("stored credential = %#v, want original", stored)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".credential-*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary credential files remain: %v", matches)
+	}
+}
+
+func TestWriteCredentialCancellationAroundRename(t *testing.T) {
+	keys := testCredentialKeys(t)
+	original := Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		AccountID:    "account",
+	}
+	replacement := original
+	replacement.AccessToken = "new-access"
+	encoded, err := EncryptCredential(replacement, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		cancelAt  int
+		wantError bool
+		wantNew   bool
+	}{
+		{name: "before rename", cancelAt: 15, wantError: true},
+		{name: "after rename", cancelAt: 16, wantNew: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credential.enc")
+			if err := SaveCredential(path, original, keys); err != nil {
+				t.Fatal(err)
+			}
+			ctx := &cancelOnCheckContext{cancelAt: test.cancelAt}
+			err := writeCredential(ctx, path, encoded)
+			if test.wantError != errors.Is(err, context.Canceled) {
+				t.Fatalf("write error = %v, want cancellation = %t", err, test.wantError)
+			}
+			stored, loadErr := LoadCredential(path, keys)
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if gotNew := sameCredential(stored, replacement); gotNew != test.wantNew {
+				t.Fatalf("stored credential = %#v, replacement = %t", stored, test.wantNew)
+			}
+			matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(path), ".credential-*.tmp"))
+			if globErr != nil {
+				t.Fatal(globErr)
+			}
+			if len(matches) != 0 {
+				t.Fatalf("temporary credential files remain: %v", matches)
+			}
+		})
 	}
 }
 

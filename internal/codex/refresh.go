@@ -97,6 +97,7 @@ type Refresher struct {
 	client   *http.Client
 
 	inFlight       *refreshCall
+	generation     uint64
 	permanentToken string
 	transientToken string
 }
@@ -146,68 +147,101 @@ func (r *Refresher) Credential(ctx context.Context) (Credential, error) {
 	if ctx == nil {
 		return Credential{}, errors.New("credential context is nil")
 	}
-	if err := ctx.Err(); err != nil {
-		return Credential{}, err
-	}
-	credential, err := LoadCredential(r.path, r.keys)
-	if err != nil {
-		return Credential{}, err
-	}
-	r.clearChangedFailures(credential)
-	if r.hasPermanentFailure(credential) {
-		return Credential{}, ErrRefreshRequiresLogin
-	}
-	if !r.needsRefresh(credential) {
-		r.mu.Lock()
-		call := r.inFlight
-		r.mu.Unlock()
-		if call != nil {
-			return waitForRefresh(ctx, call)
+	for {
+		if err := ctx.Err(); err != nil {
+			return Credential{}, err
 		}
-		return credential, nil
+		r.mu.Lock()
+		generation := r.generation
+		inFlight := r.inFlight
+		permanentToken := r.permanentToken
+		transientToken := r.transientToken
+		r.mu.Unlock()
+
+		credential, loadErr := LoadCredential(r.path, r.keys)
+		if err := ctx.Err(); err != nil {
+			return Credential{}, err
+		}
+		r.mu.Lock()
+		if generation != r.generation {
+			call := r.inFlight
+			r.mu.Unlock()
+			if call != nil {
+				if _, err := waitForRefresh(ctx, call); err != nil {
+					return Credential{}, err
+				}
+			}
+			continue
+		}
+		r.mu.Unlock()
+		if loadErr != nil {
+			return Credential{}, loadErr
+		}
+		if permanentToken != "" && permanentToken != credential.RefreshToken ||
+			transientToken != "" && transientToken != credential.RefreshToken {
+			r.clearChangedFailures(credential)
+			continue
+		}
+		if permanentToken != "" && permanentToken == credential.RefreshToken {
+			return Credential{}, ErrRefreshRequiresLogin
+		}
+		if inFlight != nil {
+			if _, err := waitForRefresh(ctx, inFlight); err != nil {
+				return Credential{}, err
+			}
+			continue
+		}
+		if !r.needsRefresh(credential) {
+			return credential, nil
+		}
+		return r.refreshSingleFlight(ctx, false, credential)
 	}
-	return r.refreshSingleFlight(ctx, false, credential)
 }
 
 // Snapshot reports availability and state from one credential observation.
 func (r *Refresher) Snapshot() CredentialSnapshot {
-	credential, err := LoadCredential(r.path, r.keys)
-	now := time.Now()
-	r.mu.Lock()
-	inFlight := r.inFlight != nil
-	permanentToken := r.permanentToken
-	transientToken := r.transientToken
-	if err == nil {
-		if permanentToken != "" && permanentToken != credential.RefreshToken {
-			r.permanentToken = ""
-			permanentToken = ""
+	for {
+		r.mu.Lock()
+		generation := r.generation
+		inFlight := r.inFlight
+		permanentToken := r.permanentToken
+		transientToken := r.transientToken
+		r.mu.Unlock()
+
+		credential, loadErr := LoadCredential(r.path, r.keys)
+		now := time.Now()
+		r.mu.Lock()
+		if generation != r.generation {
+			r.mu.Unlock()
+			continue
 		}
-		if transientToken != "" && transientToken != credential.RefreshToken {
-			r.transientToken = ""
-			transientToken = ""
+		r.mu.Unlock()
+		if loadErr != nil {
+			return CredentialSnapshot{State: CredentialStatusMissing}
 		}
+		if permanentToken != "" && permanentToken != credential.RefreshToken ||
+			transientToken != "" && transientToken != credential.RefreshToken {
+			r.clearChangedFailures(credential)
+			continue
+		}
+		available := credentialAvailableAt(credential, now)
+		if permanentToken != "" && permanentToken == credential.RefreshToken {
+			return CredentialSnapshot{Available: false, State: CredentialStatusPermanentFailure}
+		}
+		if inFlight != nil {
+			return CredentialSnapshot{Available: available, State: CredentialStatusRefreshing}
+		}
+		if transientToken != "" && transientToken == credential.RefreshToken {
+			return CredentialSnapshot{Available: available, State: CredentialStatusTransientFailure}
+		}
+		if credential.ExpiresAt.IsZero() || !credential.ExpiresAt.After(now) {
+			return CredentialSnapshot{Available: false, State: CredentialStatusExpired}
+		}
+		if !credential.ExpiresAt.After(now.Add(refreshSkew)) {
+			return CredentialSnapshot{Available: available, State: CredentialStatusRefreshable}
+		}
+		return CredentialSnapshot{Available: available, State: CredentialStatusCurrent}
 	}
-	r.mu.Unlock()
-	if err != nil {
-		return CredentialSnapshot{State: CredentialStatusMissing}
-	}
-	available := credentialAvailableAt(credential, now)
-	if permanentToken != "" && permanentToken == credential.RefreshToken {
-		return CredentialSnapshot{Available: false, State: CredentialStatusPermanentFailure}
-	}
-	if inFlight {
-		return CredentialSnapshot{Available: available, State: CredentialStatusRefreshing}
-	}
-	if transientToken != "" && transientToken == credential.RefreshToken {
-		return CredentialSnapshot{Available: available, State: CredentialStatusTransientFailure}
-	}
-	if credential.ExpiresAt.IsZero() || !credential.ExpiresAt.After(now) {
-		return CredentialSnapshot{Available: false, State: CredentialStatusExpired}
-	}
-	if !credential.ExpiresAt.After(now.Add(refreshSkew)) {
-		return CredentialSnapshot{Available: available, State: CredentialStatusRefreshable}
-	}
-	return CredentialSnapshot{Available: available, State: CredentialStatusCurrent}
 }
 
 // Available reports whether a non-expired credential can serve a request now.
@@ -293,6 +327,7 @@ func (r *Refresher) refreshSingleFlight(ctx context.Context, force bool, observe
 	}
 	call := &refreshCall{done: make(chan struct{})}
 	r.inFlight = call
+	r.generation++
 	r.mu.Unlock()
 	go r.runRefresh(call, force, observed)
 	return waitForRefresh(ctx, call)
@@ -380,8 +415,11 @@ func (r *Refresher) refresh(ctx context.Context, current Credential) (Credential
 	if err != nil {
 		return Credential{}, &RefreshError{status: response.StatusCode}
 	}
-	stored, saved, err := saveCredentialIfUnchanged(r.path, current, credential, r.keys)
+	stored, saved, err := saveCredentialIfUnchanged(ctx, r.path, current, credential, r.keys)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return Credential{}, err
+		}
 		return Credential{}, &RefreshError{status: response.StatusCode}
 	}
 	if !saved {
@@ -416,17 +454,24 @@ func (r *Refresher) finishRefresh(call *refreshCall, credential Credential, err 
 	if r.inFlight == call {
 		r.inFlight = nil
 	}
+	r.generation++
 	close(call.done)
 	r.mu.Unlock()
 }
 
 func (r *Refresher) clearChangedFailures(credential Credential) {
 	r.mu.Lock()
+	changed := false
 	if r.permanentToken != "" && r.permanentToken != credential.RefreshToken {
 		r.permanentToken = ""
+		changed = true
 	}
 	if r.transientToken != "" && r.transientToken != credential.RefreshToken {
 		r.transientToken = ""
+		changed = true
+	}
+	if changed {
+		r.generation++
 	}
 	r.mu.Unlock()
 }

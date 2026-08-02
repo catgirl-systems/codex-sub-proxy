@@ -328,7 +328,7 @@ func LoginAndSave(ctx context.Context, options LoginOptions, path string, keys e
 	if err != nil {
 		return Credential{}, err
 	}
-	if err := SaveCredential(path, credential, keys); err != nil {
+	if err := saveCredential(ctx, path, credential, keys); err != nil {
 		return Credential{}, fmt.Errorf("save OAuth credential: %w", err)
 	}
 	return credential, nil

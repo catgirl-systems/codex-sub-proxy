@@ -134,6 +134,60 @@ func TestRefresherSingleFlightPersistsRotatedCredential(t *testing.T) {
 	}
 }
 
+func TestRefresherSnapshotDoesNotWaitForActiveRefresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	if err := SaveCredential(path, Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+		AccountID:    "account",
+	}, keys); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-release
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, refreshErr := refresher.Credential(context.Background())
+		refreshDone <- refreshErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start")
+	}
+	snapshotDone := make(chan CredentialSnapshot, 1)
+	go func() {
+		snapshotDone <- refresher.Snapshot()
+	}()
+	select {
+	case snapshot := <-snapshotDone:
+		if snapshot.State != CredentialStatusRefreshing {
+			t.Fatalf("snapshot = %+v, want refreshing", snapshot)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("snapshot waited for active refresh")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if refreshErr := <-refreshDone; refreshErr != nil {
+		t.Fatalf("refresh error: %v", refreshErr)
+	}
+}
+
 func TestRefresherCanceledWaiterDoesNotCancelRefresh(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credential.enc")
 	keys := testCredentialKeys(t)

@@ -146,6 +146,16 @@ func DecryptCredential(data []byte, keys envelope.KeySet) (Credential, error) {
 
 // SaveCredential writes an encrypted credential with private-file permissions.
 func SaveCredential(path string, credential Credential, keys envelope.KeySet) error {
+	return saveCredential(context.Background(), path, credential, keys)
+}
+
+func saveCredential(ctx context.Context, path string, credential Credential, keys envelope.KeySet) error {
+	if ctx == nil {
+		return errors.New("credential save context is nil")
+	}
+	if err := checkCredentialContext(ctx, "save credential"); err != nil {
+		return err
+	}
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return errors.New("credential path is empty")
@@ -160,12 +170,24 @@ func SaveCredential(path string, credential Credential, keys envelope.KeySet) er
 	if err != nil {
 		return err
 	}
+	if err := checkCredentialContext(ctx, "encode credential"); err != nil {
+		return err
+	}
 	credentialSaveMu.Lock()
 	defer credentialSaveMu.Unlock()
-	return writeCredential(path, encoded)
+	if err := checkCredentialContext(ctx, "write credential"); err != nil {
+		return err
+	}
+	return writeCredential(ctx, path, encoded)
 }
 
-func saveCredentialIfUnchanged(path string, expected, replacement Credential, keys envelope.KeySet) (Credential, bool, error) {
+func saveCredentialIfUnchanged(ctx context.Context, path string, expected, replacement Credential, keys envelope.KeySet) (Credential, bool, error) {
+	if ctx == nil {
+		return Credential{}, false, errors.New("credential save context is nil")
+	}
+	if err := checkCredentialContext(ctx, "compare credential"); err != nil {
+		return Credential{}, false, err
+	}
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return Credential{}, false, errors.New("credential path is empty")
@@ -180,71 +202,186 @@ func saveCredentialIfUnchanged(path string, expected, replacement Credential, ke
 	if err != nil {
 		return Credential{}, false, err
 	}
+	if err := checkCredentialContext(ctx, "encode credential"); err != nil {
+		return Credential{}, false, err
+	}
 	credentialSaveMu.Lock()
 	defer credentialSaveMu.Unlock()
+	if err := checkCredentialContext(ctx, "load credential"); err != nil {
+		return Credential{}, false, err
+	}
 	current, err := loadCredential(path, keys)
+	if contextErr := checkCredentialContext(ctx, "load credential"); contextErr != nil {
+		return Credential{}, false, contextErr
+	}
 	if err != nil {
 		return Credential{}, false, err
 	}
 	if !sameCredential(current, expected) {
 		return current, false, nil
 	}
-	if err := writeCredential(path, encoded); err != nil {
+	if err := writeCredential(ctx, path, encoded); err != nil {
 		return Credential{}, false, err
 	}
 	return replacement, true, nil
 }
 
-func writeCredential(path string, encoded []byte) error {
+func checkCredentialContext(ctx context.Context, operation string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
+}
+
+func writeCredential(ctx context.Context, path string, encoded []byte) error {
+	if ctx == nil {
+		return errors.New("credential save context is nil")
+	}
 	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("create credential directory: %w", err)
+	if err := checkCredentialContext(ctx, "create credential directory"); err != nil {
+		return err
 	}
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+	mkdirErr := os.MkdirAll(directory, 0o700)
+	if contextErr := checkCredentialContext(ctx, "create credential directory"); contextErr != nil {
+		return contextErr
+	}
+	if mkdirErr != nil {
+		return fmt.Errorf("create credential directory: %w", mkdirErr)
+	}
+	if err := checkCredentialContext(ctx, "inspect credential path"); err != nil {
+		return err
+	}
+	info, lstatErr := os.Lstat(path)
+	if contextErr := checkCredentialContext(ctx, "inspect credential path"); contextErr != nil {
+		return contextErr
+	}
+	if lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("credential path is a symbolic link")
-	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("inspect credential path: %w", err)
+	} else if lstatErr != nil && !os.IsNotExist(lstatErr) {
+		return fmt.Errorf("inspect credential path: %w", lstatErr)
 	}
-	file, err := os.CreateTemp(directory, ".credential-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create credential file: %w", err)
+	if err := checkCredentialContext(ctx, "create credential file"); err != nil {
+		return err
+	}
+	file, createErr := os.CreateTemp(directory, ".credential-*.tmp")
+	if contextErr := checkCredentialContext(ctx, "create credential file"); contextErr != nil {
+		if file != nil {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+		}
+		return contextErr
+	}
+	if createErr != nil {
+		return fmt.Errorf("create credential file: %w", createErr)
 	}
 	temporary := file.Name()
 	removeTemporary := true
+	fileClosed := false
 	defer func() {
+		if !fileClosed {
+			_ = file.Close()
+		}
 		if removeTemporary {
 			_ = os.Remove(temporary)
 		}
 	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("set credential permissions: %w", err)
+	if err := checkCredentialContext(ctx, "set credential permissions"); err != nil {
+		return err
 	}
-	if _, err := file.Write(encoded); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write credential: %w", err)
+	chmodErr := file.Chmod(0o600)
+	if contextErr := checkCredentialContext(ctx, "set credential permissions"); contextErr != nil {
+		return contextErr
 	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("sync credential: %w", err)
+	if chmodErr != nil {
+		return fmt.Errorf("set credential permissions: %w", chmodErr)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close credential: %w", err)
+	if err := checkCredentialContext(ctx, "write credential"); err != nil {
+		return err
 	}
-	if err := os.Rename(temporary, path); err != nil {
-		return fmt.Errorf("replace credential: %w", err)
+	_, writeErr := file.Write(encoded)
+	if contextErr := checkCredentialContext(ctx, "write credential"); contextErr != nil {
+		return contextErr
 	}
-	removeTemporary = false
-	directoryFile, err := os.Open(directory)
-	if err != nil {
-		return fmt.Errorf("open credential directory: %w", err)
+	if writeErr != nil {
+		return fmt.Errorf("write credential: %w", writeErr)
 	}
-	if err := directoryFile.Sync(); err != nil {
-		_ = directoryFile.Close()
-		return fmt.Errorf("sync credential directory: %w", err)
+	if err := checkCredentialContext(ctx, "sync credential"); err != nil {
+		return err
 	}
-	if err := directoryFile.Close(); err != nil {
-		return fmt.Errorf("close credential directory: %w", err)
+	syncErr := file.Sync()
+	if contextErr := checkCredentialContext(ctx, "sync credential"); contextErr != nil {
+		return contextErr
+	}
+	if syncErr != nil {
+		return fmt.Errorf("sync credential: %w", syncErr)
+	}
+	if err := checkCredentialContext(ctx, "close credential"); err != nil {
+		return err
+	}
+	closeErr := file.Close()
+	fileClosed = true
+	if contextErr := checkCredentialContext(ctx, "close credential"); contextErr != nil {
+		return contextErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close credential: %w", closeErr)
+	}
+	if err := checkCredentialContext(ctx, "replace credential"); err != nil {
+		return err
+	}
+	committed := false
+	renameErr := os.Rename(temporary, path)
+	if renameErr == nil {
+		committed = true
+		removeTemporary = false
+	}
+	if contextErr := checkCredentialContext(ctx, "replace credential"); contextErr != nil && !committed {
+		return contextErr
+	}
+	if renameErr != nil {
+		return fmt.Errorf("replace credential: %w", renameErr)
+	}
+	// Rename is the commit point; finish the directory sync even if cancellation
+	// is observed afterward.
+	if contextErr := checkCredentialContext(ctx, "open credential directory"); contextErr != nil && !committed {
+		return contextErr
+	}
+	directoryFile, openErr := os.Open(directory)
+	if contextErr := checkCredentialContext(ctx, "open credential directory"); contextErr != nil && !committed {
+		if directoryFile != nil {
+			_ = directoryFile.Close()
+		}
+		return contextErr
+	}
+	if openErr != nil {
+		return fmt.Errorf("open credential directory: %w", openErr)
+	}
+	directoryClosed := false
+	defer func() {
+		if !directoryClosed {
+			_ = directoryFile.Close()
+		}
+	}()
+	if contextErr := checkCredentialContext(ctx, "sync credential directory"); contextErr != nil && !committed {
+		return contextErr
+	}
+	directorySyncErr := directoryFile.Sync()
+	if contextErr := checkCredentialContext(ctx, "sync credential directory"); contextErr != nil && !committed {
+		return contextErr
+	}
+	if directorySyncErr != nil {
+		return fmt.Errorf("sync credential directory: %w", directorySyncErr)
+	}
+	if contextErr := checkCredentialContext(ctx, "close credential directory"); contextErr != nil && !committed {
+		return contextErr
+	}
+	directoryCloseErr := directoryFile.Close()
+	directoryClosed = true
+	if contextErr := checkCredentialContext(ctx, "close credential directory"); contextErr != nil && !committed {
+		return contextErr
+	}
+	if directoryCloseErr != nil {
+		return fmt.Errorf("close credential directory: %w", directoryCloseErr)
 	}
 	return nil
 }
@@ -316,7 +453,7 @@ func ImportCredential(ctx context.Context, sourcePath, destinationPath string, k
 	if err := ctx.Err(); err != nil {
 		return Credential{}, err
 	}
-	if err := SaveCredential(destinationPath, credential, keys); err != nil {
+	if err := saveCredential(ctx, destinationPath, credential, keys); err != nil {
 		return Credential{}, err
 	}
 	return credential, nil
