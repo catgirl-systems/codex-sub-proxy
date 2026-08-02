@@ -561,5 +561,12 @@ func publicImageUsage(usage *codex.CodexUsage) *openai.Usage {
 			TextTokens:   usage.InputTokensDetails.TextTokens,
 		}
 	}
+	if usage.OutputTokensDetails != nil {
+		public.OutputTokensDetails = &openai.OutputTokenDetails{
+			ReasoningTokens: usage.OutputTokensDetails.ReasoningTokens,
+			ImageTokens:     usage.OutputTokensDetails.ImageTokens,
+			TextTokens:      usage.OutputTokensDetails.TextTokens,
+		}
+	}
 	return public
 }

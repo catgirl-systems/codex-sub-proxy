@@ -63,6 +63,61 @@ func TestImagesPublicValidationAndJSONLimits(t *testing.T) {
 	}
 }
 
+func TestPublicImageResponsePreservesFixtureUsage(t *testing.T) {
+	for _, name := range []string{"images_generation.json", "images_edit.json"} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join("..", "codex", "testdata", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var privateResponse codex.CodexImageResponse
+			if err := json.Unmarshal(raw, &privateResponse); err != nil {
+				t.Fatal(err)
+			}
+			if privateResponse.Created == nil || len(privateResponse.Data) != 1 ||
+				privateResponse.Usage == nil ||
+				privateResponse.Usage.InputTokensDetails == nil ||
+				privateResponse.Usage.OutputTokensDetails == nil {
+				t.Fatalf("private response = %#v", privateResponse)
+			}
+			response, err := publicImageResponse(codex.CodexImageResult{
+				Created: *privateResponse.Created,
+				Images: []codex.CodexImage{{
+					Bytes:         []byte("\x89PNG\r\n\x1a\n\x00"),
+					RevisedPrompt: privateResponse.Data[0].RevisedPrompt,
+				}},
+				Usage: privateResponse.Usage,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			publicUsage := response.Usage
+			privateUsage := privateResponse.Usage
+			if publicUsage == nil ||
+				publicUsage.InputTokens != privateUsage.InputTokens ||
+				publicUsage.OutputTokens != privateUsage.OutputTokens ||
+				publicUsage.TotalTokens != privateUsage.TotalTokens ||
+				publicUsage.InputTokensDetails == nil ||
+				publicUsage.InputTokensDetails.CachedTokens != privateUsage.InputTokensDetails.CachedTokens ||
+				publicUsage.InputTokensDetails.ImageTokens != privateUsage.InputTokensDetails.ImageTokens ||
+				publicUsage.InputTokensDetails.TextTokens != privateUsage.InputTokensDetails.TextTokens ||
+				publicUsage.OutputTokensDetails == nil ||
+				publicUsage.OutputTokensDetails.ReasoningTokens != privateUsage.OutputTokensDetails.ReasoningTokens ||
+				publicUsage.OutputTokensDetails.ImageTokens != privateUsage.OutputTokensDetails.ImageTokens ||
+				publicUsage.OutputTokensDetails.TextTokens != privateUsage.OutputTokensDetails.TextTokens {
+				t.Fatalf("public response usage = %#v, private usage = %#v", publicUsage, privateUsage)
+			}
+		})
+	}
+	if publicImageUsage(nil) != nil {
+		t.Fatal("nil usage was mapped")
+	}
+	withoutDetails := publicImageUsage(&codex.CodexUsage{})
+	if withoutDetails == nil || withoutDetails.InputTokensDetails != nil || withoutDetails.OutputTokensDetails != nil {
+		t.Fatalf("omitted usage details = %#v", withoutDetails)
+	}
+}
+
 func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 	generationResponse, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "images_generation.json"))
 	if err != nil {
@@ -256,6 +311,21 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 		generated.OutputFormat != sdk.ImagesResponseOutputFormatWebP {
 		t.Fatalf("generated metadata = %#v", generated)
 	}
+	var generatedOutput struct {
+		OutputTokensDetails *openai.OutputTokenDetails `json:"output_tokens_details"`
+	}
+	if err := json.Unmarshal([]byte(generated.Usage.RawJSON()), &generatedOutput); err != nil {
+		t.Fatalf("generated usage: %v", err)
+	}
+	if generated.Usage.InputTokens != 9 || generated.Usage.OutputTokens != 2 || generated.Usage.TotalTokens != 11 ||
+		generated.Usage.InputTokensDetails.ImageTokens != 3 ||
+		generated.Usage.InputTokensDetails.TextTokens != 6 ||
+		generatedOutput.OutputTokensDetails == nil ||
+		generatedOutput.OutputTokensDetails.ReasoningTokens != 0 ||
+		generatedOutput.OutputTokensDetails.ImageTokens != 1 ||
+		generatedOutput.OutputTokensDetails.TextTokens != 1 {
+		t.Fatalf("generated usage = %#v, output details = %#v", generated.Usage, generatedOutput.OutputTokensDetails)
+	}
 	edited, err := client.Images.Edit(context.Background(), sdk.ImageEditParams{
 		Image:             sdk.ImageEditParamsImageUnion{OfFileArray: []io.Reader{bytes.NewReader(imageBytes), bytes.NewReader(imageBytes)}},
 		Model:             sdk.ImageModel("gpt-image-2"),
@@ -279,6 +349,21 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 		edited.Size != sdk.ImagesResponseSize1024x1536 ||
 		edited.OutputFormat != sdk.ImagesResponseOutputFormatJPEG {
 		t.Fatalf("edited metadata = %#v", edited)
+	}
+	var editedOutput struct {
+		OutputTokensDetails *openai.OutputTokenDetails `json:"output_tokens_details"`
+	}
+	if err := json.Unmarshal([]byte(edited.Usage.RawJSON()), &editedOutput); err != nil {
+		t.Fatalf("edited usage: %v", err)
+	}
+	if edited.Usage.InputTokens != 16 || edited.Usage.OutputTokens != 3 || edited.Usage.TotalTokens != 19 ||
+		edited.Usage.InputTokensDetails.ImageTokens != 8 ||
+		edited.Usage.InputTokensDetails.TextTokens != 8 ||
+		editedOutput.OutputTokensDetails == nil ||
+		editedOutput.OutputTokensDetails.ReasoningTokens != 1 ||
+		editedOutput.OutputTokensDetails.ImageTokens != 1 ||
+		editedOutput.OutputTokensDetails.TextTokens != 2 {
+		t.Fatalf("edited usage = %#v, output details = %#v", edited.Usage, editedOutput.OutputTokensDetails)
 	}
 	request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+imagesGenerationsEndpoint, bytes.NewBufferString(`{"model":"gpt-image-2","prompt":"generate","response_format":"url"}`))
 	if err != nil {
