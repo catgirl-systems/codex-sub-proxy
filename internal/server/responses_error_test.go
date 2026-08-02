@@ -205,6 +205,71 @@ func TestResponsesPrivateTopLevelErrorIsSafeSSE(t *testing.T) {
 		}
 	}
 }
+func TestResponsesPrivateTopLevelErrorIsRejectedJSON(t *testing.T) {
+	fixture := []byte("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"visible\",\"code\":\"provider-code\",\"message\":\"provider message\",\"param\":\"prompt\",\"error\":{\"code\":\"server_error\",\"type\":\"provider_error\",\"message\":\"nested provider message\",\"plan_type\":\"pro\",\"retry_after\":4.5,\"resets_at\":1738888890}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":false}`, "application/json")
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway || response.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("status = %d, content type = %q, body = %s", response.StatusCode, response.Header.Get("Content-Type"), body)
+	}
+	var value struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &value); err != nil {
+		t.Fatalf("decode safe error: %v", err)
+	}
+	if value.Error.Type != "server_error" || value.Error.Code != "upstream_protocol_error" ||
+		value.Error.Message != "The upstream service returned an invalid response." {
+		t.Fatalf("safe error = %#v", value.Error)
+	}
+	for _, private := range []string{"provider-code", "provider message", "nested provider message", "plan_type", "retry_after", "resets_at", "visible"} {
+		if strings.Contains(string(body), private) {
+			t.Fatalf("private upstream field %q leaked: %s", private, body)
+		}
+	}
+}
+
+func TestResponsesCompletedJSONWithoutEventError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":false}`, "application/json")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d, body = %s", response.StatusCode, body)
+	}
+	var value struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value.Status != "completed" {
+		t.Fatalf("response status = %q, want completed", value.Status)
+	}
+}
 
 func TestResponsesFailedStreamHasOneSafeTerminal(t *testing.T) {
 	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_failed.sse"))

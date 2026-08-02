@@ -718,12 +718,13 @@ func (decoder *codexStreamDecoder) add(event CodexResponseStreamEvent) error {
 		return fmt.Errorf("%w: event count exceeds limit", ErrCodexStreamMalformed)
 	}
 	decoder.events = append(decoder.events, event)
+	decoder.failed = decoder.failed || event.Error != nil
 	if !isCodexTerminalEvent(event.Type) {
 		return nil
 	}
 	decoder.terminalType = event.Type
 	decoder.response = event.Response
-	decoder.failed = event.Type == CodexEventResponseFailed || event.Type == CodexEventError ||
+	decoder.failed = decoder.failed || event.Type == CodexEventResponseFailed || event.Type == CodexEventError ||
 		(event.Response != nil && event.Response.Status == CodexResponseStatusFailed)
 	return nil
 }

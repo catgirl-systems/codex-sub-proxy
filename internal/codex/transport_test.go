@@ -101,6 +101,69 @@ func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 		t.Fatal("WebSocket request was not received")
 	}
 }
+func TestResponsesTransportDoPreservesAggregateFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		fixture      string
+		wantError    bool
+		wantCategory string
+		wantStatus   string
+		wantTerminal string
+	}{
+		{
+			name:         "completed",
+			fixture:      "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n",
+			wantStatus:   CodexResponseStatusCompleted,
+			wantTerminal: CodexEventResponseCompleted,
+		},
+		{
+			name:         "embedded error before completed",
+			fixture:      "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"visible\",\"error\":{\"code\":\"provider-code\",\"type\":\"provider_error\",\"message\":\"private provider message\"}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n",
+			wantError:    true,
+			wantCategory: "failed",
+			wantStatus:   CodexResponseStatusCompleted,
+			wantTerminal: CodexEventResponseCompleted,
+		},
+		{
+			name:         "response failed",
+			fixture:      "data: {\"type\":\"response.failed\",\"sequence_number\":1,\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"private response failure\"}}}\n\ndata: [DONE]\n\n",
+			wantError:    true,
+			wantCategory: "response_failed",
+			wantStatus:   CodexResponseStatusFailed,
+			wantTerminal: CodexEventResponseFailed,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(writer, test.fixture)
+			})
+			defer server.Close()
+
+			transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+			result, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+			if test.wantError {
+				var failure *CodexStreamFailureError
+				if err == nil || !errors.As(err, &failure) || !errors.Is(err, ErrCodexStreamFailed) {
+					t.Fatalf("transport.Do error = %v, want typed stream failure", err)
+				}
+				if failure.Category != test.wantCategory || failure.Status != test.wantStatus {
+					t.Fatalf("stream failure = %#v, want category %q and status %q", failure, test.wantCategory, test.wantStatus)
+				}
+				if strings.Contains(err.Error(), "provider-code") || strings.Contains(err.Error(), "private") {
+					t.Fatalf("private provider error reached transport error: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("transport.Do: %v", err)
+			}
+			if result.TerminalType != test.wantTerminal || result.Response == nil || result.Response.Status != test.wantStatus {
+				t.Fatalf("result = %#v, want terminal %q and status %q", result, test.wantTerminal, test.wantStatus)
+			}
+		})
+	}
+}
+
 func TestResponsesTransportStreamDeliversIncrementally(t *testing.T) {
 	firstEvent := []byte("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"delta\":\"first\"}\n\n")
 	terminalEvent := []byte("data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\"}}\n\ndata: [DONE]\n\n")
