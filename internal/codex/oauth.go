@@ -33,6 +33,7 @@ const (
 	oauthRequestTimeout      = 15 * time.Second
 	devicePollInterval       = 5 * time.Second
 	devicePollLifetime       = 15 * time.Minute
+	browserCallbackLifetime  = 5 * time.Minute
 	maxDeviceLifetimeSeconds = int64((1<<63 - 1) / int64(time.Second))
 )
 
@@ -96,6 +97,27 @@ type deviceCodeResponse struct {
 	UserCode     string         `json:"user_code"`
 	Interval     deviceInterval `json:"interval"`
 	ExpiresIn    int64          `json:"expires_in"`
+}
+
+func (response *deviceCodeResponse) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		DeviceAuthID string         `json:"device_auth_id"`
+		UserCode     string         `json:"user_code"`
+		UserCodeAlt  string         `json:"usercode"`
+		Interval     deviceInterval `json:"interval"`
+		ExpiresIn    int64          `json:"expires_in"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	response.DeviceAuthID = decoded.DeviceAuthID
+	response.UserCode = decoded.UserCode
+	if strings.TrimSpace(response.UserCode) == "" {
+		response.UserCode = decoded.UserCodeAlt
+	}
+	response.Interval = decoded.Interval
+	response.ExpiresIn = decoded.ExpiresIn
+	return nil
 }
 
 type deviceTokenResponse struct {
@@ -356,6 +378,8 @@ func browserLogin(ctx context.Context, options LoginOptions) (Credential, error)
 		return Credential{}, err
 	}
 
+	callbackContext, cancel := context.WithTimeout(ctx, browserCallbackLifetime)
+	defer cancel()
 	resultChannel := make(chan callbackResult, 1)
 	server := &http.Server{
 		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -371,7 +395,7 @@ func browserLogin(ctx context.Context, options LoginOptions) (Credential, error)
 			code, callbackErr := ValidateOAuthCallback(request.URL.RequestURI(), state)
 			if callbackErr != nil {
 				http.Error(writer, callbackErr.Error(), http.StatusBadRequest)
-				if callbackStateMatches(request.URL, state) {
+				if callbackStateMatches(request.URL, state) && callbackHasProviderError(request.URL) {
 					select {
 					case resultChannel <- callbackResult{err: callbackErr}:
 					default:
@@ -402,8 +426,8 @@ func browserLogin(ctx context.Context, options LoginOptions) (Credential, error)
 	var result callbackResult
 	select {
 	case result = <-resultChannel:
-	case <-ctx.Done():
-		result.err = ctx.Err()
+	case <-callbackContext.Done():
+		result.err = callbackContext.Err()
 	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), time.Second)
 	_ = server.Shutdown(shutdownContext)
@@ -554,6 +578,18 @@ func callbackStateMatches(parsed *url.URL, expectedState string) bool {
 	}
 	states := parsed.Query()["state"]
 	return len(states) == 1 && subtle.ConstantTimeCompare([]byte(states[0]), []byte(expectedState)) == 1
+}
+
+func callbackHasProviderError(parsed *url.URL) bool {
+	if parsed == nil {
+		return false
+	}
+	for _, value := range parsed.Query()["error"] {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func safeOAuthCode(value string) string {

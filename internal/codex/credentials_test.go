@@ -100,12 +100,27 @@ func TestCredentialAvailableRequiresUsableEncryptedCredential(t *testing.T) {
 	if CredentialAvailable(path, []byte("key")) {
 		t.Fatal("plain credential reported as available")
 	}
-	credential := Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour)}
+	credential := Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}
 	if err := SaveCredential(path, credential, []byte("key")); err != nil {
 		t.Fatal(err)
 	}
 	if !CredentialAvailable(path, []byte("key")) {
 		t.Fatal("usable encrypted credential reported as unavailable")
+	}
+	credential.ExpiresAt = time.Now().Add(-time.Second)
+	if err := SaveCredential(path, credential, []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if CredentialAvailable(path, []byte("key")) {
+		t.Fatal("expired credential reported as available")
+	}
+	credential.ExpiresAt = time.Now().Add(time.Hour)
+	credential.AccountID = ""
+	if err := SaveCredential(path, credential, []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if CredentialAvailable(path, []byte("key")) {
+		t.Fatal("credential without account identity reported as available")
 	}
 	if CredentialAvailable(path, []byte("wrong")) {
 		t.Fatal("credential with wrong key reported as available")
@@ -139,6 +154,36 @@ func TestImportCredentialReadsOMPDatabase(t *testing.T) {
 	}
 	if credential.AccessToken != "omp-access" || credential.RefreshToken != "omp-refresh" || credential.AccountID != "omp-account" || credential.WorkspaceID != "omp-workspace" || credential.PlanType != "pro" {
 		t.Fatalf("credential = %#v", credential)
+	}
+}
+
+func TestImportCredentialRejectsCodexHomeAuthDestination(t *testing.T) {
+	codexHome := t.TempDir()
+	destination := filepath.Join(codexHome, "auth.json")
+	_, err := ImportCredential(context.Background(), codexHome, destination, []byte("key"))
+	if err == nil {
+		t.Fatal("Codex home auth.json destination was accepted")
+	}
+	if _, statErr := os.Lstat(destination); !os.IsNotExist(statErr) {
+		t.Fatalf("destination exists after rejected import: %v", statErr)
+	}
+}
+
+func TestImportCredentialRejectsOMPSymlink(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "agent.db")
+	if err := os.WriteFile(target, []byte("not a database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "agent.db")
+	if err := os.Symlink(target, source); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ImportCredential(context.Background(), source, filepath.Join(t.TempDir(), "credential.enc"), []byte("key"))
+	if err == nil {
+		t.Fatal("OMP database symlink was accepted")
+	}
+	if !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("error = %v, want symbolic-link rejection", err)
 	}
 }
 
@@ -201,6 +246,32 @@ func TestImportedCredentialUsesAccessTokenExpiryBeforeIDToken(t *testing.T) {
 	}
 	if !credential.ExpiresAt.Equal(accessExpiry) {
 		t.Fatalf("credential expiry = %s, want %s", credential.ExpiresAt, accessExpiry)
+	}
+}
+
+func TestBuildCredentialMergesAccessAndIDTokenIdentity(t *testing.T) {
+	accessToken := testJWT(t, map[string]any{
+		"account_id":   "access-account",
+		"workspace_id": "access-workspace",
+	})
+	idToken := testJWT(t, map[string]any{
+		"user_id": "id-user",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "id-account",
+			"workspace_id":       "id-workspace",
+			"chatgpt_plan_type":  "pro",
+		},
+		"https://api.openai.com/profile": map[string]string{"email": "id@example.com"},
+	})
+	credential, err := buildCredential(accessToken, "refresh", idToken, time.Time{}, "", "", "", "", false, "", false)
+	if err != nil {
+		t.Fatalf("build credential: %v", err)
+	}
+	if credential.AccountID != "access-account" || credential.WorkspaceID != "access-workspace" {
+		t.Fatalf("access-token identity = %#v", credential)
+	}
+	if credential.UserID != "id-user" || credential.PlanType != "pro" || credential.Email != "id@example.com" {
+		t.Fatalf("fallback identity = %#v", credential)
 	}
 }
 

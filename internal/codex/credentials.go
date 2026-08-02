@@ -56,6 +56,7 @@ type codexAuthFile struct {
 	AccessToken  string          `json:"access_token"`
 	RefreshToken string          `json:"refresh_token"`
 	IDToken      string          `json:"id_token"`
+	ExpiresAt    int64           `json:"expires_at"`
 	AccountID    string          `json:"account_id"`
 	UserID       string          `json:"user_id"`
 	WorkspaceID  string          `json:"workspace_id"`
@@ -68,6 +69,7 @@ type codexTokenData struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"`
 	AccountID    string `json:"account_id"`
 }
 
@@ -245,6 +247,17 @@ func SaveCredential(path string, credential Credential, key []byte) error {
 		return fmt.Errorf("replace credential: %w", err)
 	}
 	removeTemporary = false
+	directoryFile, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open credential directory: %w", err)
+	}
+	if err := directoryFile.Sync(); err != nil {
+		_ = directoryFile.Close()
+		return fmt.Errorf("sync credential directory: %w", err)
+	}
+	if err := directoryFile.Close(); err != nil {
+		return fmt.Errorf("close credential directory: %w", err)
+	}
 	return nil
 }
 
@@ -260,7 +273,13 @@ func LoadCredential(path string, key []byte) (Credential, error) {
 // CredentialAvailable reports whether path contains a usable encrypted credential.
 func CredentialAvailable(path string, key []byte) bool {
 	credential, err := LoadCredential(path, key)
-	return err == nil && credential.AccessToken != "" && credential.RefreshToken != ""
+	if err != nil ||
+		strings.TrimSpace(credential.AccessToken) == "" ||
+		strings.TrimSpace(credential.RefreshToken) == "" ||
+		strings.TrimSpace(credential.AccountID) == "" {
+		return false
+	}
+	return !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(time.Now())
 }
 
 // ImportCredential reads a Codex auth.json, a Codex keyring home, or an OMP
@@ -279,6 +298,9 @@ func ImportCredential(ctx context.Context, sourcePath, destinationPath string, k
 	}
 	if destinationPath == "" {
 		return Credential{}, errors.New("credential destination path is empty")
+	}
+	if err := rejectCodexHomeAuthDestination(sourcePath, destinationPath); err != nil {
+		return Credential{}, err
 	}
 	credential, sourceFile, err := readImportedCredential(ctx, sourcePath)
 	if err != nil {
@@ -300,6 +322,61 @@ func ImportCredential(ctx context.Context, sourcePath, destinationPath string, k
 		return Credential{}, err
 	}
 	return credential, nil
+}
+
+func rejectCodexHomeAuthDestination(sourcePath, destinationPath string) error {
+	sourceInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect credential source: %w", err)
+	}
+	if !sourceInfo.IsDir() {
+		return nil
+	}
+	sourceHome, err := resolvePathForComparison(sourcePath)
+	if err != nil {
+		return fmt.Errorf("resolve credential source: %w", err)
+	}
+	destination, err := resolvePathForComparison(destinationPath)
+	if err != nil {
+		return fmt.Errorf("resolve credential destination: %w", err)
+	}
+	if filepath.Clean(destination) == filepath.Join(sourceHome, "auth.json") {
+		return errors.New("credential destination is Codex home auth.json")
+	}
+	return nil
+}
+
+func resolvePathForComparison(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absolute = filepath.Clean(absolute)
+	current := absolute
+	var suffix []string
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return absolute, nil
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }
 
 func readImportedCredential(ctx context.Context, sourcePath string) (Credential, os.FileInfo, error) {
@@ -364,6 +441,10 @@ func parseCredentialJSON(data []byte) (Credential, error) {
 	accessToken := auth.AccessToken
 	refreshToken := auth.RefreshToken
 	idToken := auth.IDToken
+	expiresAt := time.Time{}
+	if auth.ExpiresAt > 0 {
+		expiresAt = time.Unix(auth.ExpiresAt, 0)
+	}
 	accountID := auth.AccountID
 	userID := auth.UserID
 	workspaceID := auth.WorkspaceID
@@ -374,6 +455,9 @@ func parseCredentialJSON(data []byte) (Credential, error) {
 		accessToken = auth.Tokens.AccessToken
 		refreshToken = auth.Tokens.RefreshToken
 		idToken = auth.Tokens.IDToken
+		if auth.Tokens.ExpiresAt > 0 {
+			expiresAt = time.Unix(auth.Tokens.ExpiresAt, 0)
+		}
 		if accountID == "" {
 			accountID = auth.Tokens.AccountID
 		}
@@ -381,17 +465,27 @@ func parseCredentialJSON(data []byte) (Credential, error) {
 	if accessToken == "" || refreshToken == "" {
 		var omp ompCredentialData
 		if err := json.Unmarshal(data, &omp); err == nil && omp.AccessToken != "" && omp.Refresh != "" {
-			var expiresAt time.Time
+			ompExpiresAt := time.Time{}
 			if omp.Expires > 0 {
-				expiresAt = time.UnixMilli(omp.Expires)
+				ompExpiresAt = time.UnixMilli(omp.Expires)
 			}
-			return buildCredential(omp.AccessToken, omp.Refresh, idToken, expiresAt, omp.AccountID, userID, omp.Workspace, omp.PlanType, fedramp, omp.Email, false)
+			return buildCredential(omp.AccessToken, omp.Refresh, idToken, ompExpiresAt, omp.AccountID, userID, omp.Workspace, omp.PlanType, fedramp, omp.Email, false)
 		}
 	}
-	return buildCredential(accessToken, refreshToken, idToken, time.Time{}, accountID, userID, workspaceID, planType, fedramp, email, false)
+	return buildCredential(accessToken, refreshToken, idToken, expiresAt, accountID, userID, workspaceID, planType, fedramp, email, false)
 }
 
 func readOMPCredential(ctx context.Context, path string) (Credential, error) {
+	linkInfo, err := os.Lstat(path)
+	if err != nil {
+		return Credential{}, fmt.Errorf("inspect OMP credential database: %w", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink != 0 {
+		return Credential{}, errors.New("OMP credential database is a symbolic link")
+	}
+	if !linkInfo.Mode().IsRegular() {
+		return Credential{}, errors.New("OMP credential database is not a regular file")
+	}
 	absolutePath, err := filepath.Abs(path)
 	if err != nil {
 		return Credential{}, errors.New("resolve OMP credential database")
@@ -476,27 +570,50 @@ func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.T
 			credential.ExpiresAt = tokenExpiry
 		}
 	}
-	claims := jwtIdentity(idToken)
-	if claims == (identityClaims{}) {
-		claims = jwtIdentity(credential.AccessToken)
-	}
+	accessClaims := jwtIdentity(credential.AccessToken)
+	idClaims := jwtIdentity(idToken)
 	if credential.AccountID == "" {
-		credential.AccountID = firstNonEmpty(claims.AccountID, claims.AccountID2, claims.AuthAccountID())
+		credential.AccountID = firstNonEmpty(
+			accessClaims.AuthAccountID(),
+			accessClaims.AccountID,
+			accessClaims.AccountID2,
+			idClaims.AuthAccountID(),
+			idClaims.AccountID,
+			idClaims.AccountID2,
+		)
 	}
 	if credential.UserID == "" {
-		credential.UserID = firstNonEmpty(claims.UserID, claims.AuthUserID(), claims.Subject)
+		credential.UserID = firstNonEmpty(
+			accessClaims.UserID,
+			accessClaims.AuthUserID(),
+			accessClaims.Subject,
+			idClaims.UserID,
+			idClaims.AuthUserID(),
+			idClaims.Subject,
+		)
 	}
 	if credential.WorkspaceID == "" {
-		credential.WorkspaceID = firstNonEmpty(claims.WorkspaceID, claims.AuthWorkspaceID(), credential.AccountID)
+		credential.WorkspaceID = firstNonEmpty(
+			accessClaims.AuthWorkspaceID(),
+			accessClaims.WorkspaceID,
+			idClaims.AuthWorkspaceID(),
+			idClaims.WorkspaceID,
+			credential.AccountID,
+		)
 	}
 	if credential.PlanType == "" {
-		credential.PlanType = claims.AuthPlanType()
+		credential.PlanType = firstNonEmpty(accessClaims.AuthPlanType(), idClaims.AuthPlanType())
 	}
 	if !credential.AccountIsFedRAMP {
-		credential.AccountIsFedRAMP = claims.AuthFedRAMP()
+		credential.AccountIsFedRAMP = accessClaims.AuthFedRAMP() || idClaims.AuthFedRAMP()
 	}
 	if credential.Email == "" {
-		credential.Email = firstNonEmpty(claims.Email, claims.ProfileEmail())
+		credential.Email = firstNonEmpty(
+			accessClaims.Email,
+			accessClaims.ProfileEmail(),
+			idClaims.Email,
+			idClaims.ProfileEmail(),
+		)
 	}
 	if err := validateCredential(credential, requireIdentity); err != nil {
 		return Credential{}, err

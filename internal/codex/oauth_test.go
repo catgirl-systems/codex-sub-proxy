@@ -40,6 +40,7 @@ func TestDeviceIntervalDecodesStringAndNumber(t *testing.T) {
 		{name: "number", raw: `{"device_auth_id":"id","user_code":"code","interval":7}`, want: 7},
 		{name: "string", raw: `{"device_auth_id":"id","user_code":"code","interval":"7"}`, want: 7},
 		{name: "zero", raw: `{"device_auth_id":"id","user_code":"code","interval":"0"}`, want: 0},
+		{name: "usercode alias", raw: `{"device_auth_id":"id","usercode":"code","interval":7}`, want: 7},
 		{name: "absent", raw: `{"device_auth_id":"id","user_code":"code"}`, want: 0},
 	}
 	for _, test := range tests {
@@ -50,6 +51,9 @@ func TestDeviceIntervalDecodesStringAndNumber(t *testing.T) {
 			}
 			if response.Interval != test.want {
 				t.Fatalf("interval = %d, want %d", response.Interval, test.want)
+			}
+			if response.UserCode != "code" {
+				t.Fatalf("user code = %q, want code", response.UserCode)
 			}
 		})
 	}
@@ -283,5 +287,50 @@ func TestBrowserLoginStopsOnProviderErrorWithoutLeakingDescription(t *testing.T)
 	}
 	if callbackErr := <-callbackDone; callbackErr != nil {
 		t.Fatalf("callback request: %v", callbackErr)
+	}
+}
+
+func TestBrowserLoginIgnoresMalformedStateMatchedCallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	callbackDone := make(chan error, 1)
+	_, err := Login(ctx, LoginOptions{
+		Issuer:       "http://127.0.0.1:1",
+		CallbackPort: 0,
+		OnAuthorizationURL: func(authorizationURL string) {
+			parsed, parseErr := url.Parse(authorizationURL)
+			if parseErr != nil {
+				callbackDone <- parseErr
+				return
+			}
+			redirect := parsed.Query().Get("redirect_uri")
+			state := parsed.Query().Get("state")
+			response, requestErr := http.Get(redirect + "?state=" + url.QueryEscape(state))
+			if requestErr != nil {
+				callbackDone <- requestErr
+				return
+			}
+			response.Body.Close()
+			callbackDone <- nil
+			cancel()
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("malformed callback error = %v, want context cancellation", err)
+	}
+	if callbackErr := <-callbackDone; callbackErr != nil {
+		t.Fatalf("malformed callback request: %v", callbackErr)
+	}
+}
+
+func TestBrowserLoginHonorsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Login(ctx, LoginOptions{
+		Issuer:       "http://127.0.0.1:1",
+		CallbackPort: 0,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("browser login error = %v, want context cancellation", err)
 	}
 }
