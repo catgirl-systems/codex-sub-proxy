@@ -161,6 +161,63 @@ func TestPublicRequestUnionsRoundTripAndRejectInvalidForms(t *testing.T) {
 	}
 }
 
+func TestToolChoiceStrictDecoding(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		wantType  string
+		wantName  string
+		wantText  string
+		wantError string
+	}{
+		{
+			name:     "valid string",
+			raw:      `"auto"`,
+			wantText: "auto",
+		},
+		{
+			name:     "valid object",
+			raw:      `{"type":"function","name":"fixture_function"}`,
+			wantType: "function",
+			wantName: "fixture_function",
+		},
+		{
+			name:      "unknown member",
+			raw:       `{"type":"function","unknown":true}`,
+			wantError: `decode public tool choice object: json: unknown field "unknown"`,
+		},
+		{
+			name:      "trailing JSON",
+			raw:       `{"type":"function"}{"type":"other"}`,
+			wantError: "decode public tool choice object: multiple JSON values",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var choice ToolChoice
+			err := choice.UnmarshalJSON([]byte(test.raw))
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want %q", err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decode tool choice: %v", err)
+			}
+			if test.wantText != "" {
+				if choice.String == nil || *choice.String != test.wantText {
+					t.Fatalf("decoded string = %#v, want %q", choice.String, test.wantText)
+				}
+				return
+			}
+			if choice.String != nil || choice.Type != test.wantType || choice.Name != test.wantName {
+				t.Fatalf("decoded object = %#v", choice)
+			}
+		})
+	}
+}
+
 func TestPublicInputStrictDecodingRejectsUnknownNestedFields(t *testing.T) {
 	tests := []string{
 		`[{"typo":"message"}]`,

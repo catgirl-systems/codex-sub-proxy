@@ -228,6 +228,7 @@ func TestResponsesSupportedFieldsReachCodexAndUnknownFieldsReject(t *testing.T) 
 		`{"model":"gpt-5.6-sol","input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"fixture","filed_id":"typo"}}]}`,
 		`{"model":"gpt-5.6-sol","input":[{"type":"computer_call","pending_safety_checks":[{"id":"fixture","idd":"typo"}]}]}`,
 		`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","tools":[{"type":"function","nam":"fixture"}]}]}`,
+		`{"model":"gpt-5.6-sol","tool_choice":{"type":"function","unknown":true}}`,
 	} {
 		response = doResponsesRequest(t, servers.DataAddr(), rawKey, body, "application/json")
 		response.Body.Close()

@@ -360,7 +360,16 @@ func (choice *ToolChoice) UnmarshalJSON(data []byte) error {
 			Type string `json:"type"`
 			Name string `json:"name,omitempty"`
 		}
-		if err := json.Unmarshal(value, &object); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&object); err != nil {
+			return fmt.Errorf("decode public tool choice object: %w", err)
+		}
+		var extra json.RawMessage
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("decode public tool choice object: multiple JSON values")
+			}
 			return fmt.Errorf("decode public tool choice object: %w", err)
 		}
 		if object.Type == "" {
