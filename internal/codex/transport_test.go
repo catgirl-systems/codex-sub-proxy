@@ -534,8 +534,18 @@ func TestResponsesTransportMapsWrappedWebSocketErrors(t *testing.T) {
 	}
 }
 
-func TestDecodeCodexWebSocketMessageConvertsRateLimitHeaders(t *testing.T) {
-	frame := []byte(`{"type":"error","status":429,"headers":{"x-codex-primary-used-percent":"100.0","x-codex-primary-window-minutes":15,"x-codex-secondary-used-percent":"25.5","x-codex-secondary-window-minutes":30}}`)
+func TestDecodeCodexWebSocketMessageConvertsScalarHeaders(t *testing.T) {
+	frame := []byte(`{"type":"error","status":429,"headers":{
+		"x-codex-primary-used-percent":"100.0",
+		"x-codex-primary-window-minutes":15,
+		"retry-after":7,
+		"x-request-id":true,
+		"x-visible":"value",
+		"invalid name":"skip",
+		"x-array":[1],
+		"x-object":{"value":1},
+		"x-null":null
+	}}`)
 	_, response, err := decodeCodexWebSocketMessage(frame)
 	if err != nil {
 		t.Fatalf("decode error: %v", err)
@@ -544,16 +554,91 @@ func TestDecodeCodexWebSocketMessageConvertsRateLimitHeaders(t *testing.T) {
 		t.Fatalf("response = %#v, want status 429", response)
 	}
 	for name, want := range map[string]string{
-		"X-Codex-Primary-Used-Percent":     "100.0",
-		"X-Codex-Primary-Window-Minutes":   "15",
-		"X-Codex-Secondary-Used-Percent":   "25.5",
-		"X-Codex-Secondary-Window-Minutes": "30",
+		"X-Codex-Primary-Used-Percent":   "100.0",
+		"X-Codex-Primary-Window-Minutes": "15",
+		"Retry-After":                    "7",
+		"X-Request-Id":                   "true",
+		"X-Visible":                      "value",
 	} {
 		if got := response.Header.Get(name); got != want {
 			t.Errorf("header %q = %q, want %q", name, got, want)
 		}
 	}
+	for _, name := range []string{"invalid name", "X-Array", "X-Object", "X-Null"} {
+		if got := response.Header.Get(name); got != "" {
+			t.Errorf("header %q = %q, want skipped", name, got)
+		}
+	}
+	mapped := MapUpstreamError(response.StatusCode, response.Header, frame)
+	if mapped.RetryAfter != 7*time.Second || mapped.RequestID != "true" {
+		t.Fatalf("mapped error = %#v, want retry-after 7s and bool request id", mapped)
+	}
 	closeHTTPResponse(response)
+}
+
+func TestDecodeCodexWebSocketMessagePreservesRetryMetadataScalars(t *testing.T) {
+	tests := []struct {
+		name       string
+		retryAfter string
+		requestID  string
+		wantRetry  time.Duration
+		wantID     string
+	}{
+		{name: "numeric retry and string request", retryAfter: "17", requestID: `"request-string"`, wantRetry: 17 * time.Second, wantID: "request-string"},
+		{name: "string retry and numeric request", retryAfter: `"18"`, requestID: "123", wantRetry: 18 * time.Second, wantID: "123"},
+		{name: "boolean retry and boolean request", retryAfter: "true", requestID: "false", wantID: "false"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := []byte(`{"type":"error","status":429,"headers":{"retry-after":` + test.retryAfter + `,"x-request-id":` + test.requestID + `}}`)
+			_, response, err := decodeCodexWebSocketMessage(frame)
+			if err != nil {
+				t.Fatalf("decode error: %v", err)
+			}
+			mapped := MapUpstreamError(response.StatusCode, response.Header, frame)
+			if mapped.RetryAfter != test.wantRetry || mapped.RequestID != test.wantID {
+				t.Fatalf("mapped error = %#v, want retry-after %s and request id %q", mapped, test.wantRetry, test.wantID)
+			}
+			closeHTTPResponse(response)
+		})
+	}
+}
+
+func TestDecodeCodexWebSocketMessagePreservesNonHTTPErrorEvents(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame string
+	}{
+		{name: "statusless", frame: `{"type":"error","message":"stream failed"}`},
+		{name: "success status", frame: `{"type":"error","status":200,"message":"stream failed"}`},
+		{name: "invalid status", frame: `{"type":"error","status_code":"unknown","message":"stream failed"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event, response, err := decodeCodexWebSocketMessage([]byte(test.frame))
+			if err != nil {
+				t.Fatalf("decode error: %v", err)
+			}
+			if response != nil {
+				t.Fatalf("response = %#v, want no synthetic response", response)
+			}
+			if event.Type != CodexEventError {
+				t.Fatalf("event type = %q, want %q", event.Type, CodexEventError)
+			}
+			_, err = ParseCodexWebSocketFrames([][]byte{[]byte(test.frame)})
+			if !errors.Is(err, ErrCodexStreamFailed) {
+				t.Fatalf("stream error = %v, want failed stream", err)
+			}
+		})
+	}
+}
+
+func TestDecodeCodexWebSocketMessageRejectsConflictingStatuses(t *testing.T) {
+	frame := []byte(`{"type":"error","status":401,"status_code":403}`)
+	_, _, err := decodeCodexWebSocketMessage(frame)
+	if !errors.Is(err, ErrCodexStreamMalformed) {
+		t.Fatalf("error = %v, want malformed conflicting statuses", err)
+	}
 }
 
 func TestResponsesTransportWrapped401RefreshesOnce(t *testing.T) {
@@ -586,7 +671,7 @@ func TestResponsesTransportWrapped401RefreshesOnce(t *testing.T) {
 			return
 		}
 		if websocketRequests.Add(1) == 1 {
-			_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"error","status":401,"error":{"code":"token_expired","message":"private auth detail"}}`))
+			_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"error","status_code":401,"error":{"code":"token_expired","message":"private auth detail"}}`))
 			return
 		}
 		if request.Header.Get(AuthorizationHeader) != "Bearer new-access" {
@@ -725,6 +810,105 @@ func TestResponsesTransportHTTPClientTimeoutBoundsWebSocketAttempt(t *testing.T)
 	}
 	if sseRequests.Load() != 0 {
 		t.Fatalf("SSE requests = %d, want 0 after client timeout", sseRequests.Load())
+	}
+}
+func TestCodexSSEContextUsesSmallerTimeout(t *testing.T) {
+	ctx := context.Background()
+	requestContext, cancel := codexSSEContext(ctx, codexHTTPTimeout*2)
+	defer cancel()
+	deadline, ok := requestContext.Deadline()
+	if !ok {
+		t.Fatal("SSE context has no deadline")
+	}
+	if remaining := time.Until(deadline); remaining > codexHTTPTimeout || remaining <= 0 {
+		t.Fatalf("SSE deadline remaining = %s, want at most %s", remaining, codexHTTPTimeout)
+	}
+
+	requestContext, cancel = codexSSEContext(ctx, 10*time.Millisecond)
+	defer cancel()
+	deadline, ok = requestContext.Deadline()
+	if !ok {
+		t.Fatal("client-limited SSE context has no deadline")
+	}
+	if remaining := time.Until(deadline); remaining > 10*time.Millisecond || remaining <= 0 {
+		t.Fatalf("client-limited deadline remaining = %s, want at most 10ms", remaining)
+	}
+}
+
+func TestResponsesTransportSSEHTTPClientTimeoutReturnsDeadline(t *testing.T) {
+	headersSent := make(chan struct{})
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		if flusher, ok := writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(headersSent)
+		<-request.Context().Done()
+	})
+	defer server.Close()
+	client := &http.Client{
+		Transport: server.Client().Transport,
+		Timeout:   80 * time.Millisecond,
+	}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportSSE, client)
+	errChannel := make(chan error, 1)
+	go func() {
+		_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+		errChannel <- err
+	}()
+	select {
+	case <-headersSent:
+	case <-time.After(time.Second):
+		t.Fatal("SSE response headers were not sent")
+	}
+	select {
+	case err := <-errChannel:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("SSE timeout error = %v, want deadline exceeded", err)
+		}
+		if strings.Contains(err.Error(), server.URL) {
+			t.Fatalf("SSE timeout error exposes URL: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE timeout did not return")
+	}
+}
+
+func TestResponsesTransportSSECallerCancellationCause(t *testing.T) {
+	headersSent := make(chan struct{})
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		if flusher, ok := writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(headersSent)
+		<-request.Context().Done()
+	})
+	defer server.Close()
+	transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	errChannel := make(chan error, 1)
+	go func() {
+		_, err := transport.Do(ctx, CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+		errChannel <- err
+	}()
+	select {
+	case <-headersSent:
+	case <-time.After(time.Second):
+		t.Fatal("SSE response headers were not sent")
+	}
+	cause := errors.New("caller cancellation cause")
+	cancel(cause)
+	select {
+	case err := <-errChannel:
+		if !errors.Is(err, cause) {
+			t.Fatalf("SSE cancellation error = %v, want cause", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE cancellation did not return")
 	}
 }
 

@@ -488,7 +488,7 @@ func TestCodexErrorFixtureDecodesRateLimitData(t *testing.T) {
 	if response.Status != 429 || response.Error == nil || response.Error.Code != "usage_limit_reached" {
 		t.Fatalf("error response = %#v", response)
 	}
-	if response.Headers == nil || response.Headers.PrimaryUsedPercent != json.Number("100") {
+	if response.Headers == nil || string(response.Headers["x-codex-primary-used-percent"]) != "100" {
 		t.Fatalf("rate headers = %#v", response.Headers)
 	}
 	mapped := MapUpstreamError(response.Status, nil, raw)
@@ -497,18 +497,18 @@ func TestCodexErrorFixtureDecodesRateLimitData(t *testing.T) {
 	}
 }
 
-func TestCodexRateLimitHeadersDecodeAndRoundTrip(t *testing.T) {
+func TestCodexErrorHeadersDecodeAndRoundTrip(t *testing.T) {
 	tests := []struct {
 		name string
 		raw  string
-		want CodexRateLimitHeads
+		want map[string]string
 	}{
 		{
 			name: "wrapped WebSocket fixture",
 			raw:  wrappedWebSocketUsageLimitFixture,
-			want: CodexRateLimitHeads{
-				PrimaryUsedPercent:   json.Number("100.0"),
-				PrimaryWindowMinutes: json.Number("15"),
+			want: map[string]string{
+				"x-codex-primary-used-percent":   `"100.0"`,
+				"x-codex-primary-window-minutes": "15",
 			},
 		},
 		{
@@ -521,32 +521,34 @@ func TestCodexRateLimitHeadersDecodeAndRoundTrip(t *testing.T) {
 				"x-codex-secondary-window-minutes":"30",
 				"x-codex-secondary-reset-at":"1738889999"
 			}}`,
-			want: CodexRateLimitHeads{
-				PrimaryUsedPercent:     json.Number("100.0"),
-				PrimaryWindowMinutes:   json.Number("15"),
-				PrimaryResetAt:         json.Number("1738888888"),
-				SecondaryUsedPercent:   json.Number("25.5"),
-				SecondaryWindowMinutes: json.Number("30"),
-				SecondaryResetAt:       json.Number("1738889999"),
+			want: map[string]string{
+				"x-codex-primary-used-percent":     `"100.0"`,
+				"x-codex-primary-window-minutes":   `"15"`,
+				"x-codex-primary-reset-at":         `"1738888888"`,
+				"x-codex-secondary-used-percent":   `"25.5"`,
+				"x-codex-secondary-window-minutes": `"30"`,
+				"x-codex-secondary-reset-at":       `"1738889999"`,
 			},
 		},
 		{
-			name: "numeric scalars",
+			name: "numeric and boolean scalars",
 			raw: `{"headers":{
 				"x-codex-primary-used-percent":100.0,
 				"x-codex-primary-window-minutes":15,
 				"x-codex-primary-reset-at":1738888888,
 				"x-codex-secondary-used-percent":25.5,
 				"x-codex-secondary-window-minutes":30,
-				"x-codex-secondary-reset-at":1738889999
+				"x-codex-secondary-reset-at":1738889999,
+				"x-codex-bool":true
 			}}`,
-			want: CodexRateLimitHeads{
-				PrimaryUsedPercent:     json.Number("100.0"),
-				PrimaryWindowMinutes:   json.Number("15"),
-				PrimaryResetAt:         json.Number("1738888888"),
-				SecondaryUsedPercent:   json.Number("25.5"),
-				SecondaryWindowMinutes: json.Number("30"),
-				SecondaryResetAt:       json.Number("1738889999"),
+			want: map[string]string{
+				"x-codex-primary-used-percent":     "100.0",
+				"x-codex-primary-window-minutes":   "15",
+				"x-codex-primary-reset-at":         "1738888888",
+				"x-codex-secondary-used-percent":   "25.5",
+				"x-codex-secondary-window-minutes": "30",
+				"x-codex-secondary-reset-at":       "1738889999",
+				"x-codex-bool":                     "true",
 			},
 		},
 	}
@@ -554,22 +556,63 @@ func TestCodexRateLimitHeadersDecodeAndRoundTrip(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var envelope CodexErrorEnvelope
 			if err := json.Unmarshal([]byte(test.raw), &envelope); err != nil {
-				t.Fatalf("decode rate-limit headers: %v", err)
+				t.Fatalf("decode headers: %v", err)
 			}
-			if envelope.Headers == nil || *envelope.Headers != test.want {
-				t.Fatalf("decoded rate-limit headers = %#v, want %#v", envelope.Headers, test.want)
+			if len(envelope.Headers) != len(test.want) {
+				t.Fatalf("decoded headers = %#v, want %#v", envelope.Headers, test.want)
+			}
+			for name, want := range test.want {
+				if got := string(envelope.Headers[name]); got != want {
+					t.Errorf("header %q = %q, want raw %q", name, got, want)
+				}
 			}
 
 			encoded, err := json.Marshal(envelope)
 			if err != nil {
-				t.Fatalf("encode rate-limit headers: %v", err)
+				t.Fatalf("encode headers: %v", err)
 			}
 			var roundTrip CodexErrorEnvelope
 			if err := json.Unmarshal(encoded, &roundTrip); err != nil {
-				t.Fatalf("decode round-trip rate-limit headers: %v", err)
+				t.Fatalf("decode round-trip headers: %v", err)
 			}
-			if roundTrip.Headers == nil || *roundTrip.Headers != test.want {
-				t.Fatalf("round-trip rate-limit headers = %#v, want %#v", roundTrip.Headers, test.want)
+			if len(roundTrip.Headers) != len(test.want) {
+				t.Fatalf("round-trip headers = %#v, want %#v", roundTrip.Headers, test.want)
+			}
+			for name, want := range test.want {
+				if got := string(roundTrip.Headers[name]); got != want {
+					t.Errorf("round-trip header %q = %q, want raw %q", name, got, want)
+				}
+			}
+		})
+	}
+}
+func TestCodexErrorEnvelopeCanonicalStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantStatus int
+		present    bool
+		wantErr    bool
+	}{
+		{name: "status", raw: `{"status":401}`, wantStatus: 401, present: true},
+		{name: "status code alias", raw: `{"status_code":401}`, wantStatus: 401, present: true},
+		{name: "matching aliases", raw: `{"status":401,"status_code":401}`, wantStatus: 401, present: true},
+		{name: "statusless", raw: `{}`, wantStatus: 0},
+		{name: "invalid alias", raw: `{"status_code":"unknown"}`, wantStatus: 0},
+		{name: "conflicting aliases", raw: `{"status":401,"status_code":403}`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var envelope CodexErrorEnvelope
+			if err := json.Unmarshal([]byte(test.raw), &envelope); err != nil {
+				t.Fatalf("decode envelope: %v", err)
+			}
+			status, present, err := envelope.canonicalStatus()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("canonical status error = %v, want error = %t", err, test.wantErr)
+			}
+			if err == nil && (status != test.wantStatus || present != test.present) {
+				t.Fatalf("canonical status = %d, present = %t, want %d, %t", status, present, test.wantStatus, test.present)
 			}
 		})
 	}

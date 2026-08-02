@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	coderwebsocket "github.com/coder/websocket"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	coderwebsocket "github.com/coder/websocket"
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -154,6 +157,9 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 	if err != nil {
 		if response != nil {
 			closeHTTPResponse(response)
+		}
+		if contextErr := contextError(ctx); contextErr != nil {
+			return CodexStreamResult{}, contextErr
 		}
 		return CodexStreamResult{}, err
 	}
@@ -334,7 +340,18 @@ func decodeCodexWebSocketMessage(frame []byte) (CodexResponseStreamEvent, *http.
 		if err := json.Unmarshal(frame, &envelope); err != nil {
 			return CodexResponseStreamEvent{}, nil, fmt.Errorf("%w: decode WebSocket error: %v", ErrCodexStreamMalformed, err)
 		}
-		return CodexResponseStreamEvent{}, codexErrorResponse(frame, envelope), nil
+		status, present, err := envelope.canonicalStatus()
+		if err != nil {
+			return CodexResponseStreamEvent{}, nil, err
+		}
+		event, err := decodeCodexErrorEvent(frame)
+		if err != nil {
+			return CodexResponseStreamEvent{}, nil, err
+		}
+		if present && status >= 300 && status <= 599 {
+			return CodexResponseStreamEvent{}, codexErrorResponse(frame, envelope, status), nil
+		}
+		return event, nil, nil
 	}
 	event, err := DecodeCodexWebSocketFrame(frame)
 	if err != nil {
@@ -343,26 +360,78 @@ func decodeCodexWebSocketMessage(frame []byte) (CodexResponseStreamEvent, *http.
 	return event, nil, nil
 }
 
-func codexErrorResponse(frame []byte, envelope CodexErrorEnvelope) *http.Response {
-	headers := make(http.Header)
-	if envelope.Headers != nil {
-		setCodexRateLimitHeader(headers, "X-Codex-Primary-Used-Percent", envelope.Headers.PrimaryUsedPercent)
-		setCodexRateLimitHeader(headers, "X-Codex-Primary-Window-Minutes", envelope.Headers.PrimaryWindowMinutes)
-		setCodexRateLimitHeader(headers, "X-Codex-Primary-Reset-At", envelope.Headers.PrimaryResetAt)
-		setCodexRateLimitHeader(headers, "X-Codex-Secondary-Used-Percent", envelope.Headers.SecondaryUsedPercent)
-		setCodexRateLimitHeader(headers, "X-Codex-Secondary-Window-Minutes", envelope.Headers.SecondaryWindowMinutes)
-		setCodexRateLimitHeader(headers, "X-Codex-Secondary-Reset-At", envelope.Headers.SecondaryResetAt)
+func decodeCodexErrorEvent(frame []byte) (CodexResponseStreamEvent, error) {
+	var wire struct {
+		Type           string                     `json:"type"`
+		SequenceNumber int                        `json:"sequence_number"`
+		Error          *CodexError                `json:"error,omitempty"`
+		Code           string                     `json:"code,omitempty"`
+		Message        string                     `json:"message,omitempty"`
+		Headers        map[string]json.RawMessage `json:"headers,omitempty"`
 	}
+	if err := json.Unmarshal(frame, &wire); err != nil {
+		return CodexResponseStreamEvent{}, fmt.Errorf("%w: decode WebSocket error event: %v", ErrCodexStreamMalformed, err)
+	}
+	event := CodexResponseStreamEvent{
+		Type:           wire.Type,
+		SequenceNumber: wire.SequenceNumber,
+		Error:          wire.Error,
+		Code:           wire.Code,
+		Message:        wire.Message,
+	}
+	if len(wire.Headers) != 0 {
+		event.Headers = make(map[string]string, len(wire.Headers))
+		for name, rawValue := range wire.Headers {
+			if value, ok := codexScalarJSONValue(rawValue); ok {
+				event.Headers[name] = value
+			}
+		}
+	}
+	return event, nil
+}
+
+func codexErrorResponse(frame []byte, envelope CodexErrorEnvelope, status int) *http.Response {
+	headers := codexErrorHeaders(envelope.Headers)
 	return &http.Response{
-		StatusCode: envelope.Status,
+		StatusCode: status,
 		Header:     headers,
 		Body:       io.NopCloser(bytes.NewReader(frame)),
 	}
 }
 
-func setCodexRateLimitHeader(headers http.Header, name string, value json.Number) {
-	if valueString := strings.TrimSpace(value.String()); valueString != "" {
-		headers.Set(name, valueString)
+func codexErrorHeaders(rawHeaders map[string]json.RawMessage) http.Header {
+	headers := make(http.Header)
+	for name, rawValue := range rawHeaders {
+		if !httpguts.ValidHeaderFieldName(name) {
+			continue
+		}
+		if value, ok := codexScalarJSONValue(rawValue); ok {
+			headers.Add(name, value)
+		}
+	}
+	return headers
+}
+
+func codexScalarJSONValue(rawValue json.RawMessage) (string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(rawValue))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "", false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return "", false
+	}
+	switch value := value.(type) {
+	case string:
+		return value, true
+	case json.Number:
+		return value.String(), true
+	case bool:
+		return strconv.FormatBool(value), true
+	default:
+		return "", false
 	}
 }
 
@@ -460,7 +529,7 @@ func webSocketDialFailure(client *http.Client, err error) (error, bool) {
 }
 
 func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, headers HeaderConfig) (CodexStreamResult, *http.Response, error) {
-	requestContext, cancel := context.WithTimeout(ctx, codexHTTPTimeout)
+	requestContext, cancel := codexSSEContext(ctx, transport.httpClient.Timeout)
 	defer cancel()
 	request, err := NewRequest(requestContext, http.MethodPost, transport.responsesURL, bytes.NewReader(body), headers)
 	if err != nil {
@@ -470,10 +539,7 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 	request.Header.Set("Content-Type", "application/json")
 	response, err := transport.httpClient.Do(request)
 	if err != nil {
-		if contextErr := contextError(ctx); contextErr != nil {
-			return CodexStreamResult{}, nil, contextErr
-		}
-		return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE request failed", ErrCodexTransport)
+		return CodexStreamResult{}, nil, codexSSERequestError(ctx, requestContext, err)
 	}
 	if response == nil {
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE response is nil", ErrCodexTransport)
@@ -482,16 +548,42 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 		return CodexStreamResult{}, response, nil
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, _ := readHTTPErrorBody(response.Body)
+		var errorBody []byte
+		var readErr error
+		if response.Body != nil {
+			errorReader := &codexContextReader{ctx: requestContext, reader: response.Body}
+			errorBody, readErr = readHTTPErrorBody(errorReader)
+		}
 		closeHTTPResponse(response)
-		return CodexStreamResult{}, nil, MapUpstreamError(response.StatusCode, response.Header, body)
+		if contextErr := contextError(ctx); contextErr != nil {
+			return CodexStreamResult{}, nil, contextErr
+		}
+		if contextErr := contextError(requestContext); contextErr != nil {
+			return CodexStreamResult{}, nil, contextErr
+		}
+		if readErr != nil && codexSSETimeoutError(readErr) {
+			return CodexStreamResult{}, nil, context.DeadlineExceeded
+		}
+		return CodexStreamResult{}, nil, MapUpstreamError(response.StatusCode, response.Header, errorBody)
 	}
 	defer closeHTTPResponse(response)
-	bounded := &codexAggregateReader{reader: response.Body, remaining: maxCodexStreamPayloadBytes + 1}
+	bounded := &codexAggregateReader{
+		reader:    &codexContextReader{ctx: requestContext, reader: response.Body},
+		remaining: maxCodexStreamPayloadBytes + 1,
+	}
 	result, err := ParseCodexResponsesSSE(bounded)
 	if err != nil {
 		if errors.Is(err, errCodexAggregateLimit) {
 			return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE aggregate limit exceeded", ErrCodexStreamMalformed)
+		}
+		if contextErr := contextError(ctx); contextErr != nil {
+			return CodexStreamResult{}, nil, contextErr
+		}
+		if contextErr := contextError(requestContext); contextErr != nil {
+			return CodexStreamResult{}, nil, contextErr
+		}
+		if codexSSETimeoutError(err) {
+			return CodexStreamResult{}, nil, context.DeadlineExceeded
 		}
 		return CodexStreamResult{}, nil, err
 	}
@@ -499,6 +591,54 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE aggregate limit exceeded", ErrCodexStreamMalformed)
 	}
 	return result, nil, nil
+}
+
+func codexSSEContext(ctx context.Context, clientTimeout time.Duration) (context.Context, context.CancelFunc) {
+	timeout := codexHTTPTimeout
+	if clientTimeout > 0 && clientTimeout < timeout {
+		timeout = clientTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func codexSSERequestError(callerContext, requestContext context.Context, err error) error {
+	if contextErr := contextError(callerContext); contextErr != nil {
+		return contextErr
+	}
+	if contextErr := contextError(requestContext); contextErr != nil {
+		return contextErr
+	}
+	if codexSSETimeoutError(err) {
+		return context.DeadlineExceeded
+	}
+	return fmt.Errorf("%w: SSE request failed", ErrCodexTransport)
+}
+
+func codexSSETimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+type codexContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (reader *codexContextReader) Read(target []byte) (int, error) {
+	if contextErr := contextError(reader.ctx); contextErr != nil {
+		return 0, contextErr
+	}
+	if reader.reader == nil {
+		return 0, io.EOF
+	}
+	count, err := reader.reader.Read(target)
+	if contextErr := contextError(reader.ctx); contextErr != nil && err != nil {
+		return count, contextErr
+	}
+	return count, err
 }
 
 type codexAggregateReader struct {

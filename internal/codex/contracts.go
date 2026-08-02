@@ -408,24 +408,75 @@ type CodexError struct {
 
 // CodexErrorEnvelope is a private HTTP or WebSocket error response.
 type CodexErrorEnvelope struct {
-	Type       string               `json:"type,omitempty"`
-	Status     int                  `json:"status,omitempty"`
-	Code       string               `json:"code,omitempty"`
-	Message    string               `json:"message,omitempty"`
-	RetryAfter float64              `json:"retry_after,omitempty"`
-	ResetsAt   int64                `json:"resets_at,omitempty"`
-	Error      *CodexError          `json:"error,omitempty"`
-	Headers    *CodexRateLimitHeads `json:"headers,omitempty"`
+	Type       string                     `json:"type,omitempty"`
+	Status     int                        `json:"status,omitempty"`
+	StatusCode int                        `json:"status_code,omitempty"`
+	Code       string                     `json:"code,omitempty"`
+	Message    string                     `json:"message,omitempty"`
+	RetryAfter float64                    `json:"retry_after,omitempty"`
+	ResetsAt   int64                      `json:"resets_at,omitempty"`
+	Error      *CodexError                `json:"error,omitempty"`
+	Headers    map[string]json.RawMessage `json:"headers,omitempty"`
 }
 
-// CodexRateLimitHeads contains the rate data in a wrapped WebSocket error.
-type CodexRateLimitHeads struct {
-	PrimaryUsedPercent     json.Number `json:"x-codex-primary-used-percent,omitempty"`
-	PrimaryWindowMinutes   json.Number `json:"x-codex-primary-window-minutes,omitempty"`
-	PrimaryResetAt         json.Number `json:"x-codex-primary-reset-at,omitempty"`
-	SecondaryUsedPercent   json.Number `json:"x-codex-secondary-used-percent,omitempty"`
-	SecondaryWindowMinutes json.Number `json:"x-codex-secondary-window-minutes,omitempty"`
-	SecondaryResetAt       json.Number `json:"x-codex-secondary-reset-at,omitempty"`
+func (envelope *CodexErrorEnvelope) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Type       string                     `json:"type,omitempty"`
+		Status     json.RawMessage            `json:"status,omitempty"`
+		StatusCode json.RawMessage            `json:"status_code,omitempty"`
+		Code       string                     `json:"code,omitempty"`
+		Message    string                     `json:"message,omitempty"`
+		RetryAfter float64                    `json:"retry_after,omitempty"`
+		ResetsAt   int64                      `json:"resets_at,omitempty"`
+		Error      *CodexError                `json:"error,omitempty"`
+		Headers    map[string]json.RawMessage `json:"headers,omitempty"`
+	}
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	status := codexEnvelopeStatus(decoded.Status)
+	statusCode := codexEnvelopeStatus(decoded.StatusCode)
+	*envelope = CodexErrorEnvelope{
+		Type:       decoded.Type,
+		Status:     status,
+		StatusCode: statusCode,
+		Code:       decoded.Code,
+		Message:    decoded.Message,
+		RetryAfter: decoded.RetryAfter,
+		ResetsAt:   decoded.ResetsAt,
+		Error:      decoded.Error,
+		Headers:    decoded.Headers,
+	}
+	return nil
+}
+
+func codexEnvelopeStatus(raw json.RawMessage) (value int) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return 0
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0
+	}
+	return value
+}
+
+// canonicalStatus accepts either wire alias when the other is absent. A
+// conflicting pair is malformed rather than silently choosing one.
+func (envelope CodexErrorEnvelope) canonicalStatus() (int, bool, error) {
+	statusSet := envelope.Status != 0
+	statusCodeSet := envelope.StatusCode != 0
+	if statusSet && statusCodeSet && envelope.Status != envelope.StatusCode {
+		return 0, false, fmt.Errorf("%w: error frame has conflicting status fields", ErrCodexStreamMalformed)
+	}
+	if statusSet {
+		return envelope.Status, true, nil
+	}
+	if statusCodeSet {
+		return envelope.StatusCode, true, nil
+	}
+	return 0, false, nil
 }
 
 // CodexImageRequest is a private direct Images request.
@@ -612,12 +663,21 @@ func DecodeCodexWebSocketFrame(frame []byte) (CodexResponseStreamEvent, error) {
 	if len(frame) == 0 || len(frame) > maxCodexStreamLineBytes {
 		return CodexResponseStreamEvent{}, fmt.Errorf("%w: WebSocket frame size is invalid", ErrCodexStreamMalformed)
 	}
+	var header struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(frame, &header); err != nil {
+		return CodexResponseStreamEvent{}, fmt.Errorf("%w: decode WebSocket frame: %v", ErrCodexStreamMalformed, err)
+	}
+	if strings.TrimSpace(header.Type) == "" {
+		return CodexResponseStreamEvent{}, fmt.Errorf("%w: event type is empty", ErrCodexStreamMalformed)
+	}
+	if header.Type == CodexEventError {
+		return decodeCodexErrorEvent(frame)
+	}
 	var event CodexResponseStreamEvent
 	if err := json.Unmarshal(frame, &event); err != nil {
 		return CodexResponseStreamEvent{}, fmt.Errorf("%w: decode WebSocket frame: %v", ErrCodexStreamMalformed, err)
-	}
-	if strings.TrimSpace(event.Type) == "" {
-		return CodexResponseStreamEvent{}, fmt.Errorf("%w: event type is empty", ErrCodexStreamMalformed)
 	}
 	return event, nil
 }
