@@ -3,6 +3,5 @@
   "prompt": "fixture generated icon",
   "n": 1,
   "size": "1024x1024",
-  "quality": "standard",
-  "response_format": "b64_json"
+  "quality": "auto"
 }

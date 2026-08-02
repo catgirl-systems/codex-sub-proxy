@@ -11,10 +11,14 @@
     "output_tokens": 2,
     "total_tokens": 11,
     "input_tokens_details": {
-      "cached_tokens": 0
+      "cached_tokens": 0,
+      "image_tokens": 3,
+      "text_tokens": 6
     },
     "output_tokens_details": {
-      "reasoning_tokens": 0
+      "reasoning_tokens": 0,
+      "image_tokens": 1,
+      "text_tokens": 1
     }
   }
 }

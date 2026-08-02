@@ -46,7 +46,7 @@ type ImagesClient struct {
 
 // CodexImageResult is the decoded result of one private Images request.
 type CodexImageResult struct {
-	Created int64
+	Created uint64
 	Images  []CodexImage
 	Usage   *CodexUsage
 }
@@ -94,43 +94,50 @@ func NewImagesClient(options ImagesClientOptions) (*ImagesClient, error) {
 }
 
 // Generate creates images from a text prompt.
-func (client *ImagesClient) Generate(ctx context.Context, request CodexImageRequest) (CodexImageResult, error) {
-	return client.do(ctx, false, request)
-}
-
-// Edit creates images from one or more source images.
-func (client *ImagesClient) Edit(ctx context.Context, request CodexImageRequest) (CodexImageResult, error) {
-	return client.do(ctx, true, request)
-}
-
-func (client *ImagesClient) do(ctx context.Context, edit bool, request CodexImageRequest) (CodexImageResult, error) {
-	if ctx == nil {
-		return CodexImageResult{}, errors.New("Codex Images context is nil")
-	}
-	if client == nil {
-		return CodexImageResult{}, errors.New("Codex Images client is nil")
-	}
-	if err := validateImageTurnID(client.headers.ImageTurnID); err != nil {
+func (client *ImagesClient) Generate(ctx context.Context, request CodexImageGenerationRequest) (CodexImageResult, error) {
+	if err := validateImagesCall(ctx, client); err != nil {
 		return CodexImageResult{}, err
 	}
-	if request.ResponseFormat == "" {
-		request.ResponseFormat = "b64_json"
-	}
-	if err := validateCodexImageRequest(request, edit); err != nil {
+	if err := validateCodexImageGenerationRequest(request); err != nil {
 		return CodexImageResult{}, err
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
-		return CodexImageResult{}, fmt.Errorf("encode Codex Images request: %w", err)
+		return CodexImageResult{}, fmt.Errorf("encode Codex Images generation request: %w", err)
 	}
 	if len(body) == 0 || len(body) > maxCodexImageRequestBytes {
 		return CodexImageResult{}, errors.New("Codex Images request is too large")
 	}
+	return client.do(ctx, false, body, request.N)
+}
+
+// Edit creates images from one or more source images.
+func (client *ImagesClient) Edit(ctx context.Context, request CodexImageEditRequest) (CodexImageResult, error) {
+	if err := validateImagesCall(ctx, client); err != nil {
+		return CodexImageResult{}, err
+	}
+	if err := validateCodexImageEditRequest(request); err != nil {
+		return CodexImageResult{}, err
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return CodexImageResult{}, fmt.Errorf("encode Codex Images edit request: %w", err)
+	}
+	if len(body) == 0 || len(body) > maxCodexImageRequestBytes {
+		return CodexImageResult{}, errors.New("Codex Images request is too large")
+	}
+	return client.do(ctx, true, body, request.N)
+}
+
+func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n int) (CodexImageResult, error) {
+	operationContext, cancel := codexSSEContext(ctx, client.httpClient.Timeout)
+	defer cancel()
+
 	endpoint := client.generationsURL
 	if edit {
 		endpoint = client.editsURL
 	}
-	response, err := client.refresher.Do(ctx, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
+	response, err := client.refresher.Do(operationContext, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
 		headers := client.headers
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
@@ -150,10 +157,7 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, request CodexImag
 		request.Header.Set("Content-Type", "application/json")
 		response, requestErr := client.httpClient.Do(request)
 		if requestErr != nil {
-			if contextErr := contextError(ctx); contextErr != nil {
-				return nil, contextErr
-			}
-			if contextErr := contextError(attemptContext); contextErr != nil {
+			if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
 				return nil, contextErr
 			}
 			return nil, fmt.Errorf("send Codex Images request: %w", requestErr)
@@ -164,7 +168,7 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, request CodexImag
 		return response, nil
 	})
 	if err != nil {
-		if contextErr := contextError(ctx); contextErr != nil {
+		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		return CodexImageResult{}, err
@@ -174,30 +178,54 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, request CodexImag
 	}
 	defer closeHTTPResponse(response)
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		body, readErr := readCodexImageErrorBody(ctx, response.Body)
-		if contextErr := contextError(ctx); contextErr != nil {
+		errorBody, readErr := readCodexImageErrorBody(operationContext, response.Body)
+		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		if readErr != nil {
 			return CodexImageResult{}, fmt.Errorf("read Codex Images error: %w", readErr)
 		}
-		return CodexImageResult{}, MapUpstreamError(response.StatusCode, response.Header, body)
+		return CodexImageResult{}, MapUpstreamError(response.StatusCode, response.Header, errorBody)
 	}
 	if response.ContentLength > maxCodexImageResponseBytes {
 		return CodexImageResult{}, errors.New("Codex Images response is too large")
 	}
-	responseBody, err := readCodexImageBody(ctx, response.Body)
+	responseBody, err := readCodexImageBody(operationContext, response.Body)
 	if err != nil {
-		if contextErr := contextError(ctx); contextErr != nil {
+		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		return CodexImageResult{}, err
 	}
 	var imageResponse CodexImageResponse
 	if err := json.Unmarshal(responseBody, &imageResponse); err != nil {
+		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+			return CodexImageResult{}, contextErr
+		}
 		return CodexImageResult{}, errors.New("Codex Images response is malformed")
 	}
-	return decodeCodexImageResponse(request, imageResponse)
+	result, err := decodeCodexImageResponse(n, imageResponse)
+	if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+		return CodexImageResult{}, contextErr
+	}
+	return result, err
+}
+
+func validateImagesCall(ctx context.Context, client *ImagesClient) error {
+	if ctx == nil {
+		return errors.New("Codex Images context is nil")
+	}
+	if client == nil {
+		return errors.New("Codex Images client is nil")
+	}
+	return validateImageTurnID(client.headers.ImageTurnID)
+}
+
+func codexImagesContextError(callerContext, operationContext context.Context) error {
+	if contextErr := contextError(callerContext); contextErr != nil {
+		return contextErr
+	}
+	return contextError(operationContext)
 }
 
 func validateImageTurnID(imageTurnID string) error {
@@ -210,79 +238,61 @@ func validateImageTurnID(imageTurnID string) error {
 	return nil
 }
 
-func validateCodexImageRequest(request CodexImageRequest, edit bool) error {
-	if request.Model != "gpt-image-2" {
-		return errors.New("Codex Images model must be gpt-image-2")
+func validateCodexImageGenerationRequest(request CodexImageGenerationRequest) error {
+	if err := validateCodexImageParameters(request.Model, request.Prompt, request.N, request.Size, request.Quality, request.Background); err != nil {
+		return err
 	}
-	if strings.TrimSpace(request.Prompt) == "" {
-		return errors.New("Codex Images prompt is required")
+	return nil
+}
+
+func validateCodexImageEditRequest(request CodexImageEditRequest) error {
+	if err := validateCodexImageParameters(request.Model, request.Prompt, request.N, request.Size, request.Quality, request.Background); err != nil {
+		return err
 	}
-	if len(request.Prompt) > maxCodexImagePromptBytes {
-		return errors.New("Codex Images prompt is too large")
-	}
-	if request.N < 0 || request.N > maxCodexImageCount {
-		return errors.New("Codex Images image count is invalid")
-	}
-	if request.Size != "" {
-		if err := validateCodexImageSize(request.Size); err != nil {
-			return err
-		}
-	}
-	if request.Quality != "" {
-		switch request.Quality {
-		case "low", "medium", "high", "auto", "standard":
-		default:
-			return errors.New("Codex Images quality is invalid")
-		}
-	}
-	if request.Background != "" {
-		switch request.Background {
-		case "auto", "opaque":
-		default:
-			return errors.New("Codex Images background is invalid")
-		}
-	}
-	if request.OutputFormat != "" {
-		switch request.OutputFormat {
-		case "png", "webp", "jpeg":
-		default:
-			return errors.New("Codex Images output format is invalid")
-		}
-	}
-	if request.ResponseFormat != "b64_json" {
-		return errors.New("Codex Images response format must be b64_json")
-	}
-	if !edit {
-		if request.Image != "" || len(request.Images) != 0 || request.Mask != "" {
-			return errors.New("Codex Images generation does not accept source images")
-		}
-		return nil
-	}
-	if request.Image != "" && len(request.Images) != 0 {
-		return errors.New("Codex Images edit accepts image or images, not both")
-	}
-	if request.Image == "" && len(request.Images) == 0 {
-		return errors.New("Codex Images edit requires source images")
+	if len(request.Images) == 0 || len(request.Images) > maxCodexImageCount {
+		return errors.New("Codex Images edit image count is invalid")
 	}
 	if err := validateCodexImageInputSize(request); err != nil {
 		return err
 	}
-	if request.Image != "" {
-		if err := validateCodexImageDataURL(request.Image); err != nil {
-			return fmt.Errorf("Codex Images edit image: %w", err)
-		}
-	}
-	if len(request.Images) > maxCodexImageCount {
-		return errors.New("Codex Images edit image count is invalid")
-	}
 	for index, image := range request.Images {
-		if err := validateCodexImageDataURL(image); err != nil {
+		if err := validateCodexImageDataURL(image.ImageURL); err != nil {
 			return fmt.Errorf("Codex Images edit image %d: %w", index, err)
 		}
 	}
-	if request.Mask != "" {
-		if err := validateCodexImageDataURL(request.Mask); err != nil {
-			return fmt.Errorf("Codex Images edit mask: %w", err)
+	return nil
+}
+
+func validateCodexImageParameters(model, prompt string, n int, size, quality, background string) error {
+	if model != "gpt-image-2" {
+		return errors.New("Codex Images model must be gpt-image-2")
+	}
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("Codex Images prompt is required")
+	}
+	if len(prompt) > maxCodexImagePromptBytes {
+		return errors.New("Codex Images prompt is too large")
+	}
+	if n < 0 || n > maxCodexImageCount {
+		return errors.New("Codex Images image count is invalid")
+	}
+	if size != "" {
+		if err := validateCodexImageSize(size); err != nil {
+			return err
+		}
+	}
+	if quality != "" {
+		switch quality {
+		case "low", "medium", "high", "auto":
+		default:
+			return errors.New("Codex Images quality is invalid")
+		}
+	}
+	if background != "" {
+		switch background {
+		case "auto", "opaque":
+		default:
+			return errors.New("Codex Images background is invalid")
 		}
 	}
 	return nil
@@ -312,7 +322,7 @@ func validateCodexImageSize(size string) error {
 	return nil
 }
 
-func validateCodexImageInputSize(request CodexImageRequest) error {
+func validateCodexImageInputSize(request CodexImageEditRequest) error {
 	total := 0
 	add := func(value string) bool {
 		if len(value) > maxCodexImageRequestBytes-total {
@@ -321,16 +331,10 @@ func validateCodexImageInputSize(request CodexImageRequest) error {
 		total += len(value)
 		return true
 	}
-	if !add(request.Image) {
-		return errors.New("Codex Images edit images are too large")
-	}
 	for _, image := range request.Images {
-		if !add(image) {
+		if !add(image.ImageURL) {
 			return errors.New("Codex Images edit images are too large")
 		}
-	}
-	if !add(request.Mask) {
-		return errors.New("Codex Images edit mask is too large")
 	}
 	return nil
 }
@@ -373,15 +377,18 @@ func validateCodexImageDataURL(value string) error {
 	return nil
 }
 
-func decodeCodexImageResponse(request CodexImageRequest, response CodexImageResponse) (CodexImageResult, error) {
+func decodeCodexImageResponse(n int, response CodexImageResponse) (CodexImageResult, error) {
+	if response.Created == nil {
+		return CodexImageResult{}, errors.New("Codex Images response created is missing")
+	}
 	if len(response.Data) == 0 || len(response.Data) > maxCodexImageCount {
 		return CodexImageResult{}, errors.New("Codex Images response image count is invalid")
 	}
-	if request.N > 0 && len(response.Data) > request.N {
+	if n > 0 && len(response.Data) > n {
 		return CodexImageResult{}, errors.New("Codex Images response image count is invalid")
 	}
 	result := CodexImageResult{
-		Created: response.Created,
+		Created: *response.Created,
 		Images:  make([]CodexImage, len(response.Data)),
 		Usage:   response.Usage,
 	}
@@ -400,9 +407,6 @@ func decodeCodexImageResponse(request CodexImageRequest, response CodexImageResp
 		mimeType, ok := detectCodexImageMIME(decoded)
 		if !ok {
 			return CodexImageResult{}, fmt.Errorf("Codex Images response image %d has an unsupported type", index)
-		}
-		if request.OutputFormat != "" && mimeType != codexImageMIME(request.OutputFormat) {
-			return CodexImageResult{}, fmt.Errorf("Codex Images response image %d has an unexpected type", index)
 		}
 		if len(image.RevisedPrompt) > maxCodexImagePromptBytes {
 			return CodexImageResult{}, fmt.Errorf("Codex Images response image %d metadata is too large", index)
@@ -438,19 +442,6 @@ func detectCodexImageMIME(data []byte) (string, bool) {
 		return "image/webp", true
 	}
 	return "", false
-}
-
-func codexImageMIME(outputFormat string) string {
-	switch outputFormat {
-	case "png":
-		return "image/png"
-	case "webp":
-		return "image/webp"
-	case "jpeg":
-		return "image/jpeg"
-	default:
-		return ""
-	}
 }
 
 func readCodexImageBody(ctx context.Context, body io.Reader) ([]byte, error) {

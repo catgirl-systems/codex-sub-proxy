@@ -32,22 +32,27 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 		if got := request.Header.Get("Content-Type"); got != "application/json" {
 			t.Errorf("content type = %q", got)
 		}
-		var body CodexImageRequest
+		var body map[string]json.RawMessage
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		if body.Model != "gpt-image-2" || body.Prompt != "fixture generated icon" || body.N != 1 ||
-			body.Size != "1024x1024" || body.Quality != "standard" || body.ResponseFormat != "b64_json" {
-			t.Errorf("body = %#v", body)
+		assertExactImageJSONKeys(t, body, "model", "prompt", "n", "size", "quality")
+		for key, want := range map[string]string{
+			"model": `"gpt-image-2"`, "prompt": `"fixture generated icon"`,
+			"n": "1", "size": `"1024x1024"`, "quality": `"auto"`,
+		} {
+			if got := string(body[key]); got != want {
+				t.Errorf("body[%q] = %s, want %s", key, got, want)
+			}
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write(responseBody)
 	}))
 	defer server.Close()
 	client := newTestImagesClient(t, server, "access-token", "account-123")
-	result, err := client.Generate(context.Background(), CodexImageRequest{
+	result, err := client.Generate(context.Background(), CodexImageGenerationRequest{
 		Model: "gpt-image-2", Prompt: "fixture generated icon", N: 1,
-		Size: "1024x1024", Quality: "standard", ResponseFormat: "b64_json",
+		Size: "1024x1024", Quality: "auto",
 	})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
@@ -60,7 +65,11 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 		t.Fatalf("image = %#v", result.Images[0])
 	}
 	if result.Usage == nil || result.Usage.TotalTokens != 11 || result.Usage.InputTokensDetails == nil ||
-		result.Usage.OutputTokensDetails == nil {
+		result.Usage.OutputTokensDetails == nil ||
+		result.Usage.InputTokensDetails.ImageTokens != 3 ||
+		result.Usage.InputTokensDetails.TextTokens != 6 ||
+		result.Usage.OutputTokensDetails.ImageTokens != 1 ||
+		result.Usage.OutputTokensDetails.TextTokens != 1 {
 		t.Fatalf("usage = %#v", result.Usage)
 	}
 }
@@ -72,30 +81,47 @@ func TestImagesClientEditWireAndDecode(t *testing.T) {
 			t.Errorf("path = %q", request.URL.Path)
 		}
 		assertImageHeaders(t, request, "access-token", "account-123", "image-turn-123")
-		var body CodexImageRequest
+		var body map[string]json.RawMessage
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		if body.Model != "gpt-image-2" || body.Prompt != "fixture edited icon" || body.N != 1 ||
-			body.Size != "1024x1024" || body.Quality != "standard" || body.ResponseFormat != "b64_json" ||
-			len(body.Images) != 1 || body.Images[0] != testCodexImageDataURL {
-			t.Errorf("body = %#v", body)
+		assertExactImageJSONKeys(t, body, "model", "prompt", "images", "n", "size", "quality")
+		for key, want := range map[string]string{
+			"model": `"gpt-image-2"`, "prompt": `"fixture edited icon"`,
+			"n": "1", "size": `"1024x1024"`, "quality": `"auto"`,
+		} {
+			if got := string(body[key]); got != want {
+				t.Errorf("body[%q] = %s, want %s", key, got, want)
+			}
+		}
+		var images []map[string]json.RawMessage
+		if err := json.Unmarshal(body["images"], &images); err != nil || len(images) != 1 {
+			t.Fatalf("images = %s, err = %v", body["images"], err)
+		}
+		assertExactImageJSONKeys(t, images[0], "image_url")
+		if got := string(images[0]["image_url"]); got != `"`+testCodexImageDataURL+`"` {
+			t.Errorf("images[0].image_url = %s", got)
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write(responseBody)
 	}))
 	defer server.Close()
 	client := newTestImagesClient(t, server, "access-token", "account-123")
-	result, err := client.Edit(context.Background(), CodexImageRequest{
+	result, err := client.Edit(context.Background(), CodexImageEditRequest{
 		Model: "gpt-image-2", Prompt: "fixture edited icon", N: 1,
-		Size: "1024x1024", Quality: "standard", ResponseFormat: "b64_json",
-		Images: []string{testCodexImageDataURL},
+		Size: "1024x1024", Quality: "auto",
+		Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}},
 	})
 	if err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 	if len(result.Images) != 1 || result.Images[0].MIMEType != "image/png" || len(result.Images[0].Bytes) == 0 {
 		t.Fatalf("result = %#v", result)
+	}
+	if result.Usage == nil || result.Usage.InputTokensDetails == nil ||
+		result.Usage.InputTokensDetails.ImageTokens != 8 ||
+		result.Usage.InputTokensDetails.TextTokens != 8 {
+		t.Fatalf("usage = %#v", result.Usage)
 	}
 }
 
@@ -148,7 +174,7 @@ func TestImagesClientRefreshesOnceAfterUnauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Generate(context.Background(), CodexImageRequest{Model: "gpt-image-2", Prompt: "rotate"}); err != nil {
+	if _, err := client.Generate(context.Background(), CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "rotate"}); err != nil {
 		t.Fatalf("generate after refresh: %v", err)
 	}
 	if imageRequests.Load() != 2 || refreshRequests.Load() != 1 {
@@ -164,31 +190,35 @@ func TestImagesClientRejectsInvalidInputBeforeDispatch(t *testing.T) {
 	}))
 	defer server.Close()
 	client := newTestImagesClient(t, server, "access-token", "account-123")
+	tooManyImages := make([]CodexImageEditInput, maxCodexImageCount+1)
+	for index := range tooManyImages {
+		tooManyImages[index].ImageURL = testCodexImageDataURL
+	}
 	tests := []struct {
-		name    string
-		edit    bool
-		request CodexImageRequest
+		name        string
+		edit        bool
+		generation  CodexImageGenerationRequest
+		editRequest CodexImageEditRequest
 	}{
-		{name: "model", request: CodexImageRequest{Model: "gpt-image-1", Prompt: "x"}},
-		{name: "prompt", request: CodexImageRequest{Model: "gpt-image-2"}},
-		{name: "count", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", N: maxCodexImageCount + 1}},
-		{name: "quality", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", Quality: "extreme"}},
-		{name: "size", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", Size: "17x17"}},
-		{name: "background", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", Background: "transparent"}},
-		{name: "output format", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", OutputFormat: "gif"}},
-		{name: "response format", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", ResponseFormat: "url"}},
-		{name: "generation image", request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", Image: testCodexImageDataURL}},
-		{name: "edit no image", edit: true, request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x"}},
-		{name: "edit too many", edit: true, request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", Images: []string{testCodexImageDataURL, testCodexImageDataURL, testCodexImageDataURL, testCodexImageDataURL, testCodexImageDataURL, testCodexImageDataURL}}},
-		{name: "edit bad base64", edit: true, request: CodexImageRequest{Model: "gpt-image-2", Prompt: "x", Images: []string{"data:image/png;base64,not-base64"}}},
+		{name: "model", generation: CodexImageGenerationRequest{Model: "gpt-image-1", Prompt: "x"}},
+		{name: "prompt", generation: CodexImageGenerationRequest{Model: "gpt-image-2"}},
+		{name: "count", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", N: maxCodexImageCount + 1}},
+		{name: "quality standard", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Quality: "standard"}},
+		{name: "quality unknown", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Quality: "extreme"}},
+		{name: "size", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Size: "17x17"}},
+		{name: "background", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Background: "transparent"}},
+		{name: "edit no image", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x"}},
+		{name: "edit too many", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Images: tooManyImages}},
+		{name: "edit bad base64", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Images: []CodexImageEditInput{{ImageURL: "data:image/png;base64,not-base64"}}}},
+		{name: "edit empty image URL", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Images: []CodexImageEditInput{{}}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var err error
 			if test.edit {
-				_, err = client.Edit(context.Background(), test.request)
+				_, err = client.Edit(context.Background(), test.editRequest)
 			} else {
-				_, err = client.Generate(context.Background(), test.request)
+				_, err = client.Generate(context.Background(), test.generation)
 			}
 			if err == nil {
 				t.Fatal("invalid request returned no error")
@@ -201,14 +231,15 @@ func TestImagesClientRejectsInvalidInputBeforeDispatch(t *testing.T) {
 }
 
 func TestImagesClientRejectsMalformedAndOversizedOutput(t *testing.T) {
+	imageB64 := testCodexImageDataURL[len("data:image/png;base64,"):]
 	tests := []struct {
 		name string
 		body string
 	}{
 		{name: "malformed JSON", body: "{"},
-		{name: "bad base64", body: `{"data":[{"b64_json":"not-base64"}]}`},
-		{name: "non-image base64", body: `{"data":[{"b64_json":"aGVsbG8="}]}`},
-		{name: "too many images", body: `{"data":[{"b64_json":"` + testCodexImageDataURL[len("data:image/png;base64,"):] + `"},{"b64_json":"` + testCodexImageDataURL[len("data:image/png;base64,"):] + `"},{"b64_json":"` + testCodexImageDataURL[len("data:image/png;base64,"):] + `"},{"b64_json":"` + testCodexImageDataURL[len("data:image/png;base64,"):] + `"},{"b64_json":"` + testCodexImageDataURL[len("data:image/png;base64,"):] + `"},{"b64_json":"` + testCodexImageDataURL[len("data:image/png;base64,"):] + `"}]}`},
+		{name: "bad base64", body: `{"created":1,"data":[{"b64_json":"not-base64"}]}`},
+		{name: "non-image base64", body: `{"created":1,"data":[{"b64_json":"aGVsbG8="}]}`},
+		{name: "too many images", body: `{"created":1,"data":[{"b64_json":"` + imageB64 + `"},{"b64_json":"` + imageB64 + `"},{"b64_json":"` + imageB64 + `"},{"b64_json":"` + imageB64 + `"},{"b64_json":"` + imageB64 + `"},{"b64_json":"` + imageB64 + `"}]}`},
 		{name: "oversized body", body: strings.Repeat("x", maxCodexImageResponseBytes+1)},
 	}
 	for _, test := range tests {
@@ -218,9 +249,34 @@ func TestImagesClientRejectsMalformedAndOversizedOutput(t *testing.T) {
 			}))
 			defer server.Close()
 			client := newTestImagesClient(t, server, "access-token", "account-123")
-			_, err := client.Generate(context.Background(), CodexImageRequest{Model: "gpt-image-2", Prompt: "x"})
+			_, err := client.Generate(context.Background(), CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
 			if err == nil {
 				t.Fatal("invalid response returned no error")
+			}
+		})
+	}
+}
+
+func TestImagesClientRejectsMissingNegativeAndOverflowCreated(t *testing.T) {
+	imageB64 := testCodexImageDataURL[len("data:image/png;base64,"):]
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{"data":[{"b64_json":"` + imageB64 + `"}]}`},
+		{name: "negative", body: `{"created":-1,"data":[{"b64_json":"` + imageB64 + `"}]}`},
+		{name: "overflow", body: `{"created":18446744073709551616,"data":[{"b64_json":"` + imageB64 + `"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer server.Close()
+			client := newTestImagesClient(t, server, "access-token", "account-123")
+			_, err := client.Generate(context.Background(), CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
+			if err == nil {
+				t.Fatal("invalid created value returned no error")
 			}
 		})
 	}
@@ -235,7 +291,7 @@ func TestImagesClientMapsProviderErrorWithoutBodyLeak(t *testing.T) {
 	}))
 	defer server.Close()
 	client := newTestImagesClient(t, server, "access-token", "account-123")
-	_, err := client.Generate(context.Background(), CodexImageRequest{Model: "gpt-image-2", Prompt: "x"})
+	_, err := client.Generate(context.Background(), CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
 	var safeError *SafeError
 	if err == nil || !errors.As(err, &safeError) || safeError.Category != CategoryRateLimit ||
 		strings.Contains(err.Error(), secret) {
@@ -255,9 +311,76 @@ func TestImagesClientCancellation(t *testing.T) {
 	client := newTestImagesClient(t, server, "access-token", "account-123")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err := client.Generate(ctx, CodexImageRequest{Model: "gpt-image-2", Prompt: "x"})
+	_, err := client.Generate(ctx, CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestImagesClientBoundsStalledHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		select {
+		case <-request.Context().Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}))
+	defer server.Close()
+	client := newTestImagesClient(t, server, "access-token", "account-123")
+	client.httpClient.Timeout = 40 * time.Millisecond
+	started := time.Now()
+	_, err := client.Generate(context.Background(), CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled headers error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled headers elapsed = %s", elapsed)
+	}
+}
+
+func TestImagesClientBoundsStalledBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		if flusher, ok := writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = io.WriteString(writer, `{"created":1,"data":[`)
+		if flusher, ok := writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-request.Context().Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}))
+	defer server.Close()
+	client := newTestImagesClient(t, server, "access-token", "account-123")
+	client.httpClient.Timeout = 40 * time.Millisecond
+	started := time.Now()
+	_, err := client.Generate(context.Background(), CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled body error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled body elapsed = %s", elapsed)
+	}
+}
+
+func TestImagesClientPreservesCallerCancellationCause(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		select {
+		case <-request.Context().Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}))
+	defer server.Close()
+	client := newTestImagesClient(t, server, "access-token", "account-123")
+	cause := errors.New("caller stopped image request")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(cause)
+	_, err := client.Generate(ctx, CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x"})
+	if !errors.Is(err, cause) {
+		t.Fatalf("canceled image error = %v, want cause %v", err, cause)
 	}
 }
 
@@ -285,9 +408,9 @@ func TestImagesClientLiveOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	generation, err := client.Generate(context.Background(), CodexImageRequest{
+	generation, err := client.Generate(context.Background(), CodexImageGenerationRequest{
 		Model: "gpt-image-2", Prompt: "a small synthetic blue square", N: 1,
-		Size: "1024x1024", Quality: "standard",
+		Size: "1024x1024", Quality: "auto",
 	})
 	if err != nil {
 		t.Fatalf("live generation: %v", err)
@@ -295,16 +418,32 @@ func TestImagesClientLiveOptIn(t *testing.T) {
 	if len(generation.Images) != 1 || generation.Images[0].MIMEType == "" || len(generation.Images[0].Bytes) == 0 {
 		t.Fatalf("live generation result has no detected image")
 	}
-	edit, err := client.Edit(context.Background(), CodexImageRequest{
+	edit, err := client.Edit(context.Background(), CodexImageEditRequest{
 		Model: "gpt-image-2", Prompt: "add one small white dot", N: 1,
-		Size: "1024x1024", Quality: "standard",
-		Images: []string{"data:" + generation.Images[0].MIMEType + ";base64," + encodeLiveImage(generation.Images[0].Bytes)},
+		Size: "1024x1024", Quality: "auto",
+		Images: []CodexImageEditInput{{ImageURL: "data:" + generation.Images[0].MIMEType + ";base64," + encodeLiveImage(generation.Images[0].Bytes)}},
 	})
 	if err != nil {
 		t.Fatalf("live edit: %v", err)
 	}
 	if len(edit.Images) != 1 || edit.Images[0].MIMEType == "" || len(edit.Images[0].Bytes) == 0 {
 		t.Fatalf("live edit result has no detected image")
+	}
+}
+
+func assertExactImageJSONKeys(t *testing.T, fields map[string]json.RawMessage, want ...string) {
+	t.Helper()
+	expected := make(map[string]struct{}, len(want))
+	for _, key := range want {
+		expected[key] = struct{}{}
+	}
+	if len(fields) != len(expected) {
+		t.Fatalf("JSON keys = %v, want exactly %v", fields, want)
+	}
+	for key := range fields {
+		if _, ok := expected[key]; !ok {
+			t.Errorf("unexpected JSON key %q", key)
+		}
 	}
 }
 
@@ -334,6 +473,7 @@ func newTestImagesClient(t *testing.T, server *httptest.Server, accessToken, acc
 		t.Fatal(err)
 	}
 	refresher, err := NewRefresher(path, keys, RefresherOptions{HTTPClient: server.Client()})
+
 	if err != nil {
 		t.Fatal(err)
 	}

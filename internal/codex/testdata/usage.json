@@ -7,10 +7,14 @@
     "cached_tokens": 8,
     "cache_write_tokens": 3,
     "orchestration_input_tokens": 4,
-    "orchestration_input_cached_tokens": 2
+    "orchestration_input_cached_tokens": 2,
+    "image_tokens": 7,
+    "text_tokens": 35
   },
   "output_tokens_details": {
     "reasoning_tokens": 5,
-    "orchestration_output_tokens": 1
+    "orchestration_output_tokens": 1,
+    "image_tokens": 2,
+    "text_tokens": 15
   }
 }

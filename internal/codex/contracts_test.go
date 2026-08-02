@@ -423,8 +423,14 @@ func TestCodexImageFixturesDecodeAndEncode(t *testing.T) {
 		if err := json.Unmarshal(raw, &response); err != nil {
 			t.Fatalf("decode %s: %v", name, err)
 		}
-		if len(response.Data) != 1 || response.Data[0].B64JSON == "" {
+		if response.Created == nil || len(response.Data) != 1 || response.Data[0].B64JSON == "" {
 			t.Fatalf("image response %s = %#v", name, response)
+		}
+		if response.Usage == nil || response.Usage.InputTokensDetails == nil ||
+			response.Usage.OutputTokensDetails == nil ||
+			response.Usage.InputTokensDetails.ImageTokens == 0 ||
+			response.Usage.InputTokensDetails.TextTokens == 0 {
+			t.Fatalf("image usage %s = %#v", name, response.Usage)
 		}
 		if _, err := base64.StdEncoding.DecodeString(response.Data[0].B64JSON); err != nil {
 			t.Fatalf("decode image data %s: %v", name, err)
@@ -446,15 +452,27 @@ func TestCodexImageRequestFixturesDecode(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var request CodexImageRequest
-		if err := json.Unmarshal(raw, &request); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
 			t.Fatalf("decode %s: %v", name, err)
 		}
-		if request.Model != "gpt-image-2" || request.ResponseFormat != "b64_json" {
-			t.Fatalf("request %s = %#v", name, request)
+		wantKeys := []string{"model", "prompt", "n", "size", "quality"}
+		if strings.Contains(name, "edit") {
+			wantKeys = append(wantKeys, "images")
 		}
-		if strings.Contains(request.Prompt, "real") {
+		assertExactImageJSONKeys(t, fields, wantKeys...)
+		if string(fields["model"]) != `"gpt-image-2"` || string(fields["quality"]) != `"auto"` {
+			t.Fatalf("request %s has wrong model or quality: %s", name, raw)
+		}
+		if strings.Contains(string(fields["prompt"]), "real") {
 			t.Fatalf("request %s contains non-synthetic prompt", name)
+		}
+		if strings.Contains(name, "edit") {
+			var images []map[string]json.RawMessage
+			if err := json.Unmarshal(fields["images"], &images); err != nil || len(images) != 1 {
+				t.Fatalf("edit images %s = %s, err = %v", name, fields["images"], err)
+			}
+			assertExactImageJSONKeys(t, images[0], "image_url")
 		}
 	}
 }
@@ -471,7 +489,12 @@ func TestCodexUsageFixtureDecodesAllBreakdowns(t *testing.T) {
 	if usage.TotalTokens != 59 || usage.InputTokensDetails == nil || usage.OutputTokensDetails == nil {
 		t.Fatalf("usage = %#v", usage)
 	}
-	if usage.InputTokensDetails.OrchestrationInputCachedTokens != 2 || usage.OutputTokensDetails.ReasoningTokens != 5 {
+	if usage.InputTokensDetails.OrchestrationInputCachedTokens != 2 ||
+		usage.InputTokensDetails.ImageTokens != 7 ||
+		usage.InputTokensDetails.TextTokens != 35 ||
+		usage.OutputTokensDetails.ReasoningTokens != 5 ||
+		usage.OutputTokensDetails.ImageTokens != 2 ||
+		usage.OutputTokensDetails.TextTokens != 15 {
 		t.Fatalf("usage details = %#v", usage)
 	}
 }

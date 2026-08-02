@@ -388,12 +388,16 @@ type CodexInputTokenDetails struct {
 	CacheWriteTokens               int `json:"cache_write_tokens,omitempty"`
 	OrchestrationInputTokens       int `json:"orchestration_input_tokens,omitempty"`
 	OrchestrationInputCachedTokens int `json:"orchestration_input_cached_tokens,omitempty"`
+	ImageTokens                    int `json:"image_tokens,omitempty"`
+	TextTokens                     int `json:"text_tokens,omitempty"`
 }
 
 // CodexOutputTokenDetails gives the private output token breakdown.
 type CodexOutputTokenDetails struct {
 	ReasoningTokens           int `json:"reasoning_tokens,omitempty"`
 	OrchestrationOutputTokens int `json:"orchestration_output_tokens,omitempty"`
+	ImageTokens               int `json:"image_tokens,omitempty"`
+	TextTokens                int `json:"text_tokens,omitempty"`
 }
 
 // CodexError is a private provider error object.
@@ -479,24 +483,35 @@ func (envelope CodexErrorEnvelope) canonicalStatus() (int, bool, error) {
 	return 0, false, nil
 }
 
-// CodexImageRequest is a private direct Images request.
-type CodexImageRequest struct {
-	Model          string   `json:"model"`
-	Prompt         string   `json:"prompt,omitempty"`
-	N              int      `json:"n,omitempty"`
-	Size           string   `json:"size,omitempty"`
-	Quality        string   `json:"quality,omitempty"`
-	Background     string   `json:"background,omitempty"`
-	OutputFormat   string   `json:"output_format,omitempty"`
-	ResponseFormat string   `json:"response_format,omitempty"`
-	Image          string   `json:"image,omitempty"`
-	Images         []string `json:"images,omitempty"`
-	Mask           string   `json:"mask,omitempty"`
+// CodexImageGenerationRequest is the exact private generation request body.
+type CodexImageGenerationRequest struct {
+	Model      string `json:"model"`
+	Prompt     string `json:"prompt"`
+	N          int    `json:"n,omitempty"`
+	Size       string `json:"size,omitempty"`
+	Quality    string `json:"quality,omitempty"`
+	Background string `json:"background,omitempty"`
+}
+
+// CodexImageEditRequest is the exact private edit request body.
+type CodexImageEditRequest struct {
+	Model      string                `json:"model"`
+	Prompt     string                `json:"prompt"`
+	Images     []CodexImageEditInput `json:"images"`
+	N          int                   `json:"n,omitempty"`
+	Size       string                `json:"size,omitempty"`
+	Quality    string                `json:"quality,omitempty"`
+	Background string                `json:"background,omitempty"`
+}
+
+// CodexImageEditInput is one image_url object in a private edit request.
+type CodexImageEditInput struct {
+	ImageURL string `json:"image_url"`
 }
 
 // CodexImageResponse is a private direct Images result.
 type CodexImageResponse struct {
-	Created int64            `json:"created,omitempty"`
+	Created *uint64          `json:"created"`
 	Data    []CodexImageData `json:"data"`
 	Usage   *CodexUsage      `json:"usage,omitempty"`
 }
