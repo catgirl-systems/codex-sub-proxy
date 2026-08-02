@@ -161,6 +161,41 @@ func TestKeysAvailableRequiresEveryConfiguredKey(t *testing.T) {
 	}
 }
 
+func TestKeysAvailableUsesExactAPIKeyHMACValue(t *testing.T) {
+	keys := SecurityConfig{
+		PayloadEncryptionKeyEnv:    "PAYLOAD_KEY",
+		CredentialEncryptionKeyEnv: "CREDENTIAL_KEY",
+		APIKeyHMACKeyEnv:           "API_KEY",
+		AdminTokenHMACKeyEnv:       "ADMIN_KEY",
+	}
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "empty", value: "", want: false},
+		{name: "one space", value: " ", want: true},
+		{name: "tab", value: "\t", want: true},
+		{name: "newline", value: "\n", want: true},
+		{name: "ordinary bytes", value: "api-key", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lookup := func(name string) (string, bool) {
+				return map[string]string{
+					"PAYLOAD_KEY":    "payload",
+					"CREDENTIAL_KEY": "credential",
+					"API_KEY":        test.value,
+					"ADMIN_KEY":      "admin",
+				}[name], true
+			}
+			if got := keys.KeysAvailable(lookup); got != test.want {
+				t.Fatalf("KeysAvailable with API key %q = %t, want %t", test.value, got, test.want)
+			}
+		})
+	}
+}
+
 func TestCredentialKeySetLoadsActiveAndPreviousVersions(t *testing.T) {
 	security := Default().Security
 	security.CredentialEncryptionKeyVersion = 2
@@ -279,16 +314,33 @@ func TestRequireDistinctActiveKeysRejectsEqualBytes(t *testing.T) {
 
 func TestAPIKeyHMACKeyLoadsConfiguredValueWithoutLengthValidation(t *testing.T) {
 	security := Default().Security
-	t.Setenv(security.APIKeyHMACKeyEnv, " x ")
-	key, err := security.APIKeyHMACKey(os.LookupEnv)
-	if err != nil {
-		t.Fatalf("load API-key HMAC key: %v", err)
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "empty", value: "", wantErr: true},
+		{name: "one space", value: " "},
+		{name: "tab", value: "\t"},
+		{name: "newline", value: "\n"},
+		{name: "ordinary bytes", value: "api-key"},
 	}
-	if got := string(key); got != " x " {
-		t.Fatalf("HMAC key = %q", got)
-	}
-	t.Setenv(security.APIKeyHMACKeyEnv, "")
-	if _, err := security.APIKeyHMACKey(os.LookupEnv); err == nil {
-		t.Fatal("empty API-key HMAC key was accepted")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(security.APIKeyHMACKeyEnv, test.value)
+			key, err := security.APIKeyHMACKey(os.LookupEnv)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("empty API-key HMAC key was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load API-key HMAC key: %v", err)
+			}
+			if got := string(key); got != test.value {
+				t.Fatalf("HMAC key = %q, want %q", got, test.value)
+			}
+		})
 	}
 }

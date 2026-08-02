@@ -193,7 +193,6 @@ func (s SecurityConfig) KeysAvailable(lookup func(string) (string, bool)) bool {
 	names := []string{
 		s.PayloadEncryptionKeyEnv,
 		s.CredentialEncryptionKeyEnv,
-		s.APIKeyHMACKeyEnv,
 		s.AdminTokenHMACKeyEnv,
 	}
 	names = append(names, s.PayloadEncryptionPreviousKeyEnvs...)
@@ -206,6 +205,14 @@ func (s SecurityConfig) KeysAvailable(lookup func(string) (string, bool)) bool {
 		if !ok || strings.TrimSpace(value) == "" {
 			return false
 		}
+	}
+	name := s.APIKeyHMACKeyEnv
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	value, ok := lookup(name)
+	if !ok || value == "" {
+		return false
 	}
 	return true
 }
