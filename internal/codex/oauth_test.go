@@ -59,6 +59,39 @@ func TestDeviceIntervalDecodesStringAndNumber(t *testing.T) {
 	}
 }
 
+func TestDeviceLoginRejectsNegativeProviderInterval(t *testing.T) {
+	var pollCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/accounts/deviceauth/usercode":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"device_auth_id":"device-id","user_code":"ABCD-1234","interval":-1,"expires_in":900}`)
+		case "/api/accounts/deviceauth/token":
+			pollCount.Add(1)
+			http.Error(writer, "unexpected poll", http.StatusInternalServerError)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	_, err := Login(context.Background(), LoginOptions{
+		Issuer:       server.URL,
+		Device:       true,
+		HTTPClient:   server.Client(),
+		PollInterval: time.Millisecond,
+		OnDeviceCode: func(string, string) {
+			t.Fatal("device code callback called for invalid interval")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "device polling interval is out of range") {
+		t.Fatalf("negative interval error = %v", err)
+	}
+	if pollCount.Load() != 0 {
+		t.Fatalf("token endpoint polled %d times", pollCount.Load())
+	}
+}
+
 func TestDeviceLoginHonorsContextCancellation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/accounts/deviceauth/usercode" {

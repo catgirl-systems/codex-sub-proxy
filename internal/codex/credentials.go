@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -335,48 +336,18 @@ func rejectCodexHomeAuthDestination(sourcePath, destinationPath string) error {
 	if !sourceInfo.IsDir() {
 		return nil
 	}
-	sourceHome, err := resolvePathForComparison(sourcePath)
+	destinationParentInfo, err := os.Stat(filepath.Dir(destinationPath))
 	if err != nil {
-		return fmt.Errorf("resolve credential source: %w", err)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect credential destination directory: %w", err)
 	}
-	destination, err := resolvePathForComparison(destinationPath)
-	if err != nil {
-		return fmt.Errorf("resolve credential destination: %w", err)
-	}
-	if filepath.Clean(destination) == filepath.Join(sourceHome, "auth.json") {
+	if os.SameFile(sourceInfo, destinationParentInfo) &&
+		strings.EqualFold(filepath.Base(destinationPath), "auth.json") {
 		return errors.New("credential destination is Codex home auth.json")
 	}
 	return nil
-}
-
-func resolvePathForComparison(path string) (string, error) {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	absolute = filepath.Clean(absolute)
-	current := absolute
-	var suffix []string
-	for {
-		if _, err := os.Lstat(current); err == nil {
-			resolved, err := filepath.EvalSymlinks(current)
-			if err != nil {
-				return "", err
-			}
-			for index := len(suffix) - 1; index >= 0; index-- {
-				resolved = filepath.Join(resolved, suffix[index])
-			}
-			return filepath.Clean(resolved), nil
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return absolute, nil
-		}
-		suffix = append(suffix, filepath.Base(current))
-		current = parent
-	}
 }
 
 func readImportedCredential(ctx context.Context, sourcePath string) (Credential, os.FileInfo, error) {
@@ -490,8 +461,12 @@ func readOMPCredential(ctx context.Context, path string) (Credential, error) {
 	if err != nil {
 		return Credential{}, errors.New("resolve OMP credential database")
 	}
-	dsn := "file:" + filepath.ToSlash(absolutePath) + "?mode=ro"
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	databaseURL := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(absolutePath),
+		RawQuery: url.Values{"mode": []string{"ro"}}.Encode(),
+	}
+	db, err := gorm.Open(sqlite.Open(databaseURL.String()), &gorm.Config{})
 	if err != nil {
 		return Credential{}, errors.New("open OMP credential database")
 	}

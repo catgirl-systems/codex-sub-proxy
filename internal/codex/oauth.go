@@ -474,7 +474,7 @@ func deviceLogin(ctx context.Context, options LoginOptions) (Credential, error) 
 		return Credential{}, errors.New("device authorization lifetime is out of range")
 	}
 	interval := options.PollInterval
-	if device.Interval > 60 {
+	if device.Interval < 0 || device.Interval > 60 {
 		return Credential{}, errors.New("device polling interval is out of range")
 	}
 	if device.Interval > 0 {

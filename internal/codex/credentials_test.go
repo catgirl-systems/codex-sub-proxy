@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -128,8 +129,9 @@ func TestCredentialAvailableRequiresUsableEncryptedCredential(t *testing.T) {
 }
 
 func TestImportCredentialReadsOMPDatabase(t *testing.T) {
-	databasePath := filepath.Join(t.TempDir(), "agent.db")
-	db, err := gorm.Open(sqlite.Open(databasePath), &gorm.Config{})
+	databasePath := filepath.Join(t.TempDir(), "omp ?& # %.db")
+	databaseURL := url.URL{Scheme: "file", Path: filepath.ToSlash(databasePath)}
+	db, err := gorm.Open(sqlite.Open(databaseURL.String()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open test database: %v", err)
 	}
@@ -147,6 +149,9 @@ func TestImportCredentialReadsOMPDatabase(t *testing.T) {
 	if err := sqlDB.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(databasePath, 0o400); err != nil {
+		t.Fatalf("make database read-only: %v", err)
+	}
 	destinationPath := filepath.Join(t.TempDir(), "credential.enc")
 	credential, err := ImportCredential(context.Background(), databasePath, destinationPath, []byte("key"))
 	if err != nil {
@@ -163,6 +168,18 @@ func TestImportCredentialRejectsCodexHomeAuthDestination(t *testing.T) {
 	_, err := ImportCredential(context.Background(), codexHome, destination, []byte("key"))
 	if err == nil {
 		t.Fatal("Codex home auth.json destination was accepted")
+	}
+	if _, statErr := os.Lstat(destination); !os.IsNotExist(statErr) {
+		t.Fatalf("destination exists after rejected import: %v", statErr)
+	}
+}
+
+func TestImportCredentialRejectsCodexHomeAuthDestinationCaseInsensitive(t *testing.T) {
+	codexHome := t.TempDir()
+	destination := filepath.Join(codexHome, "AUTH.JSON")
+	_, err := ImportCredential(context.Background(), codexHome, destination, []byte("key"))
+	if err == nil {
+		t.Fatal("case-variant Codex home auth.json destination was accepted")
 	}
 	if _, statErr := os.Lstat(destination); !os.IsNotExist(statErr) {
 		t.Fatalf("destination exists after rejected import: %v", statErr)
