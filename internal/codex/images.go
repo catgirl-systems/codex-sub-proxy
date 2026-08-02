@@ -157,7 +157,10 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n in
 		request.Header.Set("Content-Type", "application/json")
 		response, requestErr := client.httpClient.Do(request)
 		if requestErr != nil {
-			if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+			if contextErr := context.Cause(ctx); contextErr != nil {
+				return nil, contextErr
+			}
+			if contextErr := context.Cause(operationContext); contextErr != nil {
 				return nil, contextErr
 			}
 			return nil, fmt.Errorf("send Codex Images request: %w", requestErr)
@@ -168,7 +171,10 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n in
 		return response, nil
 	})
 	if err != nil {
-		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
+			return CodexImageResult{}, contextErr
+		}
+		if contextErr := context.Cause(operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		return CodexImageResult{}, err
@@ -179,7 +185,10 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n in
 	defer closeHTTPResponse(response)
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		errorBody, readErr := readCodexImageErrorBody(operationContext, response.Body)
-		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
+			return CodexImageResult{}, contextErr
+		}
+		if contextErr := context.Cause(operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		if readErr != nil {
@@ -192,20 +201,29 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n in
 	}
 	responseBody, err := readCodexImageBody(operationContext, response.Body)
 	if err != nil {
-		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
+			return CodexImageResult{}, contextErr
+		}
+		if contextErr := context.Cause(operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		return CodexImageResult{}, err
 	}
 	var imageResponse CodexImageResponse
 	if err := json.Unmarshal(responseBody, &imageResponse); err != nil {
-		if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
+			return CodexImageResult{}, contextErr
+		}
+		if contextErr := context.Cause(operationContext); contextErr != nil {
 			return CodexImageResult{}, contextErr
 		}
 		return CodexImageResult{}, errors.New("Codex Images response is malformed")
 	}
 	result, err := decodeCodexImageResponse(n, imageResponse)
-	if contextErr := codexImagesContextError(ctx, operationContext); contextErr != nil {
+	if contextErr := context.Cause(ctx); contextErr != nil {
+		return CodexImageResult{}, contextErr
+	}
+	if contextErr := context.Cause(operationContext); contextErr != nil {
 		return CodexImageResult{}, contextErr
 	}
 	return result, err
@@ -219,13 +237,6 @@ func validateImagesCall(ctx context.Context, client *ImagesClient) error {
 		return errors.New("Codex Images client is nil")
 	}
 	return validateImageTurnID(client.headers.ImageTurnID)
-}
-
-func codexImagesContextError(callerContext, operationContext context.Context) error {
-	if contextErr := contextError(callerContext); contextErr != nil {
-		return contextErr
-	}
-	return contextError(operationContext)
 }
 
 func validateImageTurnID(imageTurnID string) error {

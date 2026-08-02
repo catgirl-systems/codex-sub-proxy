@@ -158,7 +158,7 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 		if response != nil {
 			closeHTTPResponse(response)
 		}
-		if contextErr := contextError(ctx); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
 			return CodexStreamResult{}, contextErr
 		}
 		return CodexStreamResult{}, err
@@ -188,7 +188,7 @@ func (transport *ResponsesTransport) attempt(ctx context.Context, body, webSocke
 	if authResponse != nil || err == nil {
 		return result, authResponse, err
 	}
-	if contextErr := contextError(ctx); contextErr != nil {
+	if contextErr := context.Cause(ctx); contextErr != nil {
 		return CodexStreamResult{}, nil, contextErr
 	}
 	if !fallback {
@@ -220,13 +220,13 @@ func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []by
 		CompressionMode: coderwebsocket.CompressionDisabled,
 	})
 	if err != nil {
-		if contextErr := contextError(ctx); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr, false
 		}
-		if contextErr := contextError(attemptContext); contextErr != nil {
+		if contextErr := context.Cause(attemptContext); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr, false
 		}
-		if contextErr := contextError(dialContext); contextErr != nil {
+		if contextErr := context.Cause(dialContext); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr, false
 		}
 		if response != nil {
@@ -259,10 +259,10 @@ func readCodexWebSocket(callerContext, attemptContext context.Context, connectio
 	err := connection.Write(writeContext, coderwebsocket.MessageText, body)
 	cancel()
 	if err != nil {
-		if contextErr := contextError(callerContext); contextErr != nil {
+		if contextErr := context.Cause(callerContext); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr, false
 		}
-		if contextErr := contextError(attemptContext); contextErr != nil {
+		if contextErr := context.Cause(attemptContext); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr, false
 		}
 		return CodexStreamResult{}, nil, fmt.Errorf("%w: write WebSocket request", ErrCodexTransport), true
@@ -277,10 +277,10 @@ func readCodexWebSocket(callerContext, attemptContext context.Context, connectio
 		messageType, frame, err := connection.Read(readContext)
 		cancel()
 		if err != nil {
-			if contextErr := contextError(callerContext); contextErr != nil {
+			if contextErr := context.Cause(callerContext); contextErr != nil {
 				return CodexStreamResult{}, nil, contextErr, false
 			}
-			if contextErr := contextError(attemptContext); contextErr != nil {
+			if contextErr := context.Cause(attemptContext); contextErr != nil {
 				return CodexStreamResult{}, nil, contextErr, false
 			}
 			if errors.Is(err, coderwebsocket.ErrMessageTooBig) {
@@ -340,9 +340,14 @@ func decodeCodexWebSocketMessage(frame []byte) (CodexResponseStreamEvent, *http.
 		if err := json.Unmarshal(frame, &envelope); err != nil {
 			return CodexResponseStreamEvent{}, nil, fmt.Errorf("%w: decode WebSocket error: %v", ErrCodexStreamMalformed, err)
 		}
-		status, present, err := envelope.canonicalStatus()
-		if err != nil {
-			return CodexResponseStreamEvent{}, nil, err
+		status := envelope.Status
+		present := status != 0
+		if envelope.Status != 0 && envelope.StatusCode != 0 && envelope.Status != envelope.StatusCode {
+			return CodexResponseStreamEvent{}, nil, fmt.Errorf("%w: error frame has conflicting status fields", ErrCodexStreamMalformed)
+		}
+		if !present {
+			status = envelope.StatusCode
+			present = status != 0
 		}
 		event, err := decodeCodexErrorEvent(frame)
 		if err != nil {
@@ -382,9 +387,32 @@ func decodeCodexErrorEvent(frame []byte) (CodexResponseStreamEvent, error) {
 	if len(wire.Headers) != 0 {
 		event.Headers = make(map[string]string, len(wire.Headers))
 		for name, rawValue := range wire.Headers {
-			if value, ok := codexScalarJSONValue(rawValue); ok {
-				event.Headers[name] = value
+			rawValue = bytes.TrimSpace(rawValue)
+			if len(rawValue) == 0 || bytes.Equal(rawValue, []byte("null")) {
+				continue
 			}
+			var value string
+			switch rawValue[0] {
+			case '"':
+				if err := json.Unmarshal(rawValue, &value); err != nil {
+					continue
+				}
+			case 't', 'f':
+				var boolean bool
+				if err := json.Unmarshal(rawValue, &boolean); err != nil {
+					continue
+				}
+				value = strconv.FormatBool(boolean)
+			case '[', '{':
+				continue
+			default:
+				var number json.Number
+				if err := json.Unmarshal(rawValue, &number); err != nil {
+					continue
+				}
+				value = number.String()
+			}
+			event.Headers[name] = value
 		}
 	}
 	return event, nil
@@ -405,34 +433,34 @@ func codexErrorHeaders(rawHeaders map[string]json.RawMessage) http.Header {
 		if !httpguts.ValidHeaderFieldName(name) {
 			continue
 		}
-		if value, ok := codexScalarJSONValue(rawValue); ok {
-			headers.Add(name, value)
+		rawValue = bytes.TrimSpace(rawValue)
+		if len(rawValue) == 0 || bytes.Equal(rawValue, []byte("null")) {
+			continue
 		}
+		var value string
+		switch rawValue[0] {
+		case '"':
+			if err := json.Unmarshal(rawValue, &value); err != nil {
+				continue
+			}
+		case 't', 'f':
+			var boolean bool
+			if err := json.Unmarshal(rawValue, &boolean); err != nil {
+				continue
+			}
+			value = strconv.FormatBool(boolean)
+		case '[', '{':
+			continue
+		default:
+			var number json.Number
+			if err := json.Unmarshal(rawValue, &number); err != nil {
+				continue
+			}
+			value = number.String()
+		}
+		headers.Add(name, value)
 	}
 	return headers
-}
-
-func codexScalarJSONValue(rawValue json.RawMessage) (string, bool) {
-	decoder := json.NewDecoder(bytes.NewReader(rawValue))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return "", false
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return "", false
-	}
-	switch value := value.(type) {
-	case string:
-		return value, true
-	case json.Number:
-		return value.String(), true
-	case bool:
-		return strconv.FormatBool(value), true
-	default:
-		return "", false
-	}
 }
 
 func codexWebSocketEventReplaySafe(event CodexResponseStreamEvent) bool {
@@ -463,19 +491,6 @@ func webSocketReadFailure(err error) error {
 		return fmt.Errorf("%w: WebSocket close code %d", ErrCodexStreamAbruptClose, code)
 	}
 	return fmt.Errorf("%w: WebSocket read failed", ErrCodexStreamAbruptClose)
-}
-
-func contextError(ctx context.Context) error {
-	if ctx == nil {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		if cause := context.Cause(ctx); cause != nil {
-			return cause
-		}
-		return err
-	}
-	return nil
 }
 
 func closeCodexWebSocket(ctx context.Context, connection *coderwebsocket.Conn) {
@@ -555,10 +570,10 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 			errorBody, readErr = readHTTPErrorBody(errorReader)
 		}
 		closeHTTPResponse(response)
-		if contextErr := contextError(ctx); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr
 		}
-		if contextErr := contextError(requestContext); contextErr != nil {
+		if contextErr := context.Cause(requestContext); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr
 		}
 		if readErr != nil && codexSSETimeoutError(readErr) {
@@ -576,10 +591,10 @@ func (transport *ResponsesTransport) trySSE(ctx context.Context, body []byte, he
 		if errors.Is(err, errCodexAggregateLimit) {
 			return CodexStreamResult{}, nil, fmt.Errorf("%w: SSE aggregate limit exceeded", ErrCodexStreamMalformed)
 		}
-		if contextErr := contextError(ctx); contextErr != nil {
+		if contextErr := context.Cause(ctx); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr
 		}
-		if contextErr := contextError(requestContext); contextErr != nil {
+		if contextErr := context.Cause(requestContext); contextErr != nil {
 			return CodexStreamResult{}, nil, contextErr
 		}
 		if codexSSETimeoutError(err) {
@@ -602,10 +617,10 @@ func codexSSEContext(ctx context.Context, clientTimeout time.Duration) (context.
 }
 
 func codexSSERequestError(callerContext, requestContext context.Context, err error) error {
-	if contextErr := contextError(callerContext); contextErr != nil {
+	if contextErr := context.Cause(callerContext); contextErr != nil {
 		return contextErr
 	}
-	if contextErr := contextError(requestContext); contextErr != nil {
+	if contextErr := context.Cause(requestContext); contextErr != nil {
 		return contextErr
 	}
 	if codexSSETimeoutError(err) {
@@ -628,14 +643,14 @@ type codexContextReader struct {
 }
 
 func (reader *codexContextReader) Read(target []byte) (int, error) {
-	if contextErr := contextError(reader.ctx); contextErr != nil {
+	if contextErr := context.Cause(reader.ctx); contextErr != nil {
 		return 0, contextErr
 	}
 	if reader.reader == nil {
 		return 0, io.EOF
 	}
 	count, err := reader.reader.Read(target)
-	if contextErr := contextError(reader.ctx); contextErr != nil && err != nil {
+	if contextErr := context.Cause(reader.ctx); contextErr != nil && err != nil {
 		return count, contextErr
 	}
 	return count, err

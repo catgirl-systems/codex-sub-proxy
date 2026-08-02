@@ -609,33 +609,32 @@ func TestCodexErrorHeadersDecodeAndRoundTrip(t *testing.T) {
 		})
 	}
 }
-func TestCodexErrorEnvelopeCanonicalStatus(t *testing.T) {
+func TestCodexErrorEnvelopeDecodesStatusAliases(t *testing.T) {
 	tests := []struct {
-		name       string
-		raw        string
-		wantStatus int
-		present    bool
-		wantErr    bool
+		name           string
+		raw            string
+		wantStatus     int
+		wantStatusCode int
+		wantErr        bool
 	}{
-		{name: "status", raw: `{"status":401}`, wantStatus: 401, present: true},
-		{name: "status code alias", raw: `{"status_code":401}`, wantStatus: 401, present: true},
-		{name: "matching aliases", raw: `{"status":401,"status_code":401}`, wantStatus: 401, present: true},
-		{name: "statusless", raw: `{}`, wantStatus: 0},
-		{name: "invalid alias", raw: `{"status_code":"unknown"}`, wantStatus: 0},
-		{name: "conflicting aliases", raw: `{"status":401,"status_code":403}`, wantErr: true},
+		{name: "status", raw: `{"status":401}`, wantStatus: 401},
+		{name: "status code alias", raw: `{"status_code":401}`, wantStatusCode: 401},
+		{name: "matching aliases", raw: `{"status":401,"status_code":401}`, wantStatus: 401, wantStatusCode: 401},
+		{name: "statusless", raw: `{}`},
+		{name: "invalid alias", raw: `{"status_code":"unknown"}`, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var envelope CodexErrorEnvelope
-			if err := json.Unmarshal([]byte(test.raw), &envelope); err != nil {
-				t.Fatalf("decode envelope: %v", err)
-			}
-			status, present, err := envelope.canonicalStatus()
+			err := json.Unmarshal([]byte(test.raw), &envelope)
 			if (err != nil) != test.wantErr {
-				t.Fatalf("canonical status error = %v, want error = %t", err, test.wantErr)
+				t.Fatalf("decode error = %v, want error = %t", err, test.wantErr)
 			}
-			if err == nil && (status != test.wantStatus || present != test.present) {
-				t.Fatalf("canonical status = %d, present = %t, want %d, %t", status, present, test.wantStatus, test.present)
+			if test.wantErr {
+				return
+			}
+			if envelope.Status != test.wantStatus || envelope.StatusCode != test.wantStatusCode {
+				t.Fatalf("decoded status = %d/%d, want %d/%d", envelope.Status, envelope.StatusCode, test.wantStatus, test.wantStatusCode)
 			}
 		})
 	}

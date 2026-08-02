@@ -611,7 +611,6 @@ func TestDecodeCodexWebSocketMessagePreservesNonHTTPErrorEvents(t *testing.T) {
 	}{
 		{name: "statusless", frame: `{"type":"error","message":"stream failed"}`},
 		{name: "success status", frame: `{"type":"error","status":200,"message":"stream failed"}`},
-		{name: "invalid status", frame: `{"type":"error","status_code":"unknown","message":"stream failed"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

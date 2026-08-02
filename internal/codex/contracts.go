@@ -423,66 +423,6 @@ type CodexErrorEnvelope struct {
 	Headers    map[string]json.RawMessage `json:"headers,omitempty"`
 }
 
-func (envelope *CodexErrorEnvelope) UnmarshalJSON(data []byte) error {
-	type wire struct {
-		Type       string                     `json:"type,omitempty"`
-		Status     json.RawMessage            `json:"status,omitempty"`
-		StatusCode json.RawMessage            `json:"status_code,omitempty"`
-		Code       string                     `json:"code,omitempty"`
-		Message    string                     `json:"message,omitempty"`
-		RetryAfter float64                    `json:"retry_after,omitempty"`
-		ResetsAt   int64                      `json:"resets_at,omitempty"`
-		Error      *CodexError                `json:"error,omitempty"`
-		Headers    map[string]json.RawMessage `json:"headers,omitempty"`
-	}
-	var decoded wire
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	status := codexEnvelopeStatus(decoded.Status)
-	statusCode := codexEnvelopeStatus(decoded.StatusCode)
-	*envelope = CodexErrorEnvelope{
-		Type:       decoded.Type,
-		Status:     status,
-		StatusCode: statusCode,
-		Code:       decoded.Code,
-		Message:    decoded.Message,
-		RetryAfter: decoded.RetryAfter,
-		ResetsAt:   decoded.ResetsAt,
-		Error:      decoded.Error,
-		Headers:    decoded.Headers,
-	}
-	return nil
-}
-
-func codexEnvelopeStatus(raw json.RawMessage) (value int) {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
-		return 0
-	}
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return 0
-	}
-	return value
-}
-
-// canonicalStatus accepts either wire alias when the other is absent. A
-// conflicting pair is malformed rather than silently choosing one.
-func (envelope CodexErrorEnvelope) canonicalStatus() (int, bool, error) {
-	statusSet := envelope.Status != 0
-	statusCodeSet := envelope.StatusCode != 0
-	if statusSet && statusCodeSet && envelope.Status != envelope.StatusCode {
-		return 0, false, fmt.Errorf("%w: error frame has conflicting status fields", ErrCodexStreamMalformed)
-	}
-	if statusSet {
-		return envelope.Status, true, nil
-	}
-	if statusCodeSet {
-		return envelope.StatusCode, true, nil
-	}
-	return 0, false, nil
-}
-
 // CodexImageGenerationRequest is the exact private generation request body.
 type CodexImageGenerationRequest struct {
 	Model      string `json:"model"`
