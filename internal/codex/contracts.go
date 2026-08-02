@@ -420,12 +420,12 @@ type CodexErrorEnvelope struct {
 
 // CodexRateLimitHeads contains the rate data in a wrapped WebSocket error.
 type CodexRateLimitHeads struct {
-	PrimaryUsedPercent     float64 `json:"x-codex-primary-used-percent,omitempty"`
-	PrimaryWindowMinutes   int     `json:"x-codex-primary-window-minutes,omitempty"`
-	PrimaryResetAt         int64   `json:"x-codex-primary-reset-at,omitempty"`
-	SecondaryUsedPercent   float64 `json:"x-codex-secondary-used-percent,omitempty"`
-	SecondaryWindowMinutes int     `json:"x-codex-secondary-window-minutes,omitempty"`
-	SecondaryResetAt       int64   `json:"x-codex-secondary-reset-at,omitempty"`
+	PrimaryUsedPercent     json.Number `json:"x-codex-primary-used-percent,omitempty"`
+	PrimaryWindowMinutes   json.Number `json:"x-codex-primary-window-minutes,omitempty"`
+	PrimaryResetAt         json.Number `json:"x-codex-primary-reset-at,omitempty"`
+	SecondaryUsedPercent   json.Number `json:"x-codex-secondary-used-percent,omitempty"`
+	SecondaryWindowMinutes json.Number `json:"x-codex-secondary-window-minutes,omitempty"`
+	SecondaryResetAt       json.Number `json:"x-codex-secondary-reset-at,omitempty"`
 }
 
 // CodexImageRequest is a private direct Images request.

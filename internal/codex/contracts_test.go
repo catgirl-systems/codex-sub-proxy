@@ -488,12 +488,90 @@ func TestCodexErrorFixtureDecodesRateLimitData(t *testing.T) {
 	if response.Status != 429 || response.Error == nil || response.Error.Code != "usage_limit_reached" {
 		t.Fatalf("error response = %#v", response)
 	}
-	if response.Headers == nil || response.Headers.PrimaryUsedPercent != 100 {
+	if response.Headers == nil || response.Headers.PrimaryUsedPercent != json.Number("100") {
 		t.Fatalf("rate headers = %#v", response.Headers)
 	}
 	mapped := MapUpstreamError(response.Status, nil, raw)
 	if mapped.Category != CategoryUsageLimit || mapped.IsRetryable() {
 		t.Fatalf("mapped error = %#v", mapped)
+	}
+}
+
+func TestCodexRateLimitHeadersDecodeAndRoundTrip(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want CodexRateLimitHeads
+	}{
+		{
+			name: "wrapped WebSocket fixture",
+			raw:  wrappedWebSocketUsageLimitFixture,
+			want: CodexRateLimitHeads{
+				PrimaryUsedPercent:   json.Number("100.0"),
+				PrimaryWindowMinutes: json.Number("15"),
+			},
+		},
+		{
+			name: "string scalars",
+			raw: `{"headers":{
+				"x-codex-primary-used-percent":"100.0",
+				"x-codex-primary-window-minutes":"15",
+				"x-codex-primary-reset-at":"1738888888",
+				"x-codex-secondary-used-percent":"25.5",
+				"x-codex-secondary-window-minutes":"30",
+				"x-codex-secondary-reset-at":"1738889999"
+			}}`,
+			want: CodexRateLimitHeads{
+				PrimaryUsedPercent:     json.Number("100.0"),
+				PrimaryWindowMinutes:   json.Number("15"),
+				PrimaryResetAt:         json.Number("1738888888"),
+				SecondaryUsedPercent:   json.Number("25.5"),
+				SecondaryWindowMinutes: json.Number("30"),
+				SecondaryResetAt:       json.Number("1738889999"),
+			},
+		},
+		{
+			name: "numeric scalars",
+			raw: `{"headers":{
+				"x-codex-primary-used-percent":100.0,
+				"x-codex-primary-window-minutes":15,
+				"x-codex-primary-reset-at":1738888888,
+				"x-codex-secondary-used-percent":25.5,
+				"x-codex-secondary-window-minutes":30,
+				"x-codex-secondary-reset-at":1738889999
+			}}`,
+			want: CodexRateLimitHeads{
+				PrimaryUsedPercent:     json.Number("100.0"),
+				PrimaryWindowMinutes:   json.Number("15"),
+				PrimaryResetAt:         json.Number("1738888888"),
+				SecondaryUsedPercent:   json.Number("25.5"),
+				SecondaryWindowMinutes: json.Number("30"),
+				SecondaryResetAt:       json.Number("1738889999"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var envelope CodexErrorEnvelope
+			if err := json.Unmarshal([]byte(test.raw), &envelope); err != nil {
+				t.Fatalf("decode rate-limit headers: %v", err)
+			}
+			if envelope.Headers == nil || *envelope.Headers != test.want {
+				t.Fatalf("decoded rate-limit headers = %#v, want %#v", envelope.Headers, test.want)
+			}
+
+			encoded, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatalf("encode rate-limit headers: %v", err)
+			}
+			var roundTrip CodexErrorEnvelope
+			if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+				t.Fatalf("decode round-trip rate-limit headers: %v", err)
+			}
+			if roundTrip.Headers == nil || *roundTrip.Headers != test.want {
+				t.Fatalf("round-trip rate-limit headers = %#v, want %#v", roundTrip.Headers, test.want)
+			}
+		})
 	}
 }
 
