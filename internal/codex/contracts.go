@@ -486,9 +486,12 @@ type CodexImageRequest struct {
 	N              int      `json:"n,omitempty"`
 	Size           string   `json:"size,omitempty"`
 	Quality        string   `json:"quality,omitempty"`
+	Background     string   `json:"background,omitempty"`
+	OutputFormat   string   `json:"output_format,omitempty"`
 	ResponseFormat string   `json:"response_format,omitempty"`
 	Image          string   `json:"image,omitempty"`
 	Images         []string `json:"images,omitempty"`
+	Mask           string   `json:"mask,omitempty"`
 }
 
 // CodexImageResponse is a private direct Images result.
