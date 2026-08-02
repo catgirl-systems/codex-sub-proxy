@@ -130,8 +130,15 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
+	payloadKeys, err := cfg.Security.PayloadKeySet(os.LookupEnv)
+	if err != nil {
+		return err
+	}
 	credentialKeys, err := cfg.Security.CredentialKeySet(os.LookupEnv)
 	if err != nil {
+		return err
+	}
+	if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
 		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
@@ -160,8 +167,15 @@ func runLogin(args []string) error {
 	if err != nil {
 		return err
 	}
+	payloadKeys, err := cfg.Security.PayloadKeySet(os.LookupEnv)
+	if err != nil {
+		return err
+	}
 	credentialKeys, err := cfg.Security.CredentialKeySet(os.LookupEnv)
 	if err != nil {
+		return err
+	}
+	if err := config.ValidateActiveKeyIndependence(payloadKeys, credentialKeys); err != nil {
 		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)

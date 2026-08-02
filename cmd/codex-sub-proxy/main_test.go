@@ -4,7 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
 func TestServerStoppedErrorPreservesShutdownFailure(t *testing.T) {
@@ -46,5 +49,95 @@ func TestRunRejectsEqualActiveEncryptionKeys(t *testing.T) {
 
 	if err := run([]string{"--config", configPath}); err == nil {
 		t.Fatal("equal active encryption keys were accepted at startup")
+	}
+}
+func TestRunImportRejectsEqualActiveKeysBeforeSideEffects(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	sourcePath := filepath.Join(tempDir, "auth.json")
+	source := []byte(`{"access_token":"access","refresh_token":"refresh","expires_at":4102444800,"account_id":"account"}`)
+	if err := os.WriteFile(sourcePath, source, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	destinationPath := filepath.Join(tempDir, "credential.enc")
+	t.Setenv("CSP_CODEX_CREDENTIAL_FILE", destinationPath)
+	sameKey := strings.Repeat("x", envelope.KeySize)
+	t.Setenv("CSP_PAYLOAD_ENCRYPTION_KEY", sameKey)
+	t.Setenv("CSP_CREDENTIAL_ENCRYPTION_KEY", sameKey)
+
+	err := run([]string{"import", "--config", configPath, "--source", sourcePath})
+	if err == nil || err.Error() != "active payload and credential encryption keys must differ" {
+		t.Fatalf("import error = %v, want active-key independence error", err)
+	}
+	if _, statErr := os.Stat(destinationPath); !os.IsNotExist(statErr) {
+		t.Fatalf("credential destination exists after rejected import: %v", statErr)
+	}
+}
+
+func TestRunImportWithDistinctActiveKeysContinues(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	sourcePath := filepath.Join(tempDir, "auth.json")
+	source := []byte(`{"access_token":"access","refresh_token":"refresh","expires_at":4102444800,"account_id":"account"}`)
+	if err := os.WriteFile(sourcePath, source, 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	destinationPath := filepath.Join(tempDir, "credential.enc")
+	t.Setenv("CSP_CODEX_CREDENTIAL_FILE", destinationPath)
+	t.Setenv("CSP_PAYLOAD_ENCRYPTION_KEY", strings.Repeat("p", envelope.KeySize))
+	t.Setenv("CSP_CREDENTIAL_ENCRYPTION_KEY", strings.Repeat("c", envelope.KeySize))
+
+	if err := run([]string{"import", "--config", configPath, "--source", sourcePath}); err != nil {
+		t.Fatalf("import with distinct active keys: %v", err)
+	}
+	if info, err := os.Stat(destinationPath); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Fatalf("credential destination = %v, %v", info, err)
+	}
+}
+
+func TestRunLoginRejectsEqualActiveKeysBeforeOAuth(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	destinationPath := filepath.Join(tempDir, "credential.enc")
+	t.Setenv("CSP_CODEX_CREDENTIAL_FILE", destinationPath)
+	sameKey := strings.Repeat("x", envelope.KeySize)
+	t.Setenv("CSP_PAYLOAD_ENCRYPTION_KEY", sameKey)
+	t.Setenv("CSP_CREDENTIAL_ENCRYPTION_KEY", sameKey)
+
+	err := run([]string{"login", "--config", configPath, "--device", "--issuer", "://invalid"})
+	if err == nil || err.Error() != "active payload and credential encryption keys must differ" {
+		t.Fatalf("login error = %v, want active-key independence error", err)
+	}
+	if _, statErr := os.Stat(destinationPath); !os.IsNotExist(statErr) {
+		t.Fatalf("credential destination exists after rejected login: %v", statErr)
+	}
+}
+
+func TestRunLoginWithDistinctActiveKeysContinues(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	destinationPath := filepath.Join(tempDir, "credential.enc")
+	t.Setenv("CSP_CODEX_CREDENTIAL_FILE", destinationPath)
+	t.Setenv("CSP_PAYLOAD_ENCRYPTION_KEY", strings.Repeat("p", envelope.KeySize))
+	t.Setenv("CSP_CREDENTIAL_ENCRYPTION_KEY", strings.Repeat("c", envelope.KeySize))
+
+	err := run([]string{"login", "--config", configPath, "--device", "--issuer", "://invalid"})
+	if err == nil || err.Error() != "OAuth issuer URL is invalid" {
+		t.Fatalf("login error = %v, want issuer validation error", err)
+	}
+	if _, statErr := os.Stat(destinationPath); !os.IsNotExist(statErr) {
+		t.Fatalf("credential destination exists after failed login: %v", statErr)
 	}
 }
