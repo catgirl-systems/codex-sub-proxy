@@ -435,11 +435,11 @@ type CodexErrorEnvelope struct {
 type CodexImageGenerationRequest struct {
 	Model             string `json:"model"`
 	Prompt            string `json:"prompt"`
-	N                 int    `json:"n,omitempty"`
+	N                 *int   `json:"n,omitempty"`
 	Size              string `json:"size,omitempty"`
 	Quality           string `json:"quality,omitempty"`
 	Background        string `json:"background,omitempty"`
-	OutputCompression int    `json:"output_compression,omitempty"`
+	OutputCompression *int   `json:"output_compression,omitempty"`
 	OutputFormat      string `json:"output_format,omitempty"`
 	Moderation        string `json:"moderation,omitempty"`
 	User              string `json:"user,omitempty"`
@@ -450,11 +450,11 @@ type CodexImageEditRequest struct {
 	Model             string                `json:"model"`
 	Prompt            string                `json:"prompt"`
 	Images            []CodexImageEditInput `json:"images"`
-	N                 int                   `json:"n,omitempty"`
+	N                 *int                  `json:"n,omitempty"`
 	Size              string                `json:"size,omitempty"`
 	Quality           string                `json:"quality,omitempty"`
 	Background        string                `json:"background,omitempty"`
-	OutputCompression int                   `json:"output_compression,omitempty"`
+	OutputCompression *int                  `json:"output_compression,omitempty"`
 	OutputFormat      string                `json:"output_format,omitempty"`
 	User              string                `json:"user,omitempty"`
 }
@@ -466,9 +466,13 @@ type CodexImageEditInput struct {
 
 // CodexImageResponse is a private direct Images result.
 type CodexImageResponse struct {
-	Created *uint64          `json:"created"`
-	Data    []CodexImageData `json:"data"`
-	Usage   *CodexUsage      `json:"usage,omitempty"`
+	Created      *uint64          `json:"created"`
+	Background   string           `json:"background,omitempty"`
+	Data         []CodexImageData `json:"data"`
+	OutputFormat string           `json:"output_format,omitempty"`
+	Quality      string           `json:"quality,omitempty"`
+	Size         string           `json:"size,omitempty"`
+	Usage        *CodexUsage      `json:"usage,omitempty"`
 }
 
 // CodexImageData is one private image result.

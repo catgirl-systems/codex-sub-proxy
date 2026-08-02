@@ -777,6 +777,9 @@ func responsesError(err error) (int, openai.Error) {
 	if err == nil {
 		return http.StatusBadGateway, openai.Error{Type: responsesServerErrorType, Code: "upstream_error", Message: "The upstream service returned an error."}
 	}
+	if errors.Is(err, codex.ErrInvalidImageRequest) {
+		return http.StatusBadRequest, openai.Error{Type: responsesErrorType, Code: "invalid_request", Message: "The request is invalid."}
+	}
 	var safeError *codex.SafeError
 	if errors.As(err, &safeError) {
 		status := safeError.StatusCode

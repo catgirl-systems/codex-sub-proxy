@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,10 +18,50 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/openai"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
+	"github.com/go-playground/validator/v10"
 	sdk "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
 )
+
+func TestImagesPublicValidationAndJSONLimits(t *testing.T) {
+	validation := validator.New()
+	zero := 0
+	for _, request := range []openai.ImageGenerationRequest{
+		{Model: "gpt-image-1", Prompt: "prompt"},
+		{Model: "gpt-image-2", Prompt: "   "},
+		{Model: "gpt-image-2", Prompt: "prompt", N: &zero},
+		{Model: "gpt-image-2", Prompt: "prompt", OutputCompression: &zero},
+		{Model: "gpt-image-2", Prompt: "prompt", OutputCompression: &zero, OutputFormat: "png"},
+	} {
+		if err := validateImagesRequest(validation, request); err == nil {
+			t.Fatalf("invalid request %#v was accepted", request)
+		}
+	}
+	valid := openai.ImageGenerationRequest{Model: "gpt-image-2", Prompt: "prompt"}
+	body := `{"model":"gpt-image-2","prompt":"prompt"}` + strings.Repeat(" ", maxImagesJSONBodyBytes)
+	recorder := httptest.NewRecorder()
+	err := decodeImagesJSON(http.MaxBytesReader(recorder, io.NopCloser(strings.NewReader(body)), maxImagesJSONBodyBytes), &valid)
+	if !errors.Is(err, errImagesBodyTooLarge) {
+		t.Fatalf("trailing oversized JSON error = %v", err)
+	}
+	omittedForm, _, err := decodeImageEditForm(map[string][]string{
+		"model": {"gpt-image-2"}, "prompt": {"prompt"},
+	})
+	if err != nil || omittedForm.N != nil || omittedForm.OutputCompression != nil {
+		t.Fatalf("omitted multipart integers = %#v, err = %v", omittedForm, err)
+	}
+	zeroForm, _, err := decodeImageEditForm(map[string][]string{
+		"model": {"gpt-image-2"}, "prompt": {"prompt"}, "n": {"0"},
+		"output_compression": {"0"}, "output_format": {"jpeg"},
+	})
+	if err != nil || zeroForm.N == nil || *zeroForm.N != 0 ||
+		zeroForm.OutputCompression == nil || *zeroForm.OutputCompression != 0 {
+		t.Fatalf("explicit zero multipart integers = %#v, err = %v", zeroForm, err)
+	}
+}
 
 func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 	generationResponse, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "images_generation.json"))
@@ -34,6 +76,9 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 
 	var generationRequests, editRequests atomic.Int32
 	var generationTurnID, editTurnID string
+	var slowGeneration atomic.Bool
+	generationStarted := make(chan struct{}, 1)
+	releaseGeneration := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/generations":
@@ -49,8 +94,15 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 				t.Errorf("generation body: %v", err)
 			}
-			if string(body["model"]) != `"gpt-image-2"` || string(body["prompt"]) != `"generate"` {
+			if string(body["model"]) != `"gpt-image-2"` || string(body["prompt"]) != `"generate"` ||
+				string(body["n"]) != "1" || string(body["output_compression"]) != "0" ||
+				string(body["output_format"]) != `"webp"` || string(body["background"]) != `"transparent"` ||
+				string(body["quality"]) != `"auto"` || string(body["size"]) != `"1024x1024"` {
 				t.Errorf("generation body = %s", body)
+			}
+			if slowGeneration.Load() {
+				generationStarted <- struct{}{}
+				<-releaseGeneration
 			}
 			writer.Header().Set("Content-Type", "application/json")
 			_, _ = writer.Write(generationResponse)
@@ -64,14 +116,24 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 				t.Errorf("edit request = %s %s content-type=%q", request.Method, request.URL.Path, request.Header.Get("Content-Type"))
 			}
 			var body struct {
-				Model  string                      `json:"model"`
-				Prompt string                      `json:"prompt"`
-				Images []codex.CodexImageEditInput `json:"images"`
+				Model             string                      `json:"model"`
+				Prompt            string                      `json:"prompt"`
+				Images            []codex.CodexImageEditInput `json:"images"`
+				N                 *int                        `json:"n"`
+				OutputCompression *int                        `json:"output_compression"`
+				OutputFormat      string                      `json:"output_format"`
+				Background        string                      `json:"background"`
+				Quality           string                      `json:"quality"`
+				Size              string                      `json:"size"`
 			}
 			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 				t.Errorf("edit body: %v", err)
 			}
-			if body.Model != "gpt-image-2" || body.Prompt != "edit" || len(body.Images) != 2 || len(body.Images[0].ImageURL) < len("data:image/png;base64,") {
+			if body.Model != "gpt-image-2" || body.Prompt != "edit" || len(body.Images) != 2 ||
+				len(body.Images[0].ImageURL) < len("data:image/png;base64,") ||
+				body.N == nil || *body.N != 1 || body.OutputCompression == nil || *body.OutputCompression != 0 ||
+				body.OutputFormat != "jpeg" || body.Background != "opaque" ||
+				body.Quality != "medium" || body.Size != "1024x1536" {
 				t.Errorf("edit body = %#v", body)
 			}
 			writer.Header().Set("Content-Type", "application/json")
@@ -148,26 +210,75 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 		option.WithAPIKey(rawKey),
 	)
 	generated, err := client.Images.Generate(context.Background(), sdk.ImageGenerateParams{
-		Model:          sdk.ImageModel("gpt-image-2"),
-		Prompt:         "generate",
-		ResponseFormat: sdk.ImageGenerateParamsResponseFormatB64JSON,
+		Model:             sdk.ImageModel("gpt-image-2"),
+		Prompt:            "generate",
+		N:                 param.NewOpt[int64](1),
+		OutputCompression: param.NewOpt[int64](0),
+		OutputFormat:      sdk.ImageGenerateParamsOutputFormatWebP,
+		Background:        sdk.ImageGenerateParamsBackgroundTransparent,
+		Quality:           sdk.ImageGenerateParamsQualityAuto,
+		Size:              sdk.ImageGenerateParamsSize1024x1024,
+		ResponseFormat:    sdk.ImageGenerateParamsResponseFormatB64JSON,
 	})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
-	if generated == nil || len(generated.Data) != 1 || generated.Data[0].B64JSON == "" {
-		t.Fatalf("generated = %#v", generated)
+	slowGeneration.Store(true)
+	slowDone := make(chan error, 1)
+	go func() {
+		_, err := client.Images.Generate(context.Background(), sdk.ImageGenerateParams{
+			Model:             sdk.ImageModel("gpt-image-2"),
+			Prompt:            "generate",
+			N:                 param.NewOpt[int64](1),
+			OutputCompression: param.NewOpt[int64](0),
+			OutputFormat:      sdk.ImageGenerateParamsOutputFormatWebP,
+			Background:        sdk.ImageGenerateParamsBackgroundTransparent,
+			Quality:           sdk.ImageGenerateParamsQualityAuto,
+			Size:              sdk.ImageGenerateParamsSize1024x1024,
+			ResponseFormat:    sdk.ImageGenerateParamsResponseFormatB64JSON,
+		})
+		slowDone <- err
+	}()
+	select {
+	case <-generationStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow generation did not reach upstream")
+	}
+	time.Sleep(writeTimeout + 500*time.Millisecond)
+	close(releaseGeneration)
+	if err := <-slowDone; err != nil {
+		t.Fatalf("generation beyond server WriteTimeout: %v", err)
+	}
+	slowGeneration.Store(false)
+	if generated.Background != sdk.ImagesResponseBackgroundTransparent ||
+		generated.Quality != sdk.ImagesResponseQualityHigh ||
+		generated.Size != sdk.ImagesResponseSize1024x1024 ||
+		generated.OutputFormat != sdk.ImagesResponseOutputFormatWebP {
+		t.Fatalf("generated metadata = %#v", generated)
 	}
 	edited, err := client.Images.Edit(context.Background(), sdk.ImageEditParams{
-		Image: sdk.ImageEditParamsImageUnion{OfFileArray: []io.Reader{bytes.NewReader(imageBytes), bytes.NewReader(imageBytes)}},
-		Model: sdk.ImageModel("gpt-image-2"), Prompt: "edit",
-		ResponseFormat: sdk.ImageEditParamsResponseFormatB64JSON,
+		Image:             sdk.ImageEditParamsImageUnion{OfFileArray: []io.Reader{bytes.NewReader(imageBytes), bytes.NewReader(imageBytes)}},
+		Model:             sdk.ImageModel("gpt-image-2"),
+		Prompt:            "edit",
+		N:                 param.NewOpt[int64](1),
+		OutputCompression: param.NewOpt[int64](0),
+		OutputFormat:      sdk.ImageEditParamsOutputFormatJPEG,
+		Background:        sdk.ImageEditParamsBackgroundOpaque,
+		Quality:           sdk.ImageEditParamsQualityMedium,
+		Size:              sdk.ImageEditParamsSize1024x1536,
+		ResponseFormat:    sdk.ImageEditParamsResponseFormatB64JSON,
 	})
 	if err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 	if edited == nil || len(edited.Data) != 1 || edited.Data[0].B64JSON == "" {
 		t.Fatalf("edited = %#v", edited)
+	}
+	if edited.Background != sdk.ImagesResponseBackgroundOpaque ||
+		edited.Quality != sdk.ImagesResponseQualityMedium ||
+		edited.Size != sdk.ImagesResponseSize1024x1536 ||
+		edited.OutputFormat != sdk.ImagesResponseOutputFormatJPEG {
+		t.Fatalf("edited metadata = %#v", edited)
 	}
 	request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+imagesGenerationsEndpoint, bytes.NewBufferString(`{"model":"gpt-image-2","prompt":"generate","response_format":"url"}`))
 	if err != nil {
@@ -188,7 +299,33 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 		t.Fatalf("url response = %d %#v", response.StatusCode, errorBody)
 	}
 
-	if generationRequests.Load() != 1 || editRequests.Load() != 1 || generationTurnID == "" || editTurnID == "" || generationTurnID == editTurnID {
+	for _, payload := range []string{
+		`{"model":"gpt-image-1","prompt":"generate"}`,
+		`{"model":"gpt-image-2","prompt":"generate","size":"512x1024"}`,
+	} {
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+imagesGenerationsEndpoint, bytes.NewBufferString(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]map[string]string
+		if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+			_ = response.Body.Close()
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest || body["error"]["type"] != "invalid_request_error" ||
+			body["error"]["code"] != "invalid_request" {
+			t.Fatalf("invalid image request = %d %#v", response.StatusCode, body)
+		}
+	}
+
+	if generationRequests.Load() != 2 || editRequests.Load() != 1 || generationTurnID == "" || editTurnID == "" || generationTurnID == editTurnID {
 		t.Fatalf("upstream requests = generation %d edit %d turn IDs = %q/%q", generationRequests.Load(), editRequests.Load(), generationTurnID, editTurnID)
 	}
 }

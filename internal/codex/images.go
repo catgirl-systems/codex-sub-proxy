@@ -25,8 +25,12 @@ const (
 	maxCodexImageRequestBytes  = 32 << 20
 	maxCodexImageResponseBytes = 32 << 20
 	maxCodexImageDimension     = 3840
+	minCodexImagePixels        = 655360
 	maxCodexImagePixels        = 3840 * 2160
 )
+
+// ErrInvalidImageRequest identifies an image request rejected before dispatch.
+var ErrInvalidImageRequest = errors.New("invalid Codex Images request")
 
 // ImagesClientOptions contains the private Codex Images endpoints and auth.
 type ImagesClientOptions struct {
@@ -48,9 +52,13 @@ type ImagesClient struct {
 
 // CodexImageResult is the decoded result of one private Images request.
 type CodexImageResult struct {
-	Created uint64
-	Images  []CodexImage
-	Usage   *CodexUsage
+	Created      uint64
+	Background   string
+	Images       []CodexImage
+	OutputFormat string
+	Quality      string
+	Size         string
+	Usage        *CodexUsage
 }
 
 // CodexImage is one decoded image and its provider metadata.
@@ -99,11 +107,8 @@ func NewImagesClient(options ImagesClientOptions) (*ImagesClient, error) {
 
 // Generate creates images from a text prompt.
 func (client *ImagesClient) Generate(ctx context.Context, request CodexImageGenerationRequest) (CodexImageResult, error) {
-	if err := validateImagesCall(ctx, client); err != nil {
-		return CodexImageResult{}, err
-	}
 	if err := validateCodexImageGenerationRequest(request); err != nil {
-		return CodexImageResult{}, err
+		return CodexImageResult{}, fmt.Errorf("%w: %w", ErrInvalidImageRequest, err)
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -117,11 +122,8 @@ func (client *ImagesClient) Generate(ctx context.Context, request CodexImageGene
 
 // Edit creates images from one or more source images.
 func (client *ImagesClient) Edit(ctx context.Context, request CodexImageEditRequest) (CodexImageResult, error) {
-	if err := validateImagesCall(ctx, client); err != nil {
-		return CodexImageResult{}, err
-	}
 	if err := validateCodexImageEditRequest(request); err != nil {
-		return CodexImageResult{}, err
+		return CodexImageResult{}, fmt.Errorf("%w: %w", ErrInvalidImageRequest, err)
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -133,7 +135,7 @@ func (client *ImagesClient) Edit(ctx context.Context, request CodexImageEditRequ
 	return client.do(ctx, true, body, request.N)
 }
 
-func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n int) (CodexImageResult, error) {
+func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n *int) (CodexImageResult, error) {
 	operationContext, cancel := codexSSEContext(ctx, client.httpClient.Timeout)
 	defer cancel()
 
@@ -242,19 +244,6 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n in
 	return result, err
 }
 
-func validateImagesCall(ctx context.Context, client *ImagesClient) error {
-	if ctx == nil {
-		return errors.New("Codex Images context is nil")
-	}
-	if client == nil {
-		return errors.New("Codex Images client is nil")
-	}
-	if client.headers.ImageTurnID != "" {
-		return validateImageTurnID(client.headers.ImageTurnID)
-	}
-	return nil
-}
-
 func newCodexImageTurnID() (string, error) {
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err != nil {
@@ -330,10 +319,9 @@ func validateCodexImageEditRequest(request CodexImageEditRequest) error {
 	}
 	return nil
 }
-
 func validateCodexImageParameters(
-	model, prompt string, n int, size, quality, background string,
-	outputCompression int, outputFormat, moderation, user string,
+	model, prompt string, n *int, size, quality, background string,
+	outputCompression *int, outputFormat, moderation, user string,
 ) error {
 	if model != "gpt-image-2" {
 		return errors.New("Codex Images model must be gpt-image-2")
@@ -344,7 +332,7 @@ func validateCodexImageParameters(
 	if len(prompt) > maxCodexImagePromptBytes {
 		return errors.New("Codex Images prompt is too large")
 	}
-	if n < 0 || n > maxCodexImageCount {
+	if n != nil && (*n < 1 || *n > maxCodexImageCount) {
 		return errors.New("Codex Images image count is invalid")
 	}
 	if size != "" {
@@ -366,14 +354,23 @@ func validateCodexImageParameters(
 			return errors.New("Codex Images background is invalid")
 		}
 	}
-	if outputCompression < 0 || outputCompression > 100 {
-		return errors.New("Codex Images output compression is invalid")
-	}
 	if outputFormat != "" {
 		switch outputFormat {
 		case "png", "jpeg", "webp":
 		default:
 			return errors.New("Codex Images output format is invalid")
+		}
+	}
+	if outputCompression != nil {
+		if *outputCompression < 0 || *outputCompression > 100 {
+			return errors.New("Codex Images output compression is invalid")
+		}
+		effectiveFormat := outputFormat
+		if effectiveFormat == "" {
+			effectiveFormat = "png"
+		}
+		if effectiveFormat != "jpeg" && effectiveFormat != "webp" {
+			return errors.New("Codex Images output compression requires jpeg or webp output format")
 		}
 	}
 	if moderation != "" {
@@ -406,7 +403,8 @@ func validateCodexImageSize(size string) error {
 		return errors.New("Codex Images size is invalid")
 	}
 	if width <= 0 || height <= 0 || width > maxCodexImageDimension || height > maxCodexImageDimension ||
-		width%16 != 0 || height%16 != 0 || width > maxCodexImagePixels/height || height > maxCodexImagePixels/width ||
+		width%16 != 0 || height%16 != 0 || width*height < minCodexImagePixels ||
+		width > maxCodexImagePixels/height || height > maxCodexImagePixels/width ||
 		width > height*3 || height > width*3 {
 		return errors.New("Codex Images size is invalid")
 	}
@@ -468,20 +466,27 @@ func validateCodexImageDataURL(value string) error {
 	return nil
 }
 
-func decodeCodexImageResponse(n int, response CodexImageResponse) (CodexImageResult, error) {
+func decodeCodexImageResponse(n *int, response CodexImageResponse) (CodexImageResult, error) {
 	if response.Created == nil {
 		return CodexImageResult{}, errors.New("Codex Images response created is missing")
 	}
 	if len(response.Data) == 0 || len(response.Data) > maxCodexImageCount {
 		return CodexImageResult{}, errors.New("Codex Images response image count is invalid")
 	}
-	if n > 0 && len(response.Data) > n {
+	if n != nil && *n > 0 && len(response.Data) > *n {
 		return CodexImageResult{}, errors.New("Codex Images response image count is invalid")
 	}
+	if err := validateCodexImageResponseMetadata(response); err != nil {
+		return CodexImageResult{}, err
+	}
 	result := CodexImageResult{
-		Created: *response.Created,
-		Images:  make([]CodexImage, len(response.Data)),
-		Usage:   response.Usage,
+		Created:      *response.Created,
+		Background:   response.Background,
+		Images:       make([]CodexImage, len(response.Data)),
+		OutputFormat: response.OutputFormat,
+		Quality:      response.Quality,
+		Size:         response.Size,
+		Usage:        response.Usage,
 	}
 	for index, image := range response.Data {
 		if image.B64JSON == "" || image.URL != "" {
@@ -511,11 +516,67 @@ func decodeCodexImageResponse(n int, response CodexImageResponse) (CodexImageRes
 	return result, nil
 }
 
+func validateCodexImageResponseMetadata(response CodexImageResponse) error {
+	if len(response.Background) > maxCodexImagePromptBytes ||
+		len(response.OutputFormat) > maxCodexImagePromptBytes ||
+		len(response.Quality) > maxCodexImagePromptBytes ||
+		len(response.Size) > maxCodexImagePromptBytes {
+		return errors.New("Codex Images response metadata is too large")
+	}
+	if response.Background != "" {
+		switch response.Background {
+		case "auto", "opaque", "transparent":
+		default:
+			return errors.New("Codex Images response background is invalid")
+		}
+	}
+	if response.OutputFormat != "" {
+		switch response.OutputFormat {
+		case "png", "jpeg", "webp":
+		default:
+			return errors.New("Codex Images response output format is invalid")
+		}
+	}
+	if response.Quality != "" {
+		switch response.Quality {
+		case "low", "medium", "high", "auto":
+		default:
+			return errors.New("Codex Images response quality is invalid")
+		}
+	}
+	if response.Size != "" {
+		if err := validateCodexImageSize(response.Size); err != nil {
+			return fmt.Errorf("Codex Images response size is invalid: %w", err)
+		}
+	}
+	return nil
+}
+
 func codexBase64DecodedSize(value string) (int, bool) {
-	if value == "" || len(value)%4 == 1 {
+	if value == "" || len(value)%4 != 0 {
 		return 0, false
 	}
-	decoded := base64.StdEncoding.DecodedLen(len(value))
+	padding := 0
+	for index := len(value) - 1; index >= 0 && value[index] == '='; index-- {
+		padding++
+	}
+	if padding > 2 {
+		return 0, false
+	}
+	content := value[:len(value)-padding]
+	if strings.ContainsRune(content, '=') {
+		return 0, false
+	}
+	for index := 0; index < len(content); index++ {
+		character := value[index]
+		if (character < 'A' || character > 'Z') &&
+			(character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') &&
+			character != '+' && character != '/' {
+			return 0, false
+		}
+	}
+	decoded := base64.StdEncoding.DecodedLen(len(value)) - padding
 	if decoded < 0 || decoded > maxCodexImageBytes {
 		return 0, false
 	}

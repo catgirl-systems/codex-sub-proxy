@@ -1,5 +1,9 @@
 {
   "created": 1738888894,
+  "background": "transparent",
+  "quality": "high",
+  "size": "1024x1024",
+  "output_format": "webp",
   "data": [
     {
       "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",

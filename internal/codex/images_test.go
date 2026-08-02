@@ -20,6 +20,10 @@ import (
 
 const testCodexImageDataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
+func codexImageInt(value int) *int {
+	return &value
+}
+
 func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 	responseBody := readImageFixture(t, "images_generation.json")
 	var requests atomic.Int32
@@ -52,8 +56,8 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 	defer server.Close()
 	client := newTestImagesClient(t, server, "access-token", "account-123")
 	result, err := client.Generate(context.Background(), CodexImageGenerationRequest{
-		Model: "gpt-image-2", Prompt: "fixture generated icon", N: 1,
-		Size: "1024x1024", Quality: "auto", OutputCompression: 75,
+		Model: "gpt-image-2", Prompt: "fixture generated icon", N: codexImageInt(1),
+		Size: "1024x1024", Quality: "auto", OutputCompression: codexImageInt(75),
 		OutputFormat: "webp", Moderation: "low", User: "fixture-user",
 	})
 	if err != nil {
@@ -61,6 +65,10 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 	}
 	if requests.Load() != 1 || result.Created != 1738888894 || len(result.Images) != 1 {
 		t.Fatalf("result = %#v, requests = %d", result, requests.Load())
+	}
+	if result.Background != "transparent" || result.Quality != "high" ||
+		result.Size != "1024x1024" || result.OutputFormat != "webp" {
+		t.Fatalf("result metadata = %#v", result)
 	}
 	if result.Images[0].MIMEType != "image/png" || len(result.Images[0].Bytes) == 0 ||
 		result.Images[0].RevisedPrompt != "a synthetic generated icon" {
@@ -76,6 +84,115 @@ func TestImagesClientGenerateWireAndDecode(t *testing.T) {
 	}
 }
 
+func TestImagesClientOptionalIntegerPresence(t *testing.T) {
+	responseBody := readImageFixture(t, "images_generation.json")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		index := int(requests.Add(1))
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode request %d: %v", index, err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch index {
+		case 1:
+			assertExactImageJSONKeys(t, body, "model", "prompt")
+		case 2:
+			assertExactImageJSONKeys(t, body, "model", "prompt", "output_compression", "output_format")
+			if string(body["output_compression"]) != "0" {
+				t.Errorf("output_compression = %s, want 0", body["output_compression"])
+			}
+		default:
+			t.Errorf("unexpected request %d", index)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(responseBody)
+	}))
+	defer server.Close()
+	client := newTestImagesClient(t, server, "access-token", "account-123")
+	if _, err := client.Generate(context.Background(), CodexImageGenerationRequest{
+		Model: "gpt-image-2", Prompt: "omitted",
+	}); err != nil {
+		t.Fatalf("omitted option request: %v", err)
+	}
+	if _, err := client.Generate(context.Background(), CodexImageGenerationRequest{
+		Model: "gpt-image-2", Prompt: "zero compression",
+		OutputCompression: codexImageInt(0), OutputFormat: "jpeg",
+	}); err != nil {
+		t.Fatalf("zero compression request: %v", err)
+	}
+	if _, err := client.Generate(context.Background(), CodexImageGenerationRequest{
+		Model: "gpt-image-2", Prompt: "zero count", N: codexImageInt(0),
+	}); err == nil {
+		t.Fatal("explicit n=0 was accepted")
+	}
+	for _, outputFormat := range []string{"", "png"} {
+		if _, err := client.Generate(context.Background(), CodexImageGenerationRequest{
+			Model: "gpt-image-2", Prompt: "invalid compression format",
+			OutputCompression: codexImageInt(0), OutputFormat: outputFormat,
+		}); err == nil {
+			t.Fatalf("compression with output_format %q was accepted", outputFormat)
+		}
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("requests = %d, want 2", requests.Load())
+	}
+}
+
+func TestCodexImageSizeMinimumPixels(t *testing.T) {
+	if err := validateCodexImageSize("640x1024"); err != nil {
+		t.Fatalf("exact minimum size rejected: %v", err)
+	}
+	if err := validateCodexImageSize("624x1024"); err == nil {
+		t.Fatal("below-minimum size was accepted")
+	}
+	if err := validateCodexImageSize("512x1024"); err == nil {
+		t.Fatal("below-minimum size was accepted")
+	}
+}
+
+func TestCodexImageBase64ExactBoundaries(t *testing.T) {
+	image := make([]byte, maxCodexImageBytes)
+	copy(image, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	encoded := base64.StdEncoding.EncodeToString(image)
+	if decodedSize, ok := codexBase64DecodedSize(encoded); !ok || decodedSize != maxCodexImageBytes {
+		t.Fatalf("exact maximum decoded size = %d, %t", decodedSize, ok)
+	}
+	if err := validateCodexImageDataURL("data:image/png;base64," + encoded); err != nil {
+		t.Fatalf("exact maximum input rejected: %v", err)
+	}
+	created := uint64(1)
+	result, err := decodeCodexImageResponse(nil, CodexImageResponse{
+		Created: &created,
+		Data:    []CodexImageData{{B64JSON: encoded}},
+	})
+	if err != nil {
+		t.Fatalf("exact maximum response rejected: %v", err)
+	}
+	if len(result.Images) != 1 || len(result.Images[0].Bytes) != maxCodexImageBytes {
+		t.Fatalf("decoded exact maximum response = %d bytes", len(result.Images[0].Bytes))
+	}
+	oversized := append(append([]byte(nil), image...), 0)
+	oversizedEncoded := base64.StdEncoding.EncodeToString(oversized)
+	if decodedSize, ok := codexBase64DecodedSize(oversizedEncoded); ok && decodedSize <= maxCodexImageBytes {
+		t.Fatalf("oversized decoded size = %d, %t", decodedSize, ok)
+	}
+	if err := validateCodexImageDataURL("data:image/png;base64," + oversizedEncoded); err == nil {
+		t.Fatal("oversized input was accepted")
+	}
+	if _, err := decodeCodexImageResponse(nil, CodexImageResponse{
+		Created: &created,
+		Data:    []CodexImageData{{B64JSON: oversizedEncoded}},
+	}); err == nil {
+		t.Fatal("oversized response was accepted")
+	}
+	for _, malformed := range []string{"not-base64", "AAAAA", "AA=A", "AAAA="} {
+		if _, ok := codexBase64DecodedSize(malformed); ok {
+			t.Fatalf("malformed base64 %q was accepted", malformed)
+		}
+	}
+}
 func TestImagesClientEditWireAndDecode(t *testing.T) {
 	responseBody := readImageFixture(t, "images_edit.json")
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -111,8 +228,8 @@ func TestImagesClientEditWireAndDecode(t *testing.T) {
 	defer server.Close()
 	client := newTestImagesClient(t, server, "access-token", "account-123")
 	result, err := client.Edit(context.Background(), CodexImageEditRequest{
-		Model: "gpt-image-2", Prompt: "fixture edited icon", N: 1,
-		Size: "1024x1024", Quality: "auto", OutputCompression: 80,
+		Model: "gpt-image-2", Prompt: "fixture edited icon", N: codexImageInt(1),
+		Size: "1024x1024", Quality: "auto", OutputCompression: codexImageInt(80),
 		OutputFormat: "jpeg", User: "fixture-user",
 		Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}},
 	})
@@ -121,6 +238,10 @@ func TestImagesClientEditWireAndDecode(t *testing.T) {
 	}
 	if len(result.Images) != 1 || result.Images[0].MIMEType != "image/png" || len(result.Images[0].Bytes) == 0 {
 		t.Fatalf("result = %#v", result)
+	}
+	if result.Background != "opaque" || result.Quality != "medium" ||
+		result.Size != "1024x1536" || result.OutputFormat != "jpeg" {
+		t.Fatalf("result metadata = %#v", result)
 	}
 	if result.Usage == nil || result.Usage.InputTokensDetails == nil ||
 		result.Usage.InputTokensDetails.ImageTokens != 8 ||
@@ -181,13 +302,13 @@ func TestImagesClientBackgroundValuesWire(t *testing.T) {
 				)
 				if operation.edit {
 					result, err = client.Edit(context.Background(), CodexImageEditRequest{
-						Model: "gpt-image-2", Prompt: "fixture edited icon", N: 1,
+						Model: "gpt-image-2", Prompt: "fixture edited icon", N: codexImageInt(1),
 						Size: "1024x1024", Quality: "auto", Background: background,
 						Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}},
 					})
 				} else {
 					result, err = client.Generate(context.Background(), CodexImageGenerationRequest{
-						Model: "gpt-image-2", Prompt: "fixture generated icon", N: 1,
+						Model: "gpt-image-2", Prompt: "fixture generated icon", N: codexImageInt(1),
 						Size: "1024x1024", Quality: "auto", Background: background,
 					})
 				}
@@ -282,10 +403,11 @@ func TestImagesClientRejectsInvalidInputBeforeDispatch(t *testing.T) {
 	}{
 		{name: "model", generation: CodexImageGenerationRequest{Model: "gpt-image-1", Prompt: "x"}},
 		{name: "prompt", generation: CodexImageGenerationRequest{Model: "gpt-image-2"}},
-		{name: "count", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", N: maxCodexImageCount + 1}},
+		{name: "count", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", N: codexImageInt(maxCodexImageCount + 1)}},
 		{name: "quality standard", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Quality: "standard"}},
 		{name: "quality unknown", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Quality: "extreme"}},
 		{name: "size", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Size: "17x17"}},
+		{name: "size below minimum", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Size: "624x1024"}},
 		{name: "background", generation: CodexImageGenerationRequest{Model: "gpt-image-2", Prompt: "x", Background: "invalid"}},
 		{name: "edit background", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x", Background: "invalid", Images: []CodexImageEditInput{{ImageURL: testCodexImageDataURL}}}},
 		{name: "edit no image", edit: true, editRequest: CodexImageEditRequest{Model: "gpt-image-2", Prompt: "x"}},
@@ -490,7 +612,7 @@ func TestImagesClientLiveOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	generation, err := client.Generate(context.Background(), CodexImageGenerationRequest{
-		Model: "gpt-image-2", Prompt: "a small synthetic blue square", N: 1,
+		Model: "gpt-image-2", Prompt: "a small synthetic blue square", N: codexImageInt(1),
 		Size: "1024x1024", Quality: "auto",
 	})
 	if err != nil {
@@ -500,7 +622,7 @@ func TestImagesClientLiveOptIn(t *testing.T) {
 		t.Fatalf("live generation result has no detected image")
 	}
 	edit, err := client.Edit(context.Background(), CodexImageEditRequest{
-		Model: "gpt-image-2", Prompt: "add one small white dot", N: 1,
+		Model: "gpt-image-2", Prompt: "add one small white dot", N: codexImageInt(1),
 		Size: "1024x1024", Quality: "auto",
 		Images: []CodexImageEditInput{{ImageURL: "data:" + generation.Images[0].MIMEType + ";base64," + encodeLiveImage(generation.Images[0].Bytes)}},
 	})

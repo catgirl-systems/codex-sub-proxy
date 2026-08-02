@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
@@ -36,6 +37,7 @@ const (
 	maxImageModelBytes          = 64
 	maxImageOptionBytes         = 64
 	maxImageResponsePromptBytes = 64 << 10
+	imagesWriteTimeout          = 5*time.Minute + writeTimeout
 )
 
 var (
@@ -46,6 +48,7 @@ var (
 func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
+		setImagesWriteDeadline(ctx)
 		request := ctx.Request()
 		if request.Method != http.MethodPost {
 			writeImagesMethodNotAllowed(ctx)
@@ -122,6 +125,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
+		setImagesWriteDeadline(ctx)
 		request := ctx.Request()
 		if request.Method != http.MethodPost {
 			writeImagesMethodNotAllowed(ctx)
@@ -249,13 +253,21 @@ func authenticateImagesRequest(ctx iris.Context, authorizer *apikey.Authorizer) 
 	return principal, true
 }
 
+func setImagesWriteDeadline(ctx iris.Context) {
+	_ = http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Now().Add(imagesWriteTimeout))
+}
+
 func writeImagesMethodNotAllowed(ctx iris.Context) {
 	ctx.Header("Allow", http.MethodPost)
 	writeImagesError(ctx, http.StatusMethodNotAllowed, "method_not_allowed", "Only POST is allowed for this endpoint.")
 }
 
 func writeImagesError(ctx iris.Context, status int, code, message string) {
-	writeResponsesError(ctx, status, "invalid_request_error", code, message)
+	typeName := "invalid_request_error"
+	if status >= http.StatusInternalServerError {
+		typeName = "server_error"
+	}
+	writeResponsesError(ctx, status, typeName, code, message)
 }
 
 func writeImagesDispatchError(ctx iris.Context, err error) {
@@ -278,6 +290,10 @@ func decodeImagesJSON(reader io.Reader, destination any) error {
 	}
 	var extra json.RawMessage
 	if err := decoder.Decode(&extra); err != io.EOF {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return errImagesBodyTooLarge
+		}
 		if err == nil {
 			return errors.New("multiple JSON values")
 		}
@@ -292,17 +308,23 @@ func validateImagesRequest(requestValidation *validator.Validate, request any) e
 	}
 	switch request := request.(type) {
 	case openai.ImageGenerationRequest:
-		return validateImageRequestBytes(request.Model, request.Prompt, request.User)
+		return validateImageRequestFields(request.Model, request.Prompt, request.User, request.OutputCompression, request.OutputFormat)
 	case openai.ImageEditRequest:
-		return validateImageRequestBytes(request.Model, request.Prompt, request.User)
+		return validateImageRequestFields(request.Model, request.Prompt, request.User, request.OutputCompression, request.OutputFormat)
 	default:
 		return errors.New("unsupported image request")
 	}
 }
 
-func validateImageRequestBytes(model, prompt, user string) error {
+func validateImageRequestFields(model, prompt, user string, outputCompression *int, outputFormat string) error {
+	if model != "gpt-image-2" || strings.TrimSpace(prompt) == "" {
+		return errors.New("image model or prompt is invalid")
+	}
 	if len(model) > maxImageModelBytes || len(prompt) > maxImagePromptBytes || len(user) > maxImageUserBytes {
 		return errors.New("image request field is too large")
+	}
+	if outputCompression != nil && outputFormat != "jpeg" && outputFormat != "webp" {
+		return errors.New("image output compression requires jpeg or webp output format")
 	}
 	return nil
 }
@@ -383,19 +405,20 @@ func imageFormString(values map[string][]string, name string, maxBytes int) (str
 	return items[0], true, nil
 }
 
-func imageFormInt(values map[string][]string, name string) (int, error) {
+func imageFormInt(values map[string][]string, name string) (*int, error) {
 	value, present, err := imageFormString(values, name, maxImageOptionBytes)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if !present {
-		return 0, nil
+		return nil, nil
 	}
 	parsed, err := strconv.ParseInt(value, 10, 32)
 	if err != nil {
-		return 0, errors.New("multipart integer field is invalid")
+		return nil, errors.New("multipart integer field is invalid")
 	}
-	return int(parsed), nil
+	converted := int(parsed)
+	return &converted, nil
 }
 
 func imageFileHeaders(form *multipart.Form) ([]*multipart.FileHeader, error) {
@@ -496,9 +519,13 @@ func publicImageResponse(result codex.CodexImageResult) (openai.ImageResponse, e
 		return openai.ImageResponse{}, errors.New("invalid image result")
 	}
 	response := openai.ImageResponse{
-		Created: int64(result.Created),
-		Data:    make([]openai.ImageData, len(result.Images)),
-		Usage:   publicImageUsage(result.Usage),
+		Created:      int64(result.Created),
+		Background:   result.Background,
+		Data:         make([]openai.ImageData, len(result.Images)),
+		OutputFormat: result.OutputFormat,
+		Quality:      result.Quality,
+		Size:         result.Size,
+		Usage:        publicImageUsage(result.Usage),
 	}
 	responseBytes := 0
 	for index, image := range result.Images {
