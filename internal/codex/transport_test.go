@@ -187,6 +187,68 @@ func TestResponsesTransportFallsBackAfterReplaySafeWebSocketEvents(t *testing.T)
 	}
 }
 
+func TestResponsesTransportFallsBackAfterBareWebSocketDrop(t *testing.T) {
+	var sseRequests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			sseRequests.Add(1)
+			writer.Header().Set("Content-Type", "text/event-stream")
+			writer.WriteHeader(http.StatusOK)
+			_, _ = writer.Write(transportSSEFixture(t))
+			return
+		}
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		if _, _, err := connection.Read(context.Background()); err == nil {
+			_ = connection.CloseNow()
+		}
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+	result, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	if err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	if result.TerminalType != CodexEventResponseCompleted {
+		t.Fatalf("terminal type = %q, want %q", result.TerminalType, CodexEventResponseCompleted)
+	}
+	if sseRequests.Load() != 1 {
+		t.Fatalf("SSE requests = %d, want 1", sseRequests.Load())
+	}
+}
+
+func TestResponsesTransportDoesNotFallbackAfterMalformedWebSocketFrame(t *testing.T) {
+	var sseRequests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			sseRequests.Add(1)
+			return
+		}
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.created"`))
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+	_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	if !errors.Is(err, ErrCodexStreamMalformed) {
+		t.Fatalf("error = %v, want malformed stream", err)
+	}
+	if sseRequests.Load() != 0 {
+		t.Fatalf("SSE requests = %d, want 0", sseRequests.Load())
+	}
+}
+
 func TestResponsesTransportDoesNotReplayAfterPartialWebSocketOutput(t *testing.T) {
 	var sseRequests atomic.Int32
 	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -272,8 +334,8 @@ func TestResponsesTransportCancellationClosesWebSocket(t *testing.T) {
 	defer server.Close()
 
 	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	errorsReturned := make(chan error, 1)
 	go func() {
 		_, err := transport.Do(ctx, CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
@@ -284,14 +346,35 @@ func TestResponsesTransportCancellationClosesWebSocket(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("WebSocket request was not received")
 	}
-	cancel()
+	cause := errors.New("caller cancellation cause")
+	cancel(cause)
 	select {
 	case err := <-errorsReturned:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("error = %v, want context cancellation", err)
+		if !errors.Is(err, cause) {
+			t.Fatalf("error = %v, want caller cancellation cause", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("transport did not stop after cancellation")
+	}
+}
+
+func TestWebSocketReadFallbackStatuslessNetworkErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "EOF", err: io.EOF, want: true},
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "timeout", err: context.DeadlineExceeded, want: true},
+		{name: "protocol", err: errors.New("unexpected reserved bits"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := webSocketReadFallback(test.err); got != test.want {
+				t.Fatalf("fallback = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -392,6 +475,281 @@ func TestResponsesTransportErrorsDoNotExposeSecrets(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "transport-token") {
 		t.Fatalf("error exposes secret: %v", err)
+	}
+}
+
+func TestResponsesTransportMapsWrappedWebSocketErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		frame      string
+		category   ErrorCategory
+		statusCode int
+		retryAfter time.Duration
+	}{
+		{
+			name:       "usage limit",
+			frame:      `{"type":"error","status":429,"retry_after":7.5,"error":{"type":"usage_limit_reached","message":"private usage details"},"headers":{"x-codex-primary-used-percent":100}}`,
+			category:   CategoryUsageLimit,
+			statusCode: http.StatusTooManyRequests,
+			retryAfter: 7500 * time.Millisecond,
+		},
+		{
+			name:       "policy",
+			frame:      `{"type":"error","status":400,"error":{"type":"cyber_policy","message":"private policy details"}}`,
+			category:   CategoryPolicy,
+			statusCode: http.StatusBadRequest,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+				connection, err := transportUpgrader.Upgrade(writer, request, nil)
+				if err != nil {
+					return
+				}
+				defer connection.CloseNow()
+				if _, _, err := connection.Read(context.Background()); err != nil {
+					return
+				}
+				_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(test.frame))
+			})
+			defer server.Close()
+
+			transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+			_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+			var safeErr *SafeError
+			if !errors.As(err, &safeErr) {
+				t.Fatalf("error = %v, want SafeError", err)
+			}
+			if safeErr.Category != test.category || safeErr.StatusCode != test.statusCode {
+				t.Fatalf("safe error = %#v, want category %q status %d", safeErr, test.category, test.statusCode)
+			}
+			if safeErr.RetryAfter != test.retryAfter {
+				t.Fatalf("retry after = %s, want %s", safeErr.RetryAfter, test.retryAfter)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatalf("error exposes private detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeCodexWebSocketMessageConvertsRateLimitHeaders(t *testing.T) {
+	frame := []byte(`{"type":"error","status":429,"headers":{"x-codex-primary-used-percent":"100.0","x-codex-primary-window-minutes":15,"x-codex-secondary-used-percent":"25.5","x-codex-secondary-window-minutes":30}}`)
+	_, response, err := decodeCodexWebSocketMessage(frame)
+	if err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if response == nil || response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("response = %#v, want status 429", response)
+	}
+	for name, want := range map[string]string{
+		"X-Codex-Primary-Used-Percent":     "100.0",
+		"X-Codex-Primary-Window-Minutes":   "15",
+		"X-Codex-Secondary-Used-Percent":   "25.5",
+		"X-Codex-Secondary-Window-Minutes": "30",
+	} {
+		if got := response.Header.Get(name); got != want {
+			t.Errorf("header %q = %q, want %q", name, got, want)
+		}
+	}
+	closeHTTPResponse(response)
+}
+
+func TestResponsesTransportWrapped401RefreshesOnce(t *testing.T) {
+	keys := testCredentialKeys(t)
+	credentialPath := t.TempDir() + "/credential.enc"
+	if err := SaveCredential(credentialPath, Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		AccountID:    "transport-account",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}, keys); err != nil {
+		t.Fatal(err)
+	}
+	var websocketRequests atomic.Int32
+	var refreshRequests atomic.Int32
+	var wrongToken atomic.Bool
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/oauth/token" {
+			refreshRequests.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
+			return
+		}
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		if websocketRequests.Add(1) == 1 {
+			_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"error","status":401,"error":{"code":"token_expired","message":"private auth detail"}}`))
+			return
+		}
+		if request.Header.Get(AuthorizationHeader) != "Bearer new-access" {
+			wrongToken.Store(true)
+		}
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	})
+	defer server.Close()
+	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, err := NewResponsesTransport(ResponsesTransportOptions{
+		Policy:       ResponsesTransportWebSocketPreferred,
+		ResponsesURL: server.URL,
+		WebSocketURL: "ws" + strings.TrimPrefix(server.URL, "http"),
+		HTTPClient:   server.Client(),
+		Refresher:    refresher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	if err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	if result.TerminalType != CodexEventResponseDone {
+		t.Fatalf("terminal type = %q, want %q", result.TerminalType, CodexEventResponseDone)
+	}
+	if websocketRequests.Load() != 2 {
+		t.Fatalf("WebSocket requests = %d, want 2", websocketRequests.Load())
+	}
+	if refreshRequests.Load() != 1 {
+		t.Fatalf("refresh requests = %d, want 1", refreshRequests.Load())
+	}
+	if wrongToken.Load() {
+		t.Fatal("refreshed access token was not used")
+	}
+}
+
+func TestResponsesTransportDoesNotRefreshWrapped401AfterOutput(t *testing.T) {
+	keys := testCredentialKeys(t)
+	credentialPath := t.TempDir() + "/credential.enc"
+	if err := SaveCredential(credentialPath, Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		AccountID:    "transport-account",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}, keys); err != nil {
+		t.Fatal(err)
+	}
+	var refreshRequests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/oauth/token" {
+			refreshRequests.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"access_token":"unexpected","refresh_token":"unexpected","expires_in":3600}`)
+			return
+		}
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.output_text.delta","delta":"visible output"}`))
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"error","status":401,"error":{"code":"token_expired","message":"private auth detail"}}`))
+	})
+	defer server.Close()
+	refresher, err := NewRefresher(credentialPath, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, err := NewResponsesTransport(ResponsesTransportOptions{
+		Policy:       ResponsesTransportWebSocketPreferred,
+		ResponsesURL: server.URL,
+		WebSocketURL: "ws" + strings.TrimPrefix(server.URL, "http"),
+		HTTPClient:   server.Client(),
+		Refresher:    refresher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	var safeErr *SafeError
+	if !errors.As(err, &safeErr) || safeErr.Category != CategoryAuthentication || safeErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("error = %#v, want authentication SafeError", err)
+	}
+	if strings.Contains(err.Error(), "private") {
+		t.Fatalf("error exposes private detail: %v", err)
+	}
+	if refreshRequests.Load() != 0 {
+		t.Fatalf("refresh requests = %d, want 0", refreshRequests.Load())
+	}
+}
+
+func TestResponsesTransportHTTPClientTimeoutBoundsWebSocketAttempt(t *testing.T) {
+	var sseRequests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			sseRequests.Add(1)
+			return
+		}
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		frame := []byte(`{"type":"response.metadata","metadata":{"state":"still-running"}}`)
+		for {
+			if err := connection.Write(context.Background(), coderwebsocket.MessageText, frame); err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	defer server.Close()
+	client := &http.Client{
+		Transport: server.Client().Transport,
+		Timeout:   120 * time.Millisecond,
+	}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+	start := time.Now()
+	_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want client timeout", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("timeout elapsed = %s, want under 1s", elapsed)
+	}
+	if sseRequests.Load() != 0 {
+		t.Fatalf("SSE requests = %d, want 0 after client timeout", sseRequests.Load())
+	}
+}
+
+func TestResponsesTransportZeroHTTPClientTimeoutStillReadsWebSocket(t *testing.T) {
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		if _, _, err := connection.Read(context.Background()); err != nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+		_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	})
+	defer server.Close()
+	client := &http.Client{Transport: server.Client().Transport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+	result, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	if err != nil {
+		t.Fatalf("transport.Do: %v", err)
+	}
+	if result.TerminalType != CodexEventResponseDone {
+		t.Fatalf("terminal type = %q, want %q", result.TerminalType, CodexEventResponseDone)
 	}
 }
 
