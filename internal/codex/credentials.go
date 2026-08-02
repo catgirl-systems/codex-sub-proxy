@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
@@ -27,6 +28,8 @@ const (
 	maxCredentialFileBytes = envelope.MaxEnvelopeSize
 	maxTokenBytes          = 64 << 10
 )
+
+var credentialSaveMu sync.Mutex
 
 // Credential contains Codex OAuth material and its non-secret identity.
 // SaveCredential encrypts the credential before it writes it to disk.
@@ -157,6 +160,42 @@ func SaveCredential(path string, credential Credential, keys envelope.KeySet) er
 	if err != nil {
 		return err
 	}
+	credentialSaveMu.Lock()
+	defer credentialSaveMu.Unlock()
+	return writeCredential(path, encoded)
+}
+
+func saveCredentialIfUnchanged(path string, expected, replacement Credential, keys envelope.KeySet) (Credential, bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return Credential{}, false, errors.New("credential path is empty")
+	}
+	if err := keys.Validate(); err != nil {
+		return Credential{}, false, err
+	}
+	if err := validateCredential(replacement, false); err != nil {
+		return Credential{}, false, err
+	}
+	encoded, err := EncryptCredential(replacement, keys)
+	if err != nil {
+		return Credential{}, false, err
+	}
+	credentialSaveMu.Lock()
+	defer credentialSaveMu.Unlock()
+	current, err := loadCredential(path, keys)
+	if err != nil {
+		return Credential{}, false, err
+	}
+	if !sameCredential(current, expected) {
+		return current, false, nil
+	}
+	if err := writeCredential(path, encoded); err != nil {
+		return Credential{}, false, err
+	}
+	return replacement, true, nil
+}
+
+func writeCredential(path string, encoded []byte) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create credential directory: %w", err)
@@ -215,6 +254,10 @@ func LoadCredential(path string, keys envelope.KeySet) (Credential, error) {
 	if err := keys.Validate(); err != nil {
 		return Credential{}, err
 	}
+	return loadCredential(path, keys)
+}
+
+func loadCredential(path string, keys envelope.KeySet) (Credential, error) {
 	data, err := readRegularFile(path, maxCredentialFileBytes)
 	if err != nil {
 		return Credential{}, err

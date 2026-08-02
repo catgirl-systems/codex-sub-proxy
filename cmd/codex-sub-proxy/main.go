@@ -85,22 +85,21 @@ func run(args []string) error {
 
 	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
 	keysReady = keysReady && payloadErr == nil && credentialErr == nil
-	var credentialAvailable func() bool
-	var credentialStatus func() string
+	var credentialSnapshot func() server.CredentialSnapshot
 	if credentialErr == nil {
 		if credentialPath, expandErr := config.ExpandPath(cfg.Codex.CredentialFile); expandErr == nil {
-			credentialAvailable = func() bool {
-				return codex.CredentialAvailable(credentialPath, credentialKeys)
-			}
 			if refresher, refreshErr := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{}); refreshErr == nil {
-				credentialAvailable = refresher.Available
-				credentialStatus = func() string {
-					return string(refresher.Status())
+				credentialSnapshot = func() server.CredentialSnapshot {
+					snapshot := refresher.Snapshot()
+					return server.CredentialSnapshot{
+						Available: snapshot.Available,
+						State:     string(snapshot.State),
+					}
 				}
 			}
 		}
 	}
-	readiness.SetWithStatus(storageReady, keysReady, credentialAvailable, credentialStatus)
+	readiness.Set(storageReady, keysReady, credentialSnapshot)
 
 	servers, err := server.Start(server.Config{
 		Listen:      cfg.Server.Listen,

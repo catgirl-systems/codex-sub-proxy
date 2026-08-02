@@ -9,12 +9,16 @@ import (
 	"github.com/kataras/iris/v12"
 )
 
+type CredentialSnapshot struct {
+	Available bool
+	State     string
+}
+
 type Readiness struct {
-	mu                  sync.RWMutex
-	storage             bool
-	keys                bool
-	credentialAvailable func() bool
-	credentialStatus    func() string
+	mu                 sync.RWMutex
+	storage            bool
+	keys               bool
+	credentialSnapshot func() CredentialSnapshot
 }
 
 type ReadinessSnapshot struct {
@@ -28,17 +32,12 @@ func NewReadiness() *Readiness {
 	return &Readiness{}
 }
 
-func (r *Readiness) Set(storage, keys bool, credentialAvailable func() bool) {
-	r.SetWithStatus(storage, keys, credentialAvailable, nil)
-}
-
-// SetWithStatus sets health checks and a non-secret credential state callback.
-func (r *Readiness) SetWithStatus(storage, keys bool, credentialAvailable func() bool, credentialStatus func() string) {
+// Set records fixed checks and one coherent credential observation callback.
+func (r *Readiness) Set(storage, keys bool, credential func() CredentialSnapshot) {
 	r.mu.Lock()
 	r.storage = storage
 	r.keys = keys
-	r.credentialAvailable = credentialAvailable
-	r.credentialStatus = credentialStatus
+	r.credentialSnapshot = credential
 	r.mu.Unlock()
 }
 
@@ -48,14 +47,12 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 		Storage: r.storage,
 		Keys:    r.keys,
 	}
-	credentialAvailable := r.credentialAvailable
-	credentialStatus := r.credentialStatus
+	credential := r.credentialSnapshot
 	r.mu.RUnlock()
-	if credentialAvailable != nil {
-		snapshot.UpstreamAuth = credentialAvailable()
-	}
-	if credentialStatus != nil {
-		snapshot.CredentialState = credentialStatus()
+	if credential != nil {
+		current := credential()
+		snapshot.UpstreamAuth = current.Available
+		snapshot.CredentialState = current.State
 	}
 	return snapshot
 }

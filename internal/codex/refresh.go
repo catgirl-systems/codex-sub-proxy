@@ -13,7 +13,10 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
-const refreshSkew = 5 * time.Minute
+const (
+	refreshSkew             = 5 * time.Minute
+	refreshOperationTimeout = 15 * time.Second
+)
 
 // CredentialStatus describes the current credential state without secret data.
 type CredentialStatus string
@@ -27,6 +30,12 @@ const (
 	CredentialStatusTransientFailure CredentialStatus = "transient_failure"
 	CredentialStatusPermanentFailure CredentialStatus = "permanent_failure"
 )
+
+// CredentialSnapshot is one coherent readiness observation.
+type CredentialSnapshot struct {
+	Available bool
+	State     CredentialStatus
+}
 
 // RefresherOptions selects the OAuth endpoint and HTTP client.
 type RefresherOptions struct {
@@ -160,57 +169,63 @@ func (r *Refresher) Credential(ctx context.Context) (Credential, error) {
 	return r.refreshSingleFlight(ctx, false, credential)
 }
 
+// Snapshot reports availability and state from one credential observation.
+func (r *Refresher) Snapshot() CredentialSnapshot {
+	credential, err := LoadCredential(r.path, r.keys)
+	now := time.Now()
+	r.mu.Lock()
+	inFlight := r.inFlight != nil
+	permanentToken := r.permanentToken
+	transientToken := r.transientToken
+	if err == nil {
+		if permanentToken != "" && permanentToken != credential.RefreshToken {
+			r.permanentToken = ""
+			permanentToken = ""
+		}
+		if transientToken != "" && transientToken != credential.RefreshToken {
+			r.transientToken = ""
+			transientToken = ""
+		}
+	}
+	r.mu.Unlock()
+	if err != nil {
+		return CredentialSnapshot{State: CredentialStatusMissing}
+	}
+	available := credentialAvailableAt(credential, now)
+	if permanentToken != "" && permanentToken == credential.RefreshToken {
+		return CredentialSnapshot{Available: false, State: CredentialStatusPermanentFailure}
+	}
+	if inFlight {
+		return CredentialSnapshot{Available: available, State: CredentialStatusRefreshing}
+	}
+	if transientToken != "" && transientToken == credential.RefreshToken {
+		return CredentialSnapshot{Available: available, State: CredentialStatusTransientFailure}
+	}
+	if credential.ExpiresAt.IsZero() || !credential.ExpiresAt.After(now) {
+		return CredentialSnapshot{Available: false, State: CredentialStatusExpired}
+	}
+	if !credential.ExpiresAt.After(now.Add(refreshSkew)) {
+		return CredentialSnapshot{Available: available, State: CredentialStatusRefreshable}
+	}
+	return CredentialSnapshot{Available: available, State: CredentialStatusCurrent}
+}
+
 // Available reports whether a non-expired credential can serve a request now.
 func (r *Refresher) Available() bool {
-	credential, err := LoadCredential(r.path, r.keys)
-	if err != nil {
-		return false
-	}
-	r.clearChangedFailures(credential)
-	if r.hasPermanentFailure(credential) {
-		return false
-	}
-	return credential.AccountID != "" && credential.ExpiresAt.After(time.Now())
+	return r.Snapshot().Available
 }
 
 // Status reports credential readiness without returning token material.
 func (r *Refresher) Status() CredentialStatus {
-	credential, err := LoadCredential(r.path, r.keys)
-	r.mu.Lock()
-	inFlight := r.inFlight != nil
-	permanent := r.permanentToken != ""
-	transient := r.transientToken != ""
-	if err == nil {
-		if permanent && credential.RefreshToken != r.permanentToken {
-			r.permanentToken = ""
-			permanent = false
-		}
-		if transient && credential.RefreshToken != r.transientToken {
-			r.transientToken = ""
-			transient = false
-		}
-	}
-	r.mu.Unlock()
-	if inFlight {
-		return CredentialStatusRefreshing
-	}
-	if err != nil {
-		return CredentialStatusMissing
-	}
-	if permanent {
-		return CredentialStatusPermanentFailure
-	}
-	if transient {
-		return CredentialStatusTransientFailure
-	}
-	now := time.Now()
-	if credential.ExpiresAt.IsZero() || !credential.ExpiresAt.After(now) {
-		return CredentialStatusExpired
-	}
-	if !credential.ExpiresAt.After(now.Add(refreshSkew)) {
-		return CredentialStatusRefreshable
-	}
-	return CredentialStatusCurrent
+	return r.Snapshot().State
+}
+
+func credentialAvailableAt(credential Credential, now time.Time) bool {
+	return strings.TrimSpace(credential.AccessToken) != "" &&
+		strings.TrimSpace(credential.RefreshToken) != "" &&
+		strings.TrimSpace(credential.AccountID) != "" &&
+		!credential.ExpiresAt.IsZero() &&
+		credential.ExpiresAt.After(now)
 }
 
 // Do sends one request and retries it once after a 401 when replaySafe is true.
@@ -279,25 +294,32 @@ func (r *Refresher) refreshSingleFlight(ctx context.Context, force bool, observe
 	call := &refreshCall{done: make(chan struct{})}
 	r.inFlight = call
 	r.mu.Unlock()
+	go r.runRefresh(call, force, observed)
+	return waitForRefresh(ctx, call)
+}
 
-	credential, err := LoadCredential(r.path, r.keys)
+func (r *Refresher) runRefresh(call *refreshCall, force bool, observed Credential) {
+	operationContext, cancel := context.WithTimeout(context.Background(), refreshOperationTimeout)
+	defer cancel()
+	source, err := LoadCredential(r.path, r.keys)
 	if err == nil {
-		r.clearChangedFailures(credential)
-		if r.hasPermanentFailure(credential) {
+		r.clearChangedFailures(source)
+		if r.hasPermanentFailure(source) {
 			err = ErrRefreshRequiresLogin
-		} else if (force && !sameCredential(credential, observed)) || (!force && !r.needsRefresh(credential)) {
-			call.credential = credential
+		} else if (force && !sameCredential(source, observed)) || (!force && !r.needsRefresh(source)) {
+			r.finishRefresh(call, source, nil, source)
+			return
 		}
 	}
-	if err == nil && call.credential.AccessToken == "" {
-		call.credential, err = r.refresh(ctx, credential)
+	if err == nil {
+		var credential Credential
+		credential, err = r.refresh(operationContext, source)
+		if err == nil {
+			r.finishRefresh(call, credential, nil, source)
+			return
+		}
 	}
-	if err == nil && call.credential.AccessToken != "" {
-		r.finishRefresh(call, call.credential, nil, credential)
-		return call.credential, nil
-	}
-	r.finishRefresh(call, Credential{}, err, credential)
-	return Credential{}, err
+	r.finishRefresh(call, Credential{}, err, source)
 }
 
 func waitForRefresh(ctx context.Context, call *refreshCall) (Credential, error) {
@@ -338,12 +360,13 @@ func (r *Refresher) refresh(ctx context.Context, current Credential) (Credential
 	if err := json.Unmarshal(body, &token); err != nil {
 		return Credential{}, &RefreshError{status: response.StatusCode}
 	}
-	if token.ExpiresIn <= 0 || token.ExpiresIn > 365*24*60*60 || strings.TrimSpace(token.AccessToken) == "" {
+	if token.ExpiresIn <= 0 || token.ExpiresIn > 365*24*60*60 ||
+		strings.TrimSpace(token.AccessToken) == "" || strings.TrimSpace(token.RefreshToken) == "" {
 		return Credential{}, &RefreshError{status: response.StatusCode}
 	}
 	credential, err := buildCredential(
 		token.AccessToken,
-		firstNonEmpty(token.RefreshToken, current.RefreshToken),
+		token.RefreshToken,
 		firstNonEmpty(token.IDToken, current.IDToken),
 		time.Now().Add(time.Duration(token.ExpiresIn)*time.Second),
 		firstNonEmpty(token.AccountID, current.AccountID),
@@ -357,8 +380,12 @@ func (r *Refresher) refresh(ctx context.Context, current Credential) (Credential
 	if err != nil {
 		return Credential{}, &RefreshError{status: response.StatusCode}
 	}
-	if err := SaveCredential(r.path, credential, r.keys); err != nil {
+	stored, saved, err := saveCredentialIfUnchanged(r.path, current, credential, r.keys)
+	if err != nil {
 		return Credential{}, &RefreshError{status: response.StatusCode}
+	}
+	if !saved {
+		return stored, nil
 	}
 	return credential, nil
 }
@@ -369,7 +396,8 @@ func refreshHTTPError(status int, body []byte) error {
 		failure.Status = status
 		return &RefreshError{permanent: failure.IsPermanent(), status: status}
 	}
-	return &RefreshError{permanent: status == http.StatusUnauthorized, status: status}
+	permanent := status == http.StatusUnauthorized && !isTransientRefreshText(strings.ToLower(string(body)))
+	return &RefreshError{permanent: permanent, status: status}
 }
 
 func (r *Refresher) finishRefresh(call *refreshCall, credential Credential, err error, source Credential) {
@@ -417,5 +445,11 @@ func sameCredential(left, right Credential) bool {
 	return left.AccessToken == right.AccessToken &&
 		left.IDToken == right.IDToken &&
 		left.RefreshToken == right.RefreshToken &&
-		left.ExpiresAt.Equal(right.ExpiresAt)
+		left.ExpiresAt.Equal(right.ExpiresAt) &&
+		left.AccountID == right.AccountID &&
+		left.UserID == right.UserID &&
+		left.WorkspaceID == right.WorkspaceID &&
+		left.PlanType == right.PlanType &&
+		left.AccountIsFedRAMP == right.AccountIsFedRAMP &&
+		left.Email == right.Email
 }

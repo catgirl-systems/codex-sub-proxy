@@ -189,6 +189,312 @@ func TestRefresherCanceledWaiterDoesNotCancelRefresh(t *testing.T) {
 	}
 }
 
+func TestRefresherLeaderCancellationDoesNotCancelLiveWaiter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	original := Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+		AccountID:    "account",
+	}
+	if err := SaveCredential(path, original, keys); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if requests.Add(1) != 1 {
+			http.Error(writer, "unexpected extra refresh", http.StatusInternalServerError)
+			return
+		}
+		close(started)
+		<-release
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaderContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, leaderErr := refresher.Credential(leaderContext)
+		leaderDone <- leaderErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start")
+	}
+	waiterDone := make(chan struct {
+		credential Credential
+		err        error
+	}, 1)
+	go func() {
+		credential, waiterErr := refresher.Credential(context.Background())
+		waiterDone <- struct {
+			credential Credential
+			err        error
+		}{credential: credential, err: waiterErr}
+	}()
+	cancel()
+	select {
+	case leaderErr := <-leaderDone:
+		if !errors.Is(leaderErr, context.Canceled) {
+			t.Fatalf("leader error = %v", leaderErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled leader did not return")
+	}
+	close(release)
+	select {
+	case result := <-waiterDone:
+		if result.err != nil || result.credential.AccessToken != "new-access" {
+			t.Fatalf("waiter result = %#v, %v", result.credential, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live waiter did not return")
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("refresh requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestRefresherConcurrentCredentialReplacementWins(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	if err := SaveCredential(path, Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+		AccountID:    "account",
+	}, keys); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-release
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"access_token":"refresh-access","refresh_token":"refresh-token","expires_in":3600}`)
+	}))
+	defer server.Close()
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultDone := make(chan struct {
+		credential Credential
+		err        error
+	}, 1)
+	go func() {
+		credential, refreshErr := refresher.Credential(context.Background())
+		resultDone <- struct {
+			credential Credential
+			err        error
+		}{credential: credential, err: refreshErr}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start")
+	}
+	replacement := Credential{
+		AccessToken:  "replacement-access",
+		RefreshToken: "replacement-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		AccountID:    "account",
+	}
+	replacementDone := make(chan error, 1)
+	go func() {
+		replacementDone <- SaveCredential(path, replacement, keys)
+	}()
+	if replacementErr := <-replacementDone; replacementErr != nil {
+		t.Fatalf("replace credential: %v", replacementErr)
+	}
+	close(release)
+	select {
+	case result := <-resultDone:
+		if result.err != nil || !sameCredential(result.credential, replacement) {
+			t.Fatalf("refresh result = %#v, %v", result.credential, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not return")
+	}
+	stored, err := LoadCredential(path, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameCredential(stored, replacement) {
+		t.Fatalf("stored credential = %#v, want replacement", stored)
+	}
+}
+
+func TestRefresherRejectsMissingRotatedRefreshToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	original := Credential{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+		AccountID:    "account",
+	}
+	if err := SaveCredential(path, original, keys); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"access_token":"new-access","expires_in":3600}`)
+	}))
+	defer server.Close()
+	refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = refresher.Credential(context.Background())
+	var refreshErr *RefreshError
+	if !errors.Is(err, ErrRefreshTemporary) || !errors.As(err, &refreshErr) || refreshErr.Permanent() {
+		t.Fatalf("missing rotated token error = %v", err)
+	}
+	stored, err := LoadCredential(path, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameCredential(stored, original) {
+		t.Fatalf("stored credential = %#v, want original", stored)
+	}
+}
+
+func TestRefresherPlainTextUnauthorizedClassification(t *testing.T) {
+	t.Run("transient", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "credential.enc")
+		keys := testCredentialKeys(t)
+		if err := SaveCredential(path, Credential{
+			AccessToken:  "old-access",
+			RefreshToken: "old-refresh",
+			ExpiresAt:    time.Now().Add(-time.Minute),
+			AccountID:    "account",
+		}, keys); err != nil {
+			t.Fatal(err)
+		}
+		var requests atomic.Int32
+		secret := "plain-text-secret"
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if requests.Add(1) == 1 {
+				http.Error(writer, "upstream timeout "+secret, http.StatusUnauthorized)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`)
+		}))
+		defer server.Close()
+		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = refresher.Credential(context.Background())
+		if !errors.Is(err, ErrRefreshTemporary) || strings.Contains(err.Error(), secret) {
+			t.Fatalf("transient plain-text error = %v", err)
+		}
+		if got := refresher.Status(); got != CredentialStatusTransientFailure {
+			t.Fatalf("transient plain-text status = %q", got)
+		}
+		if credential, retryErr := refresher.Credential(context.Background()); retryErr != nil || credential.AccessToken != "new-access" {
+			t.Fatalf("transient plain-text retry = %#v, %v", credential, retryErr)
+		}
+		if requests.Load() != 2 {
+			t.Fatalf("transient plain-text requests = %d, want 2", requests.Load())
+		}
+	})
+
+	t.Run("permanent", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "credential.enc")
+		keys := testCredentialKeys(t)
+		if err := SaveCredential(path, Credential{
+			AccessToken:  "old-access",
+			RefreshToken: "old-refresh",
+			ExpiresAt:    time.Now().Add(-time.Minute),
+			AccountID:    "account",
+		}, keys); err != nil {
+			t.Fatal(err)
+		}
+		var requests atomic.Int32
+		secret := "plain-text-secret"
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			requests.Add(1)
+			http.Error(writer, "invalid grant "+secret, http.StatusUnauthorized)
+		}))
+		defer server.Close()
+		refresher, err := NewRefresher(path, keys, RefresherOptions{Issuer: server.URL, HTTPClient: server.Client()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = refresher.Credential(context.Background())
+		var refreshErr *RefreshError
+		if !errors.Is(err, ErrRefreshRequiresLogin) || !errors.As(err, &refreshErr) || !refreshErr.Permanent() || strings.Contains(err.Error(), secret) {
+			t.Fatalf("permanent plain-text error = %v", err)
+		}
+		if got := refresher.Status(); got != CredentialStatusPermanentFailure {
+			t.Fatalf("permanent plain-text status = %q", got)
+		}
+		_, err = refresher.Credential(context.Background())
+		if !errors.Is(err, ErrRefreshRequiresLogin) || requests.Load() != 1 {
+			t.Fatalf("permanent plain-text retry = %v, requests = %d", err, requests.Load())
+		}
+	})
+}
+
+func TestRefresherSnapshotTransitions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	refresher, err := NewRefresher(path, keys, RefresherOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := Credential{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		AccountID:    "account",
+	}
+	if err := SaveCredential(path, credential, keys); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := refresher.Snapshot()
+	if !snapshot.Available || snapshot.State != CredentialStatusCurrent {
+		t.Fatalf("current snapshot = %+v", snapshot)
+	}
+	credential.ExpiresAt = time.Now().Add(time.Minute)
+	if err := SaveCredential(path, credential, keys); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = refresher.Snapshot()
+	if !snapshot.Available || snapshot.State != CredentialStatusRefreshable {
+		t.Fatalf("refreshable snapshot = %+v", snapshot)
+	}
+	credential.ExpiresAt = time.Now().Add(-time.Minute)
+	if err := SaveCredential(path, credential, keys); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = refresher.Snapshot()
+	if snapshot.Available || snapshot.State != CredentialStatusExpired {
+		t.Fatalf("expired snapshot = %+v", snapshot)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = refresher.Snapshot()
+	if snapshot.Available || snapshot.State != CredentialStatusMissing {
+		t.Fatalf("missing snapshot = %+v", snapshot)
+	}
+}
+
 func TestRefresherPermanentAndTransientFailures(t *testing.T) {
 	t.Run("permanent", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "credential.enc")

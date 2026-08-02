@@ -41,7 +41,7 @@ func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 	checkReadiness(t, client, "http://"+servers.DataAddr()+"/readyz", http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{})
 	checkReadiness(t, client, "http://"+servers.AdminAddr()+"/readyz", http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{})
 
-	readiness.Set(true, true, func() bool { return true })
+	readiness.Set(true, true, func() CredentialSnapshot { return CredentialSnapshot{Available: true} })
 	checkReadiness(t, client, "http://"+servers.DataAddr()+"/readyz", http.StatusOK, "ready", ReadinessSnapshot{
 		Storage:      true,
 		Keys:         true,
@@ -53,10 +53,26 @@ func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 		UpstreamAuth: true,
 	})
 }
+func TestReadinessConsumesOneCredentialSnapshot(t *testing.T) {
+	readiness := NewReadiness()
+	var calls int
+	readiness.Set(true, true, func() CredentialSnapshot {
+		calls++
+		return CredentialSnapshot{Available: true, State: "current"}
+	})
+	snapshot := readiness.Snapshot()
+	if calls != 1 {
+		t.Fatalf("credential snapshot calls = %d, want 1", calls)
+	}
+	if !snapshot.Ready() || snapshot.CredentialState != "current" {
+		t.Fatalf("readiness snapshot = %+v", snapshot)
+	}
+}
+
 func TestReadinessReportsCredentialState(t *testing.T) {
 	readiness := NewReadiness()
-	readiness.SetWithStatus(true, true, func() bool { return true }, func() string {
-		return "refreshing"
+	readiness.Set(true, true, func() CredentialSnapshot {
+		return CredentialSnapshot{Available: true, State: "refreshing"}
 	})
 	snapshot := readiness.Snapshot()
 	if snapshot.CredentialState != "refreshing" || !snapshot.Ready() {
@@ -78,8 +94,13 @@ func TestReadinessReflectsCredentialChanges(t *testing.T) {
 	}
 
 	readiness := NewReadiness()
-	readiness.Set(true, true, func() bool {
-		return codex.CredentialAvailable(credentialPath, credentialKey)
+	refresher, err := codex.NewRefresher(credentialPath, credentialKey, codex.RefresherOptions{})
+	if err != nil {
+		t.Fatalf("new refresher: %v", err)
+	}
+	readiness.Set(true, true, func() CredentialSnapshot {
+		snapshot := refresher.Snapshot()
+		return CredentialSnapshot{Available: snapshot.Available, State: string(snapshot.State)}
 	})
 	servers, err := Start(Config{
 		Listen:      "127.0.0.1:0",
@@ -99,17 +120,19 @@ func TestReadinessReflectsCredentialChanges(t *testing.T) {
 	client := &http.Client{Timeout: time.Second}
 	url := "http://" + servers.DataAddr() + "/readyz"
 	checkReadiness(t, client, url, http.StatusOK, "ready", ReadinessSnapshot{
-		Storage:      true,
-		Keys:         true,
-		UpstreamAuth: true,
+		Storage:         true,
+		Keys:            true,
+		UpstreamAuth:    true,
+		CredentialState: "current",
 	})
 
 	if err := os.Remove(credentialPath); err != nil {
 		t.Fatalf("remove credential: %v", err)
 	}
 	checkReadiness(t, client, url, http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{
-		Storage: true,
-		Keys:    true,
+		Storage:         true,
+		Keys:            true,
+		CredentialState: "missing",
 	})
 
 	credential.ExpiresAt = time.Now().Add(-time.Second)
@@ -117,8 +140,9 @@ func TestReadinessReflectsCredentialChanges(t *testing.T) {
 		t.Fatalf("save expired credential: %v", err)
 	}
 	checkReadiness(t, client, url, http.StatusServiceUnavailable, "unavailable", ReadinessSnapshot{
-		Storage: true,
-		Keys:    true,
+		Storage:         true,
+		Keys:            true,
+		CredentialState: "expired",
 	})
 
 	credential.ExpiresAt = time.Now().Add(time.Hour)
@@ -126,9 +150,10 @@ func TestReadinessReflectsCredentialChanges(t *testing.T) {
 		t.Fatalf("restore credential: %v", err)
 	}
 	checkReadiness(t, client, url, http.StatusOK, "ready", ReadinessSnapshot{
-		Storage:      true,
-		Keys:         true,
-		UpstreamAuth: true,
+		Storage:         true,
+		Keys:            true,
+		UpstreamAuth:    true,
+		CredentialState: "current",
 	})
 }
 
