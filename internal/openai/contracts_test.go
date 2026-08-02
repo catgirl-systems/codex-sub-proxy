@@ -75,8 +75,50 @@ func TestPublicResponsesSSEFixtureDecodesTypedEvents(t *testing.T) {
 	if len(events) != 4 || events[len(events)-1].Type != EventCompleted {
 		t.Fatalf("SSE events = %#v", events)
 	}
+	if events[0].SequenceNumber != 0 || events[1].SequenceNumber != 1 || events[2].OutputIndex != 0 ||
+		events[3].SequenceNumber != 3 {
+		t.Fatalf("SSE coordinates = %#v", events)
+	}
 	if events[2].Item == nil || events[2].Item.Type != ImageGenerationCall {
 		t.Fatalf("image event = %#v", events[2])
+	}
+	for _, event := range events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("encode SSE event: %v", err)
+		}
+		var roundTrip ResponseStreamEvent
+		if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+			t.Fatalf("decode encoded SSE event: %v", err)
+		}
+		if roundTrip.SequenceNumber != event.SequenceNumber || roundTrip.OutputIndex != event.OutputIndex ||
+			roundTrip.ContentIndex != event.ContentIndex {
+			t.Fatalf("round-trip SSE coordinates = %#v", roundTrip)
+		}
+	}
+}
+
+func TestPublicStreamCoordinatesRoundTripIncludingZero(t *testing.T) {
+	raw := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"synthetic-item","output_index":0,"content_index":0,"delta":"synthetic output"}`)
+	var event ResponseStreamEvent
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatalf("decode stream event: %v", err)
+	}
+	if event.SequenceNumber != 0 || event.OutputIndex != 0 || event.ContentIndex != 0 {
+		t.Fatalf("stream coordinates = %#v", event)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("encode stream event: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode encoded stream event: %v", err)
+	}
+	for _, name := range []string{"sequence_number", "output_index", "content_index"} {
+		if string(fields[name]) != "0" {
+			t.Fatalf("encoded %s = %s", name, fields[name])
+		}
 	}
 }
 
@@ -167,6 +209,39 @@ func TestPublicImageFixturesDecode(t *testing.T) {
 		}
 	}
 }
+func TestPublicFixtureCredentialPatternsCatchCommonSentinels(t *testing.T) {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`),
+		regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._\-]{8,}`),
+		regexp.MustCompile(`(?i)\b(?:sk|rk|pk|gh[pousr]|github_pat|xox[baprs])[-_][a-z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)\bAKIA[0-9A-Z]{16}\b`),
+		regexp.MustCompile(`eyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)"(?:access|refresh|api)[_-]?token"\s*:\s*"[^"]{12,}"`),
+		regexp.MustCompile(`(?i)"(?:client[_-]?secret|(?:api|access|refresh)[_-]?(?:key|token)|private[_-]?key|credentials?|password|passwd|secret|token)"\s*:\s*"[^"]{8,}"`),
+		regexp.MustCompile(`(?i)(?:"(?:cookie|set[_-]?cookie|session(?:[_-]?id)?)"\s*:\s*"[^"]{8,}"|\b(?:cookie|set-cookie|session(?:[-_ ]?id)?)\s*[:=]\s*[^\s"';,]{8,})`),
+	}
+	sentinels := []string{
+		`"client_secret":"synthetic-client-secret-value"`,
+		`"credential":"synthetic-credential-value"`,
+		`Cookie: session=synthetic-session-value`,
+		`"cookie":"synthetic-cookie-value"`,
+		"AKIA1234567890ABCDEF",
+		"ghp_syntheticgithubtokenvalue",
+		"github_pat_syntheticgithubtokenvalue",
+	}
+	for _, sentinel := range sentinels {
+		matched := false
+		for _, pattern := range patterns {
+			if pattern.MatchString(sentinel) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("credential sentinel was not detected: %q", sentinel)
+		}
+	}
+}
 
 func TestPublicUsageAndErrorFixturesDecode(t *testing.T) {
 	raw, err := os.ReadFile("testdata/usage.json")
@@ -209,9 +284,12 @@ func TestPublicFixturesContainNoCredentialPatterns(t *testing.T) {
 	patterns := []*regexp.Regexp{
 		regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`),
 		regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._\-]{8,}`),
-		regexp.MustCompile(`(?i)\b(?:sk|rk|pk|ghp|github_pat|xox[baprs])[-_][a-z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)\b(?:sk|rk|pk|gh[pousr]|github_pat|xox[baprs])[-_][a-z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)\bAKIA[0-9A-Z]{16}\b`),
 		regexp.MustCompile(`eyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}`),
 		regexp.MustCompile(`(?i)"(?:access|refresh|api)[_-]?token"\s*:\s*"[^"]{12,}"`),
+		regexp.MustCompile(`(?i)"(?:client[_-]?secret|(?:api|access|refresh)[_-]?(?:key|token)|private[_-]?key|credentials?|password|passwd|secret|token)"\s*:\s*"[^"]{8,}"`),
+		regexp.MustCompile(`(?i)(?:"(?:cookie|set[_-]?cookie|session(?:[_-]?id)?)"\s*:\s*"[^"]{8,}"|\b(?:cookie|set-cookie|session(?:[-_ ]?id)?)\s*[:=]\s*[^\s"';,]{8,})`),
 	}
 	for _, name := range fixtureNames {
 		raw, err := os.ReadFile("testdata/" + name)

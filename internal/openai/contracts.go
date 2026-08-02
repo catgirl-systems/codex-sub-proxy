@@ -133,17 +133,19 @@ type IncompleteDetails struct {
 
 // ResponseStreamEvent is one public Responses SSE event.
 type ResponseStreamEvent struct {
-	Type        string       `json:"type"`
-	Response    *Response    `json:"response,omitempty"`
-	Item        *OutputItem  `json:"item,omitempty"`
-	Part        *ContentPart `json:"part,omitempty"`
-	Error       *Error       `json:"error,omitempty"`
-	Delta       string       `json:"delta,omitempty"`
-	Text        string       `json:"text,omitempty"`
-	Code        string       `json:"code,omitempty"`
-	Message     string       `json:"message,omitempty"`
-	ItemID      string       `json:"item_id,omitempty"`
-	OutputIndex int          `json:"output_index,omitempty"`
+	Type           string       `json:"type"`
+	SequenceNumber int          `json:"sequence_number"`
+	Response       *Response    `json:"response,omitempty"`
+	Item           *OutputItem  `json:"item,omitempty"`
+	Part           *ContentPart `json:"part,omitempty"`
+	Error          *Error       `json:"error,omitempty"`
+	Delta          string       `json:"delta,omitempty"`
+	Text           string       `json:"text,omitempty"`
+	Code           string       `json:"code,omitempty"`
+	Message        string       `json:"message,omitempty"`
+	ItemID         string       `json:"item_id,omitempty"`
+	OutputIndex    int          `json:"output_index"`
+	ContentIndex   int          `json:"content_index"`
 }
 
 // Usage records public token counts.

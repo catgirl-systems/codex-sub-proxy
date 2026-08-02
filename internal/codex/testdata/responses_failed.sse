@@ -1,6 +1,6 @@
-data: {"type":"response.created","response":{"id":"resp_fixture_003","object":"response","created_at":1738888890,"model":"gpt-5.6-sol","status":"in_progress"}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture_003","object":"response","created_at":1738888890,"model":"gpt-5.6-sol","status":"in_progress"}}
 
-data: {"type":"response.failed","response":{"id":"resp_fixture_003","object":"response","created_at":1738888890,"model":"gpt-5.6-sol","status":"failed","error":{"code":"server_error","type":"server_error","message":"synthetic upstream failure"}}}
+data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_fixture_003","object":"response","created_at":1738888890,"model":"gpt-5.6-sol","status":"failed","error":{"code":"server_error","type":"server_error","message":"synthetic upstream failure"}}}
 
 data: [DONE]
 

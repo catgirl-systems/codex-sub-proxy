@@ -96,6 +96,14 @@ func TestCodexResponsesFailedFixtureReturnsTypedFailure(t *testing.T) {
 	if !errors.As(err, &failure) || !errors.Is(err, ErrCodexStreamFailed) {
 		t.Fatalf("error = %v", err)
 	}
+	if failure.Category != "response_failed" || failure.Status != CodexResponseStatusFailed {
+		t.Fatalf("safe failure = %#v", failure)
+	}
+	if encoded, marshalErr := json.Marshal(failure); marshalErr != nil {
+		t.Fatalf("encode safe failure: %v", marshalErr)
+	} else if strings.Contains(string(encoded), "synthetic upstream failure") {
+		t.Fatal("errors.As exposed private provider message")
+	}
 	if result.TerminalType != CodexEventResponseFailed || result.Response == nil || result.Response.Error == nil {
 		t.Fatalf("failed result = %#v", result)
 	}
@@ -145,12 +153,41 @@ func TestCodexWebSocketFixtureRoundTrips(t *testing.T) {
 	if result.Response.Status != CodexResponseStatusCompleted || len(result.Events) != 6 {
 		t.Fatalf("WebSocket events = %#v", result.Events)
 	}
+	if result.Events[0].SequenceNumber != 0 || result.Events[1].OutputIndex != 0 ||
+		result.Events[2].ContentIndex != 0 {
+		t.Fatalf("WebSocket coordinates = %#v", result.Events[:3])
+	}
 	encoded, err := json.Marshal(result.Events[len(result.Events)-1])
 	if err != nil {
 		t.Fatalf("encode WebSocket event: %v", err)
 	}
 	if _, err := DecodeCodexWebSocketFrame(encoded); err != nil {
 		t.Fatalf("decode encoded WebSocket event: %v", err)
+	}
+}
+func TestCodexStreamPayloadBudgetAppliesToSSEAndWebSocket(t *testing.T) {
+	event := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("x", 200*1024) + `"}`
+	frame := []byte(event)
+	if len(frame) >= maxCodexStreamLineBytes {
+		t.Fatalf("test frame is too large: %d", len(frame))
+	}
+	frameCount := maxCodexStreamPayloadBytes/len(frame) + 1
+	frames := make([][]byte, frameCount)
+	for index := range frames {
+		frames[index] = frame
+	}
+	if _, err := ParseCodexWebSocketFrames(frames); !errors.Is(err, ErrCodexStreamMalformed) {
+		t.Fatalf("WebSocket aggregate limit error = %v", err)
+	}
+
+	var sse strings.Builder
+	for range frames {
+		sse.WriteString("data: ")
+		sse.WriteString(event)
+		sse.WriteString("\n\n")
+	}
+	if _, err := ParseCodexResponsesSSE(strings.NewReader(sse.String())); !errors.Is(err, ErrCodexStreamMalformed) {
+		t.Fatalf("SSE aggregate limit error = %v", err)
 	}
 }
 
@@ -278,6 +315,67 @@ func TestCodexTransientRefreshFixtureIsNotPermanent(t *testing.T) {
 		t.Fatalf("transient refresh failure is permanent: %#v", failure)
 	}
 }
+func TestCodexRefreshFailureClassificationMatchesOMP(t *testing.T) {
+	tests := []struct {
+		name      string
+		failure   CodexRefreshFailure
+		permanent bool
+	}{
+		{name: "invalid grant", failure: CodexRefreshFailure{Error: "invalid_grant", Status: 400}, permanent: true},
+		{name: "invalid token", failure: CodexRefreshFailure{Error: "invalid_token", Status: 400}, permanent: true},
+		{name: "unauthorized client", failure: CodexRefreshFailure{Error: "unauthorized_client", Status: 400}, permanent: true},
+		{name: "revoked refresh token", failure: CodexRefreshFailure{ErrorDescription: "Refresh token revoked", Status: 400}, permanent: true},
+		{name: "expired refresh token", failure: CodexRefreshFailure{ErrorDescription: "Refresh token expired", Status: 400}, permanent: true},
+		{name: "bare unauthorized", failure: CodexRefreshFailure{Status: 401}, permanent: true},
+		{name: "temporary unavailable", failure: CodexRefreshFailure{Error: "temporarily_unavailable", Status: 503}, permanent: false},
+		{name: "service unavailable", failure: CodexRefreshFailure{ErrorDescription: "refresh service is unavailable", Status: 503}, permanent: false},
+		{name: "rate limited unauthorized", failure: CodexRefreshFailure{ErrorDescription: "401 unauthorized: too many requests", Status: 401}, permanent: false},
+		{name: "network timeout unauthorized", failure: CodexRefreshFailure{ErrorDescription: "network timeout", Status: 401}, permanent: false},
+		{name: "forbidden", failure: CodexRefreshFailure{ErrorDescription: "403 forbidden", Status: 403}, permanent: false},
+		{name: "gateway", failure: CodexRefreshFailure{ErrorDescription: "502 bad gateway", Status: 502}, permanent: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.failure.IsPermanent(); got != test.permanent {
+				t.Fatalf("IsPermanent() = %t, want %t for %#v", got, test.permanent, test.failure)
+			}
+		})
+	}
+}
+
+func TestCodexFixtureCredentialPatternsCatchCommonSentinels(t *testing.T) {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`),
+		regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._\-]{8,}`),
+		regexp.MustCompile(`(?i)\b(?:sk|rk|pk|gh[pousr]|github_pat|xox[baprs])[-_][a-z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)\bAKIA[0-9A-Z]{16}\b`),
+		regexp.MustCompile(`eyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)"(?:access|refresh|api)[_-]?token"\s*:\s*"[^"]{12,}"`),
+		regexp.MustCompile(`(?i)"(?:client[_-]?secret|(?:api|access|refresh)[_-]?(?:key|token)|private[_-]?key|credentials?|password|passwd|secret|token)"\s*:\s*"[^"]{8,}"`),
+		regexp.MustCompile(`(?i)(?:"(?:cookie|set[_-]?cookie|session(?:[_-]?id)?)"\s*:\s*"[^"]{8,}"|\b(?:cookie|set-cookie|session(?:[-_ ]?id)?)\s*[:=]\s*[^\s"';,]{8,})`),
+	}
+	sentinels := []string{
+		`"client_secret":"synthetic-client-secret-value"`,
+		`"credential":"synthetic-credential-value"`,
+		`Cookie: session=synthetic-session-value`,
+		`"cookie":"synthetic-cookie-value"`,
+		"AKIA1234567890ABCDEF",
+		"ghp_syntheticgithubtokenvalue",
+		"github_pat_syntheticgithubtokenvalue",
+	}
+	for _, sentinel := range sentinels {
+		matched := false
+		for _, pattern := range patterns {
+			if pattern.MatchString(sentinel) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("credential sentinel was not detected: %q", sentinel)
+		}
+	}
+}
 
 func TestCodexFixturesContainNoCredentialPatterns(t *testing.T) {
 	fixtureNames := []string{
@@ -301,9 +399,12 @@ func TestCodexFixturesContainNoCredentialPatterns(t *testing.T) {
 	patterns := []*regexp.Regexp{
 		regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}`),
 		regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._\-]{8,}`),
-		regexp.MustCompile(`(?i)\b(?:sk|rk|pk|ghp|github_pat|xox[baprs])[-_][a-z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)\b(?:sk|rk|pk|gh[pousr]|github_pat|xox[baprs])[-_][a-z0-9_-]{8,}`),
+		regexp.MustCompile(`(?i)\bAKIA[0-9A-Z]{16}\b`),
 		regexp.MustCompile(`eyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}`),
 		regexp.MustCompile(`(?i)"(?:access|refresh|api)[_-]?token"\s*:\s*"[^"]{12,}"`),
+		regexp.MustCompile(`(?i)"(?:client[_-]?secret|(?:api|access|refresh)[_-]?(?:key|token)|private[_-]?key|credentials?|password|passwd|secret|token)"\s*:\s*"[^"]{8,}"`),
+		regexp.MustCompile(`(?i)(?:"(?:cookie|set[_-]?cookie|session(?:[_-]?id)?)"\s*:\s*"[^"]{8,}"|\b(?:cookie|set-cookie|session(?:[-_ ]?id)?)\s*[:=]\s*[^\s"';,]{8,})`),
 	}
 	for _, name := range fixtureNames {
 		raw, err := os.ReadFile("testdata/" + name)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 )
 
@@ -34,8 +35,11 @@ const (
 	CodexImageGenerationCall             = "image_generation_call"
 )
 
-const maxCodexStreamLineBytes = 256 * 1024
-const maxCodexStreamEvents = 8192
+const (
+	maxCodexStreamLineBytes    = 256 * 1024
+	maxCodexStreamEvents       = 8192
+	maxCodexStreamPayloadBytes = 4 * 1024 * 1024
+)
 
 // CodexResponseRequest is the private request body for the Responses endpoint.
 type CodexResponseRequest struct {
@@ -147,18 +151,20 @@ type CodexIncompleteDetails struct {
 
 // CodexResponseStreamEvent is one private SSE or WebSocket event.
 type CodexResponseStreamEvent struct {
-	Type         string            `json:"type"`
-	Response     *CodexResponse    `json:"response,omitempty"`
-	Item         *CodexOutputItem  `json:"item,omitempty"`
-	Part         *CodexContentPart `json:"part,omitempty"`
-	Error        *CodexError       `json:"error,omitempty"`
-	Delta        string            `json:"delta,omitempty"`
-	Text         string            `json:"text,omitempty"`
-	Code         string            `json:"code,omitempty"`
-	Message      string            `json:"message,omitempty"`
-	ItemID       string            `json:"item_id,omitempty"`
-	OutputIndex  int               `json:"output_index,omitempty"`
-	SummaryIndex int               `json:"summary_index,omitempty"`
+	Type           string            `json:"type"`
+	SequenceNumber int               `json:"sequence_number"`
+	Response       *CodexResponse    `json:"response,omitempty"`
+	Item           *CodexOutputItem  `json:"item,omitempty"`
+	Part           *CodexContentPart `json:"part,omitempty"`
+	Error          *CodexError       `json:"error,omitempty"`
+	Delta          string            `json:"delta,omitempty"`
+	Text           string            `json:"text,omitempty"`
+	Code           string            `json:"code,omitempty"`
+	Message        string            `json:"message,omitempty"`
+	ItemID         string            `json:"item_id,omitempty"`
+	OutputIndex    int               `json:"output_index"`
+	ContentIndex   int               `json:"content_index"`
+	SummaryIndex   int               `json:"summary_index,omitempty"`
 }
 
 // CodexUsage records token counts reported by Codex.
@@ -253,12 +259,38 @@ type CodexRefreshFailure struct {
 
 // IsPermanent reports whether a refresh failure requires a new login.
 func (failure CodexRefreshFailure) IsPermanent() bool {
-	switch strings.ToLower(strings.TrimSpace(failure.Error)) {
+	code := strings.ToLower(strings.TrimSpace(failure.Error))
+	switch code {
 	case "invalid_grant", "invalid_token", "unauthorized_client", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated":
 		return true
-	default:
+	}
+
+	description := strings.ToLower(strings.TrimSpace(failure.ErrorDescription))
+	normalizedDescription := strings.NewReplacer("-", " ", "_", " ").Replace(description)
+	if strings.Contains(normalizedDescription, "refresh token") &&
+		(strings.Contains(normalizedDescription, "revoked") || strings.Contains(normalizedDescription, "expired")) {
+		return true
+	}
+	if failure.Status != http.StatusUnauthorized {
 		return false
 	}
+	return !isTransientRefreshText(code + " " + description)
+}
+
+func isTransientRefreshText(text string) bool {
+	for _, marker := range []string{
+		"timeout", "network", "fetch failed", "econnrefused", "econnreset",
+		"etimedout", "eai_again", "socket hang up", "rate limit",
+		"too many requests", "temporar", "unavailable", "forbidden",
+		"permission_denied", "cloudflare", "captcha", "408", "425",
+		"429", "500", "501", "502", "503", "504", "505", "506", "507",
+		"508", "509", "510", "511",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // CodexStreamResult is the validated result of one private stream.
@@ -280,9 +312,10 @@ var ErrCodexStreamMalformed = errors.New("codex stream event is malformed")
 // ErrCodexStreamFailed means that Codex sent a failed terminal event.
 var ErrCodexStreamFailed = errors.New("codex stream failed")
 
-// CodexStreamFailureError keeps a failed terminal event without exposing its message.
+// CodexStreamFailureError keeps only safe failure classification fields.
 type CodexStreamFailureError struct {
-	Event CodexResponseStreamEvent
+	Category string
+	Status   string
 }
 
 func (e *CodexStreamFailureError) Error() string {
@@ -312,6 +345,9 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 			data.Reset()
 			return nil
 		}
+		if err := decoder.reservePayload(len(payload)); err != nil {
+			return err
+		}
 		var event CodexResponseStreamEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
 			return fmt.Errorf("%w: decode SSE event: %v", ErrCodexStreamMalformed, err)
@@ -333,11 +369,15 @@ func ParseCodexResponsesSSE(reader io.Reader) (CodexStreamResult, error) {
 		case bytes.HasPrefix(line, []byte("data:")):
 			value := bytes.TrimPrefix(line, []byte("data:"))
 			value = bytes.TrimPrefix(value, []byte(" "))
+			additional := len(value)
+			if data.Len() > 0 {
+				additional++
+			}
+			if additional > maxCodexStreamLineBytes || data.Len() > maxCodexStreamLineBytes-additional {
+				return CodexStreamResult{}, fmt.Errorf("%w: data field is too large", ErrCodexStreamMalformed)
+			}
 			if data.Len() > 0 {
 				data.WriteByte('\n')
-			}
-			if data.Len()+len(value) > maxCodexStreamLineBytes {
-				return CodexStreamResult{}, fmt.Errorf("%w: data field is too large", ErrCodexStreamMalformed)
 			}
 			data.Write(value)
 		}
@@ -370,6 +410,16 @@ func DecodeCodexWebSocketFrame(frame []byte) (CodexResponseStreamEvent, error) {
 func ParseCodexWebSocketFrames(frames [][]byte) (CodexStreamResult, error) {
 	var decoder codexStreamDecoder
 	for index, frame := range frames {
+		if len(frame) == 0 || len(frame) > maxCodexStreamLineBytes {
+			return CodexStreamResult{}, fmt.Errorf(
+				"decode Codex WebSocket frame %d: %w: WebSocket frame size is invalid",
+				index,
+				ErrCodexStreamMalformed,
+			)
+		}
+		if err := decoder.reservePayload(len(frame)); err != nil {
+			return CodexStreamResult{}, fmt.Errorf("decode Codex WebSocket frame %d: %w", index, err)
+		}
 		event, err := DecodeCodexWebSocketFrame(frame)
 		if err != nil {
 			return CodexStreamResult{}, fmt.Errorf("decode Codex WebSocket frame %d: %w", index, err)
@@ -386,6 +436,15 @@ type codexStreamDecoder struct {
 	terminalType string
 	response     *CodexResponse
 	failed       bool
+	payloadBytes int
+}
+
+func (decoder *codexStreamDecoder) reservePayload(payloadBytes int) error {
+	if payloadBytes < 0 || decoder.payloadBytes > maxCodexStreamPayloadBytes-payloadBytes {
+		return fmt.Errorf("%w: decoded payload exceeds limit", ErrCodexStreamMalformed)
+	}
+	decoder.payloadBytes += payloadBytes
+	return nil
 }
 
 func (decoder *codexStreamDecoder) add(event CodexResponseStreamEvent) error {
@@ -419,7 +478,22 @@ func (decoder *codexStreamDecoder) finish() (CodexStreamResult, error) {
 		return result, ErrCodexStreamAbruptClose
 	}
 	if decoder.failed {
-		return result, &CodexStreamFailureError{Event: decoder.events[len(decoder.events)-1]}
+		category := "failed"
+		switch decoder.terminalType {
+		case CodexEventResponseFailed:
+			category = "response_failed"
+		case CodexEventError:
+			category = "error"
+		}
+		status := ""
+		if decoder.response != nil {
+			switch decoder.response.Status {
+			case CodexResponseStatusCompleted, CodexResponseStatusFailed, CodexResponseStatusIncomplete,
+				CodexResponseStatusInProgress:
+				status = decoder.response.Status
+			}
+		}
+		return result, &CodexStreamFailureError{Category: category, Status: status}
 	}
 	return result, nil
 }
