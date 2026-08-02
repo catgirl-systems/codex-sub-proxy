@@ -122,9 +122,7 @@ func newResponsesWebSocketDialer(client *http.Client) websocket.Dialer {
 	}
 	dialer.Proxy = httpTransport.Proxy
 	dialer.NetDialContext = httpTransport.DialContext
-	if httpTransport.Proxy == nil {
-		dialer.NetDialTLSContext = httpTransport.DialTLSContext
-	}
+	dialer.NetDialTLSContext = httpTransport.DialTLSContext
 	if httpTransport.TLSClientConfig != nil {
 		dialer.TLSClientConfig = httpTransport.TLSClientConfig.Clone()
 	}
@@ -220,7 +218,26 @@ func (transport *ResponsesTransport) tryWebSocket(ctx context.Context, body []by
 		return CodexStreamResult{}, nil, err, false
 	}
 	handshakeRequest.Header.Set("Accept", "application/json")
-	connection, response, err := transport.dialer.DialContext(dialContext, transport.webSocketURL, handshakeRequest.Header)
+	dialer := transport.dialer
+	if dialer.Proxy != nil {
+		proxyRequest := handshakeRequest.Clone(dialContext)
+		switch proxyRequest.URL.Scheme {
+		case "ws":
+			proxyRequest.URL.Scheme = "http"
+		case "wss":
+			proxyRequest.URL.Scheme = "https"
+		}
+		proxyURL, proxyErr := dialer.Proxy(proxyRequest)
+		if proxyErr != nil {
+			return CodexStreamResult{}, nil, fmt.Errorf("codex proxy callback: %w", proxyErr), false
+		}
+		dialer.Proxy = nil
+		if proxyURL != nil {
+			dialer.Proxy = http.ProxyURL(proxyURL)
+			dialer.NetDialTLSContext = nil
+		}
+	}
+	connection, response, err := dialer.DialContext(dialContext, transport.webSocketURL, handshakeRequest.Header)
 	if err != nil {
 		if dialContext.Err() != nil {
 			return CodexStreamResult{}, nil, dialContext.Err(), false

@@ -452,6 +452,136 @@ func TestResponsesTransportUsesCustomTLSRoots(t *testing.T) {
 	}
 }
 
+func TestResponsesTransportConditionalProxyBypassUsesCustomTLS(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	}))
+	defer server.Close()
+
+	httpTransport := server.Client().Transport.(*http.Transport).Clone()
+	var proxyCalls atomic.Int32
+	var tlsCalls atomic.Int32
+	var wrongScheme atomic.Bool
+	httpTransport.Proxy = func(request *http.Request) (*url.URL, error) {
+		proxyCalls.Add(1)
+		if request.URL == nil || request.URL.Scheme != "https" {
+			wrongScheme.Store(true)
+		}
+		return nil, nil
+	}
+	tlsConfig := httpTransport.TLSClientConfig.Clone()
+	httpTransport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		tlsCalls.Add(1)
+		return (&tls.Dialer{NetDialer: &net.Dialer{}, Config: tlsConfig}).DialContext(ctx, network, address)
+	}
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+
+	if _, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}); err != nil {
+		t.Fatalf("transport.Do with conditional proxy bypass: %v", err)
+	}
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy callback calls = %d, want 1", proxyCalls.Load())
+	}
+	if wrongScheme.Load() {
+		t.Fatal("proxy callback received a non-HTTP request scheme")
+	}
+	if tlsCalls.Load() != 1 {
+		t.Fatalf("custom TLS dialer calls = %d, want 1", tlsCalls.Load())
+	}
+}
+
+func TestResponsesTransportConditionalProxyUsesProxyRoute(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxy := newTransportConnectProxy(t, &proxyRequests)
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := transportUpgrader.Upgrade(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		_ = connection.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"status":"completed"}}`))
+	}))
+	defer server.Close()
+
+	httpTransport := server.Client().Transport.(*http.Transport).Clone()
+	var proxyCalls atomic.Int32
+	var tlsCalls atomic.Int32
+	httpTransport.Proxy = func(request *http.Request) (*url.URL, error) {
+		proxyCalls.Add(1)
+		return proxyURL, nil
+	}
+	httpTransport.DialTLSContext = func(context.Context, string, string) (net.Conn, error) {
+		tlsCalls.Add(1)
+		return nil, errors.New("origin TLS dialer must not be used for a proxy route")
+	}
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+
+	if _, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}); err != nil {
+		t.Fatalf("transport.Do with conditional proxy route: %v", err)
+	}
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy callback calls = %d, want 1", proxyCalls.Load())
+	}
+	if proxyRequests.Load() == 0 {
+		t.Fatal("WebSocket did not use the configured proxy")
+	}
+	if tlsCalls.Load() != 0 {
+		t.Fatalf("custom TLS dialer calls = %d, want 0 for a proxy route", tlsCalls.Load())
+	}
+}
+
+func TestResponsesTransportConditionalProxyError(t *testing.T) {
+	var requests atomic.Int32
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		http.Error(writer, "unexpected request", http.StatusInternalServerError)
+	})
+	defer server.Close()
+
+	proxyErr := errors.New("conditional proxy failure")
+	httpTransport := server.Client().Transport.(*http.Transport).Clone()
+	var proxyCalls atomic.Int32
+	httpTransport.Proxy = func(*http.Request) (*url.URL, error) {
+		proxyCalls.Add(1)
+		return nil, proxyErr
+	}
+	client := &http.Client{Transport: httpTransport}
+	transport := newTestResponsesTransportWithClient(t, server, ResponsesTransportWebSocketPreferred, client)
+
+	_, err := transport.Do(context.Background(), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+	if !errors.Is(err, proxyErr) {
+		t.Fatalf("transport.Do error = %v, want proxy callback error", err)
+	}
+	if !strings.Contains(err.Error(), "codex proxy callback") {
+		t.Fatalf("transport.Do error = %v, want proxy callback context", err)
+	}
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy callback calls = %d, want 1", proxyCalls.Load())
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("fallback requests = %d, want 0", requests.Load())
+	}
+}
+
 func TestResponsesTransportUsesEnvironmentProxy(t *testing.T) {
 	var proxyRequests atomic.Int32
 	proxy := newTransportConnectProxy(t, &proxyRequests)
