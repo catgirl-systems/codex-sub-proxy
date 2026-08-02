@@ -27,14 +27,18 @@ func TestResponsesRequestFixtureRoundTrips(t *testing.T) {
 	if fixtures.Responses.Model != "gpt-5.6-sol" || !fixtures.Responses.Stream {
 		t.Fatalf("Responses request = %#v", fixtures.Responses)
 	}
-	if len(fixtures.Responses.Input) != 1 || len(fixtures.Responses.Tools) != 2 {
+	if fixtures.Responses.Input == nil || len(fixtures.Responses.Input.Items) != 1 || len(fixtures.Responses.Tools) != 2 {
 		t.Fatalf("Responses input = %#v", fixtures.Responses)
 	}
-	if !strings.Contains(string(fixtures.Responses.Input[0].Content), "fixture-public-file-image") {
-		t.Fatalf("input image = %s", fixtures.Responses.Input[0].Content)
+	if !strings.Contains(string(fixtures.Responses.Input.Items[0].Content), "fixture-public-file-image") {
+		t.Fatalf("input image = %s", fixtures.Responses.Input.Items[0].Content)
 	}
 	if fixtures.Responses.ToolChoice == nil || fixtures.Responses.ToolChoice.Type != ToolChoiceImageGeneration {
 		t.Fatalf("tool choice = %#v", fixtures.Responses.ToolChoice)
+	}
+	if fixtures.Responses.Store == nil || *fixtures.Responses.Store ||
+		fixtures.Responses.ParallelToolCalls == nil || *fixtures.Responses.ParallelToolCalls {
+		t.Fatalf("presence-preserving request flags = %#v", fixtures.Responses)
 	}
 	imageTool := fixtures.Responses.Tools[0]
 	if imageTool.PartialImages != 2 || imageTool.InputImageMask == nil ||
@@ -61,8 +65,104 @@ func TestResponsesRequestFixtureRoundTrips(t *testing.T) {
 	}
 	if roundTrip.Tools[0].PartialImages != 2 || roundTrip.Tools[1].Name != "fixture_function" ||
 		roundTrip.Tools[1].Strict == nil || *roundTrip.Tools[1].Strict ||
-		!strings.Contains(string(roundTrip.Input[0].Content), "fixture-public-file-image") {
+		roundTrip.Store == nil || *roundTrip.Store ||
+		roundTrip.ParallelToolCalls == nil || *roundTrip.ParallelToolCalls ||
+		roundTrip.Input == nil ||
+		!strings.Contains(string(roundTrip.Input.Items[0].Content), "fixture-public-file-image") {
 		t.Fatalf("round-trip Responses request = %#v", roundTrip)
+	}
+}
+func TestPublicRequestUnionsRoundTripAndRejectInvalidForms(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "string input and string tool choice",
+			raw:  `{"model":"gpt-5.6-sol","input":"fixture input","tool_choice":"auto"}`,
+		},
+		{
+			name: "array input and object tool choice",
+			raw:  `{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user"}],"tool_choice":{"type":"function","name":"fixture_function"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request ResponseRequest
+			if err := json.Unmarshal([]byte(test.raw), &request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if request.Input == nil || request.ToolChoice == nil {
+				t.Fatalf("decoded unions = %#v", request)
+			}
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatalf("encode request: %v", err)
+			}
+			var wantFields, gotFields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(test.raw), &wantFields); err != nil {
+				t.Fatalf("decode source request: %v", err)
+			}
+			if err := json.Unmarshal(encoded, &gotFields); err != nil {
+				t.Fatalf("decode encoded request: %v", err)
+			}
+			if string(gotFields["input"]) != string(wantFields["input"]) ||
+				string(gotFields["tool_choice"]) != string(wantFields["tool_choice"]) {
+				t.Fatalf("union round-trip = %s", encoded)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		`{"model":"gpt-5.6-sol","input":null}`,
+		`{"model":"gpt-5.6-sol","input":{}}`,
+		`{"model":"gpt-5.6-sol","input":1}`,
+		`{"model":"gpt-5.6-sol","tool_choice":null}`,
+		`{"model":"gpt-5.6-sol","tool_choice":{}}`,
+		`{"model":"gpt-5.6-sol","tool_choice":[]}`,
+		`{"model":"gpt-5.6-sol","tool_choice":false}`,
+	} {
+		var request ResponseRequest
+		if err := json.Unmarshal([]byte(raw), &request); err == nil {
+			t.Fatalf("invalid union accepted: %s", raw)
+		}
+	}
+	text := ""
+	if _, err := json.Marshal(Input{}); err == nil {
+		t.Fatal("empty input union encoded")
+	}
+	if _, err := json.Marshal(Input{String: &text, Items: []InputItem{}}); err == nil {
+		t.Fatal("mixed input union encoded")
+	}
+	if _, err := json.Marshal(ToolChoice{}); err == nil {
+		t.Fatal("empty tool choice union encoded")
+	}
+	if _, err := json.Marshal(ToolChoice{String: &text, Type: "function"}); err == nil {
+		t.Fatal("mixed tool choice union encoded")
+	}
+}
+
+func TestPublicStreamEventArgumentsAndAnnotationRoundTrip(t *testing.T) {
+	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}","annotation":{"type":"url_citation","url":"https://example.test"}}`)
+	var event ResponseStreamEvent
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatalf("decode event: %v", err)
+	}
+	if event.Type != EventFunctionArgsDone || event.Arguments != `{"value":1}` ||
+		len(event.Annotation) == 0 || string(event.Annotation) != `{"type":"url_citation","url":"https://example.test"}` {
+		t.Fatalf("decoded event = %#v", event)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+	var roundTrip ResponseStreamEvent
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatalf("decode encoded event: %v", err)
+	}
+	if roundTrip.Type != event.Type || roundTrip.Arguments != event.Arguments ||
+		string(roundTrip.Annotation) != string(event.Annotation) {
+		t.Fatalf("event round-trip = %#v", roundTrip)
 	}
 }
 

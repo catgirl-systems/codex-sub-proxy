@@ -115,7 +115,7 @@
   },
   "store": false,
   "stream": true,
-  "parallel_tool_calls": true,
+  "parallel_tool_calls": false,
   "client_metadata": {
     "fixture": "private"
   },

@@ -1,6 +1,10 @@
 package openai
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
 
 const (
 	// Responses event names used by the public wire contract.
@@ -9,6 +13,9 @@ const (
 	EventResponseOutputItemDone          = "response.output_item.done"
 	EventContentPartAdded                = "response.content_part.added"
 	EventOutputTextDelta                 = "response.output_text.delta"
+	EventOutputTextAnnotationAdded       = "response.output_text.annotation.added"
+	EventFunctionArgsDelta               = "response.function_call_arguments.delta"
+	EventFunctionArgsDone                = "response.function_call_arguments.done"
 	EventCompleted                       = "response.completed"
 	EventDone                            = "response.done"
 	EventIncomplete                      = "response.incomplete"
@@ -29,16 +36,94 @@ const (
 // ResponseRequest is the public OpenAI Responses request body.
 type ResponseRequest struct {
 	Model              string           `json:"model"`
-	Input              []InputItem      `json:"input,omitempty"`
+	Input              *Input           `json:"input,omitempty"`
 	Instructions       string           `json:"instructions,omitempty"`
 	Tools              []Tool           `json:"tools,omitempty"`
 	ToolChoice         *ToolChoice      `json:"tool_choice,omitempty"`
-	Store              bool             `json:"store,omitempty"`
+	Store              *bool            `json:"store,omitempty"`
 	Stream             bool             `json:"stream,omitempty"`
-	ParallelToolCalls  bool             `json:"parallel_tool_calls,omitempty"`
+	ParallelToolCalls  *bool            `json:"parallel_tool_calls,omitempty"`
 	PreviousResponseID string           `json:"previous_response_id,omitempty"`
 	Reasoning          *ReasoningConfig `json:"reasoning,omitempty"`
 	Text               *TextConfig      `json:"text,omitempty"`
+}
+
+func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
+	*request = ResponseRequest{}
+	type responseRequest ResponseRequest
+	wire := struct {
+		*responseRequest
+		Input      json.RawMessage `json:"input"`
+		ToolChoice json.RawMessage `json:"tool_choice"`
+	}{
+		responseRequest: (*responseRequest)(request),
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Input != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Input), []byte("null")) {
+			return fmt.Errorf("public input must be a string or array")
+		}
+		var input Input
+		if err := json.Unmarshal(wire.Input, &input); err != nil {
+			return err
+		}
+		request.Input = &input
+	}
+	if wire.ToolChoice != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.ToolChoice), []byte("null")) {
+			return fmt.Errorf("public tool choice must be a string or object")
+		}
+		var choice ToolChoice
+		if err := json.Unmarshal(wire.ToolChoice, &choice); err != nil {
+			return err
+		}
+		request.ToolChoice = &choice
+	}
+	return nil
+}
+
+// Input is the public Responses input string-or-array union.
+type Input struct {
+	String *string     `json:"-"`
+	Items  []InputItem `json:"-"`
+}
+
+func (input Input) MarshalJSON() ([]byte, error) {
+	switch {
+	case input.String != nil && input.Items == nil:
+		return json.Marshal(*input.String)
+	case input.String == nil && input.Items != nil:
+		return json.Marshal(input.Items)
+	default:
+		return nil, fmt.Errorf("public input must contain exactly one variant")
+	}
+}
+
+func (input *Input) UnmarshalJSON(data []byte) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return fmt.Errorf("public input must be a string or array")
+	}
+	switch value[0] {
+	case '"':
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return fmt.Errorf("decode public input string: %w", err)
+		}
+		*input = Input{String: &text}
+		return nil
+	case '[':
+		var items []InputItem
+		if err := json.Unmarshal(value, &items); err != nil {
+			return fmt.Errorf("decode public input array: %w", err)
+		}
+		*input = Input{Items: items}
+		return nil
+	default:
+		return fmt.Errorf("public input must be a string or array")
+	}
 }
 
 // InputItem is one public Responses input item. Content and output are
@@ -107,10 +192,61 @@ type Tool struct {
 	Size              string          `json:"size,omitempty"`
 }
 
-// ToolChoice selects a public Responses tool.
+// ToolChoice selects a public Responses tool as a string or object.
 type ToolChoice struct {
-	Type string `json:"type"`
-	Name string `json:"name,omitempty"`
+	String *string `json:"-"`
+	Type   string  `json:"type"`
+	Name   string  `json:"name,omitempty"`
+}
+
+func (choice ToolChoice) MarshalJSON() ([]byte, error) {
+	if choice.String != nil {
+		if choice.Type != "" || choice.Name != "" {
+			return nil, fmt.Errorf("public tool choice contains multiple variants")
+		}
+		return json.Marshal(*choice.String)
+	}
+	if choice.Type == "" {
+		return nil, fmt.Errorf("public tool choice object requires type")
+	}
+	return json.Marshal(struct {
+		Type string `json:"type"`
+		Name string `json:"name,omitempty"`
+	}{
+		Type: choice.Type,
+		Name: choice.Name,
+	})
+}
+
+func (choice *ToolChoice) UnmarshalJSON(data []byte) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return fmt.Errorf("public tool choice must be a string or object")
+	}
+	switch value[0] {
+	case '"':
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return fmt.Errorf("decode public tool choice string: %w", err)
+		}
+		*choice = ToolChoice{String: &text}
+		return nil
+	case '{':
+		var object struct {
+			Type string `json:"type"`
+			Name string `json:"name,omitempty"`
+		}
+		if err := json.Unmarshal(value, &object); err != nil {
+			return fmt.Errorf("decode public tool choice object: %w", err)
+		}
+		if object.Type == "" {
+			return fmt.Errorf("decode public tool choice object: type is required")
+		}
+		*choice = ToolChoice{Type: object.Type, Name: object.Name}
+		return nil
+	default:
+		return fmt.Errorf("public tool choice must be a string or object")
+	}
 }
 
 // ReasoningConfig carries public reasoning options.
@@ -175,23 +311,25 @@ type IncompleteDetails struct {
 
 // ResponseStreamEvent is one public Responses SSE event.
 type ResponseStreamEvent struct {
-	Type              string        `json:"type"`
-	SequenceNumber    int           `json:"sequence_number"`
-	Response          *Response     `json:"response,omitempty"`
-	Item              *OutputItem   `json:"item,omitempty"`
-	Part              *ContentPart  `json:"part,omitempty"`
-	Error             *Error        `json:"error,omitempty"`
-	Delta             string        `json:"delta,omitempty"`
-	Text              string        `json:"text,omitempty"`
-	Logprobs          []TextLogprob `json:"logprobs,omitempty"`
-	Code              string        `json:"code,omitempty"`
-	Message           string        `json:"message,omitempty"`
-	ItemID            string        `json:"item_id,omitempty"`
-	OutputIndex       int           `json:"output_index"`
-	ContentIndex      int           `json:"content_index"`
-	SummaryIndex      int           `json:"summary_index"`
-	PartialImageB64   string        `json:"partial_image_b64,omitempty"`
-	PartialImageIndex int           `json:"partial_image_index"`
+	Type              string          `json:"type"`
+	SequenceNumber    int             `json:"sequence_number"`
+	Response          *Response       `json:"response,omitempty"`
+	Item              *OutputItem     `json:"item,omitempty"`
+	Part              *ContentPart    `json:"part,omitempty"`
+	Error             *Error          `json:"error,omitempty"`
+	Delta             string          `json:"delta,omitempty"`
+	Arguments         string          `json:"arguments,omitempty"`
+	Annotation        json.RawMessage `json:"annotation,omitempty"`
+	Text              string          `json:"text,omitempty"`
+	Logprobs          []TextLogprob   `json:"logprobs,omitempty"`
+	Code              string          `json:"code,omitempty"`
+	Message           string          `json:"message,omitempty"`
+	ItemID            string          `json:"item_id,omitempty"`
+	OutputIndex       int             `json:"output_index"`
+	ContentIndex      int             `json:"content_index"`
+	SummaryIndex      int             `json:"summary_index"`
+	PartialImageB64   string          `json:"partial_image_b64,omitempty"`
+	PartialImageIndex int             `json:"partial_image_index"`
 }
 
 // Usage records public token counts.

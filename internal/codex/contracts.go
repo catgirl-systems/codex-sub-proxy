@@ -82,13 +82,13 @@ type CodexTopLogprob struct {
 // CodexResponseRequest is the private request body for the Responses endpoint.
 type CodexResponseRequest struct {
 	Model                string                `json:"model"`
-	Input                []CodexInputItem      `json:"input,omitempty"`
+	Input                *CodexInput           `json:"input,omitempty"`
 	Instructions         string                `json:"instructions,omitempty"`
 	Tools                []CodexTool           `json:"tools,omitempty"`
 	ToolChoice           *CodexToolChoice      `json:"tool_choice,omitempty"`
-	Store                bool                  `json:"store,omitempty"`
+	Store                *bool                 `json:"store,omitempty"`
 	Stream               bool                  `json:"stream,omitempty"`
-	ParallelToolCalls    bool                  `json:"parallel_tool_calls,omitempty"`
+	ParallelToolCalls    *bool                 `json:"parallel_tool_calls,omitempty"`
 	ClientMetadata       map[string]string     `json:"client_metadata,omitempty"`
 	Include              []string              `json:"include,omitempty"`
 	PreviousResponseID   string                `json:"previous_response_id,omitempty"`
@@ -102,11 +102,90 @@ type CodexResponseRequest struct {
 	ServiceTier          string                `json:"service_tier,omitempty"`
 }
 
+func (request *CodexResponseRequest) UnmarshalJSON(data []byte) error {
+	*request = CodexResponseRequest{}
+	type codexResponseRequest CodexResponseRequest
+	wire := struct {
+		*codexResponseRequest
+		Input      json.RawMessage `json:"input"`
+		ToolChoice json.RawMessage `json:"tool_choice"`
+	}{
+		codexResponseRequest: (*codexResponseRequest)(request),
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Input != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Input), []byte("null")) {
+			return fmt.Errorf("private input must be a string or array")
+		}
+		var input CodexInput
+		if err := json.Unmarshal(wire.Input, &input); err != nil {
+			return err
+		}
+		request.Input = &input
+	}
+	if wire.ToolChoice != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.ToolChoice), []byte("null")) {
+			return fmt.Errorf("private tool choice must be a string or object")
+		}
+		var choice CodexToolChoice
+		if err := json.Unmarshal(wire.ToolChoice, &choice); err != nil {
+			return err
+		}
+		request.ToolChoice = &choice
+	}
+	return nil
+}
+
+// CodexInput is the private Responses input string-or-array union.
+type CodexInput struct {
+	String *string          `json:"-"`
+	Items  []CodexInputItem `json:"-"`
+}
+
+func (input CodexInput) MarshalJSON() ([]byte, error) {
+	switch {
+	case input.String != nil && input.Items == nil:
+		return json.Marshal(*input.String)
+	case input.String == nil && input.Items != nil:
+		return json.Marshal(input.Items)
+	default:
+		return nil, fmt.Errorf("private input must contain exactly one variant")
+	}
+}
+
+func (input *CodexInput) UnmarshalJSON(data []byte) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return fmt.Errorf("private input must be a string or array")
+	}
+	switch value[0] {
+	case '"':
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return fmt.Errorf("decode private input string: %w", err)
+		}
+		*input = CodexInput{String: &text}
+		return nil
+	case '[':
+		var items []CodexInputItem
+		if err := json.Unmarshal(value, &items); err != nil {
+			return fmt.Errorf("decode private input array: %w", err)
+		}
+		*input = CodexInput{Items: items}
+		return nil
+	default:
+		return fmt.Errorf("private input must be a string or array")
+	}
+}
+
 // CodexInputItem is one private Responses input item. Content and output are
 // polymorphic in the provider contract, so they remain raw JSON values.
 type CodexInputItem struct {
 	Type                     string             `json:"type,omitempty"`
 	Role                     string             `json:"role,omitempty"`
+	Status                   string             `json:"status,omitempty"`
 	Content                  json.RawMessage    `json:"content,omitempty"`
 	ID                       string             `json:"id,omitempty"`
 	CallID                   string             `json:"call_id,omitempty"`
@@ -152,9 +231,55 @@ type CodexTool struct {
 	Size              string               `json:"size,omitempty"`
 }
 
-// CodexToolChoice selects a private Responses tool.
+// CodexToolChoice selects a private Responses tool as a string or object.
 type CodexToolChoice struct {
-	Type string `json:"type"`
+	String *string `json:"-"`
+	Type   string  `json:"type"`
+}
+
+func (choice CodexToolChoice) MarshalJSON() ([]byte, error) {
+	if choice.String != nil {
+		if choice.Type != "" {
+			return nil, fmt.Errorf("private tool choice contains multiple variants")
+		}
+		return json.Marshal(*choice.String)
+	}
+	if choice.Type == "" {
+		return nil, fmt.Errorf("private tool choice object requires type")
+	}
+	return json.Marshal(struct {
+		Type string `json:"type"`
+	}{Type: choice.Type})
+}
+
+func (choice *CodexToolChoice) UnmarshalJSON(data []byte) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return fmt.Errorf("private tool choice must be a string or object")
+	}
+	switch value[0] {
+	case '"':
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return fmt.Errorf("decode private tool choice string: %w", err)
+		}
+		*choice = CodexToolChoice{String: &text}
+		return nil
+	case '{':
+		var object struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(value, &object); err != nil {
+			return fmt.Errorf("decode private tool choice object: %w", err)
+		}
+		if object.Type == "" {
+			return fmt.Errorf("decode private tool choice object: type is required")
+		}
+		*choice = CodexToolChoice{Type: object.Type}
+		return nil
+	default:
+		return fmt.Errorf("private tool choice must be a string or object")
+	}
 }
 
 // CodexReasoningConfig carries the private reasoning options used by Codex.
@@ -232,6 +357,7 @@ type CodexResponseStreamEvent struct {
 	Part              *CodexContentPart  `json:"part,omitempty"`
 	Error             *CodexError        `json:"error,omitempty"`
 	Delta             string             `json:"delta,omitempty"`
+	Arguments         string             `json:"arguments,omitempty"`
 	Text              string             `json:"text,omitempty"`
 	Logprobs          []CodexTextLogprob `json:"logprobs,omitempty"`
 	Code              string             `json:"code,omitempty"`

@@ -47,8 +47,12 @@ func TestCodexResponseRequestFixtureRoundTrips(t *testing.T) {
 	if request.Model != "gpt-5.6-sol" || !request.Stream || request.ToolChoice == nil {
 		t.Fatalf("request = %#v", request)
 	}
-	if len(request.Input) != 6 || len(request.Tools) != 1 || request.Tools[0].Type != "image_generation" {
+	if request.Input == nil || len(request.Input.Items) != 6 || len(request.Tools) != 1 || request.Tools[0].Type != "image_generation" {
 		t.Fatalf("request shape = %#v", request)
+	}
+	if request.Store == nil || *request.Store ||
+		request.ParallelToolCalls == nil || *request.ParallelToolCalls {
+		t.Fatalf("presence-preserving request flags = %#v", request)
 	}
 	if request.Tools[0].PartialImages != 2 || request.Tools[0].InputImageMask == nil ||
 		request.Tools[0].InputImageMask.FileID != "fixture-file-mask" {
@@ -62,17 +66,18 @@ func TestCodexResponseRequestFixtureRoundTrips(t *testing.T) {
 		request.ServiceTier != "priority" {
 		t.Fatalf("request options = %#v", request)
 	}
-	if request.Input[0].Content == nil || !bytes.Contains(request.Input[0].Content, []byte(`fixture-file-image`)) ||
-		!bytes.Contains(request.Input[1].Arguments, []byte(`value`)) {
-		t.Fatalf("input content/arguments = %s / %s", request.Input[0].Content, request.Input[1].Arguments)
+	if request.Input.Items[0].Content == nil || !bytes.Contains(request.Input.Items[0].Content, []byte(`fixture-file-image`)) ||
+		!bytes.Contains(request.Input.Items[1].Arguments, []byte(`value`)) {
+		t.Fatalf("input content/arguments = %s / %s", request.Input.Items[0].Content, request.Input.Items[1].Arguments)
 	}
-	if request.Input[3].Action == nil || request.Input[3].Actions == nil ||
-		len(request.Input[3].PendingSafetyChecks) != 1 ||
-		request.Input[3].PendingSafetyChecks[0].ID != "fixture-safety" {
-		t.Fatalf("computer input = %#v", request.Input[3])
+	if request.Input.Items[3].Action == nil || request.Input.Items[3].Actions == nil ||
+		len(request.Input.Items[3].PendingSafetyChecks) != 1 ||
+		request.Input.Items[3].PendingSafetyChecks[0].ID != "fixture-safety" ||
+		request.Input.Items[3].Status != "completed" {
+		t.Fatalf("computer input = %#v", request.Input.Items[3])
 	}
-	if request.Input[4].Output == nil || len(request.Input[4].AcknowledgedSafetyChecks) != 1 {
-		t.Fatalf("computer output = %#v", request.Input[4])
+	if request.Input.Items[4].Output == nil || len(request.Input.Items[4].AcknowledgedSafetyChecks) != 1 {
+		t.Fatalf("computer output = %#v", request.Input.Items[4])
 	}
 	encoded, err := json.Marshal(request)
 	if err != nil {
@@ -84,9 +89,104 @@ func TestCodexResponseRequestFixtureRoundTrips(t *testing.T) {
 	}
 	if roundTrip.Model != request.Model || roundTrip.Tools[0].Action != request.Tools[0].Action ||
 		roundTrip.Tools[0].PartialImages != 2 || roundTrip.StreamOptions == nil ||
-		roundTrip.Input[3].PendingSafetyChecks[0].ID != "fixture-safety" ||
-		!bytes.Contains(roundTrip.Input[0].Content, []byte(`fixture-file-image`)) {
+		roundTrip.Store == nil || *roundTrip.Store ||
+		roundTrip.ParallelToolCalls == nil || *roundTrip.ParallelToolCalls ||
+		roundTrip.Input == nil ||
+		roundTrip.Input.Items[3].PendingSafetyChecks[0].ID != "fixture-safety" ||
+		roundTrip.Input.Items[3].Status != "completed" ||
+		!bytes.Contains(roundTrip.Input.Items[0].Content, []byte(`fixture-file-image`)) {
 		t.Fatalf("round-trip request = %#v", roundTrip)
+	}
+}
+func TestCodexRequestUnionsRoundTripAndRejectInvalidForms(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "string input and string tool choice",
+			raw:  `{"model":"gpt-5.6-sol","input":"fixture input","tool_choice":"auto"}`,
+		},
+		{
+			name: "array input and object tool choice",
+			raw:  `{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user"}],"tool_choice":{"type":"function"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request CodexResponseRequest
+			if err := json.Unmarshal([]byte(test.raw), &request); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if request.Input == nil || request.ToolChoice == nil {
+				t.Fatalf("decoded unions = %#v", request)
+			}
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatalf("encode request: %v", err)
+			}
+			var wantFields, gotFields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(test.raw), &wantFields); err != nil {
+				t.Fatalf("decode source request: %v", err)
+			}
+			if err := json.Unmarshal(encoded, &gotFields); err != nil {
+				t.Fatalf("decode encoded request: %v", err)
+			}
+			if string(gotFields["input"]) != string(wantFields["input"]) ||
+				string(gotFields["tool_choice"]) != string(wantFields["tool_choice"]) {
+				t.Fatalf("union round-trip = %s", encoded)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		`{"model":"gpt-5.6-sol","input":null}`,
+		`{"model":"gpt-5.6-sol","input":{}}`,
+		`{"model":"gpt-5.6-sol","input":1}`,
+		`{"model":"gpt-5.6-sol","tool_choice":null}`,
+		`{"model":"gpt-5.6-sol","tool_choice":{}}`,
+		`{"model":"gpt-5.6-sol","tool_choice":[]}`,
+		`{"model":"gpt-5.6-sol","tool_choice":false}`,
+	} {
+		var request CodexResponseRequest
+		if err := json.Unmarshal([]byte(raw), &request); err == nil {
+			t.Fatalf("invalid union accepted: %s", raw)
+		}
+	}
+	text := ""
+	if _, err := json.Marshal(CodexInput{}); err == nil {
+		t.Fatal("empty input union encoded")
+	}
+	if _, err := json.Marshal(CodexInput{String: &text, Items: []CodexInputItem{}}); err == nil {
+		t.Fatal("mixed input union encoded")
+	}
+	if _, err := json.Marshal(CodexToolChoice{}); err == nil {
+		t.Fatal("empty tool choice union encoded")
+	}
+	if _, err := json.Marshal(CodexToolChoice{String: &text, Type: "function"}); err == nil {
+		t.Fatal("mixed tool choice union encoded")
+	}
+}
+
+func TestCodexStreamEventArgumentsRoundTrip(t *testing.T) {
+	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}"}`)
+	var event CodexResponseStreamEvent
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatalf("decode event: %v", err)
+	}
+	if event.Type != CodexEventResponseFunctionArgsDone || event.Arguments != `{"value":1}` {
+		t.Fatalf("decoded event = %#v", event)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("encode event: %v", err)
+	}
+	var roundTrip CodexResponseStreamEvent
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatalf("decode encoded event: %v", err)
+	}
+	if roundTrip.Type != event.Type || roundTrip.Arguments != event.Arguments {
+		t.Fatalf("event round-trip = %#v", roundTrip)
 	}
 }
 
