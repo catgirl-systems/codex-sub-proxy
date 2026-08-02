@@ -294,7 +294,17 @@ type CodexReasoningConfig struct {
 
 // CodexTextConfig carries private text output options.
 type CodexTextConfig struct {
-	Verbosity string `json:"verbosity,omitempty"`
+	Verbosity string           `json:"verbosity,omitempty"`
+	Format    *CodexTextFormat `json:"format,omitempty"`
+}
+
+// CodexTextFormat is the flattened Responses text.format object.
+type CodexTextFormat struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 // CodexResponse is a private Responses result.

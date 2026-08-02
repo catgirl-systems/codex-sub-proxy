@@ -52,6 +52,7 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 		}
 		writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
 	})
+	app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport))
 	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport))
 	var imagesClient *codex.ImagesClient
 	if len(imageClients) > 0 {
