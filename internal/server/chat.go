@@ -125,7 +125,7 @@ type chatNamedToolFunction struct {
 	Name string `json:"name" validate:"required,max=64"`
 }
 
-func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal) iris.Handler {
+func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		request := ctx.Request()
@@ -213,8 +213,21 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			}
 			return
 		}
+		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxCompletionTokens))
+		if err != nil {
+			var quotaErr *apikey.QuotaError
+			if errors.As(err, &quotaErr) {
+				writeQuotaChatError(ctx, err)
+			} else {
+				writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			}
+			return
+		}
+		if lease != nil {
+			defer func() { _ = lease.release("request ended") }()
+		}
 		if publicRequest.Stream {
-			serveChatStream(ctx, requestContext, transport, privateRequest, publicRequest.Model, includeUsage)
+			serveChatStream(ctx, requestContext, transport, privateRequest, publicRequest.Model, includeUsage, lease)
 			return
 		}
 
@@ -249,6 +262,11 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 		}
 		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
 			handleJournalResponseError(ctx, err)
+			return
+		}
+		if err := lease.reconcile(quotaUsageFromCodex(result.Response.Usage, 0)); err != nil {
+			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
 		}
 	}
 }
@@ -1009,7 +1027,7 @@ func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 	return result, nil
 }
 
-func serveChatStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, model string, includeUsage bool) {
+func serveChatStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, model string, includeUsage bool, lease *quotaLease) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
@@ -1080,6 +1098,10 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 	}
 	if err := writeResponsesSSERecord(writer, flusher, []byte("[DONE]")); err != nil {
 		reportJournalFailure()
+		return
+	}
+	if state.response != nil && state.response.Error == nil && state.response.Status != codex.CodexResponseStatusFailed {
+		_ = lease.reconcile(quotaUsageFromCodex(state.response.Usage, 0))
 	}
 }
 

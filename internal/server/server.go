@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"gorm.io/gorm"
 )
@@ -57,11 +58,22 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 
 	errorsChannel := make(chan error, 8)
 	var journal *Journal
+	var quota *apikey.QuotaStore
 	if cfg.Database != nil {
 		if err := MigrateJournal(cfg.Database); err != nil {
 			return nil, err
 		}
+		if err := apikey.MigrateQuota(cfg.Database); err != nil {
+			return nil, err
+		}
 		var err error
+		quota, err = apikey.NewQuotaStore(cfg.Database)
+		if err != nil {
+			return nil, err
+		}
+		if err := quota.RecoverPending(context.Background()); err != nil {
+			return nil, fmt.Errorf("recover quota reservations: %w", err)
+		}
 		journal, err = newJournal(cfg.Database, cfg.JournalMode, cfg.JournalQueueCapacity, cfg.JournalDrainDeadline)
 		if err != nil {
 			return nil, err
@@ -74,7 +86,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			return nil, fmt.Errorf("start journal: %w", err)
 		}
 	}
-	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal)
+	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal, quota)
 	if err != nil {
 		if journal != nil {
 			_ = journal.Close(context.Background())

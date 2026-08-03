@@ -45,7 +45,7 @@ var (
 	errImagesUnsupportedForm = errors.New("multipart field is not supported")
 )
 
-func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal) iris.Handler {
+func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
@@ -102,6 +102,19 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
 		}
+		lease, err := admitRequestQuota(request.Context(), quota, principal, imageQuotaRequest(principal.Policy, publicRequest.N))
+		if err != nil {
+			var quotaErr *apikey.QuotaError
+			if errors.As(err, &quotaErr) {
+				writeQuotaImagesError(ctx, err)
+			} else {
+				writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			}
+			return
+		}
+		if lease != nil {
+			defer func() { _ = lease.release("request ended") }()
+		}
 		result, err := client.Generate(request.Context(), codex.CodexImageGenerationRequest{
 			Model:             publicRequest.Model,
 			Prompt:            publicRequest.Prompt,
@@ -126,11 +139,16 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		writeJSON(ctx, http.StatusOK, response)
+		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
+			return
+		}
+		if err := lease.reconcile(quotaUsageFromCodex(result.Usage, len(result.Images))); err != nil {
+			return
+		}
 	}
 }
 
-func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal) iris.Handler {
+func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
@@ -220,7 +238,19 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_image", "The image files are invalid.")
 			return
 		}
-		publicRequest.Images = dataURLs
+		lease, err := admitRequestQuota(request.Context(), quota, principal, imageQuotaRequest(principal.Policy, publicRequest.N))
+		if err != nil {
+			var quotaErr *apikey.QuotaError
+			if errors.As(err, &quotaErr) {
+				writeQuotaImagesError(ctx, err)
+			} else {
+				writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			}
+			return
+		}
+		if lease != nil {
+			defer func() { _ = lease.release("request ended") }()
+		}
 		result, err := client.Edit(request.Context(), codex.CodexImageEditRequest{
 			Model:             publicRequest.Model,
 			Prompt:            publicRequest.Prompt,
@@ -245,7 +275,12 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		writeJSON(ctx, http.StatusOK, response)
+		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
+			return
+		}
+		if err := lease.reconcile(quotaUsageFromCodex(result.Usage, len(result.Images))); err != nil {
+			return
+		}
 	}
 }
 
@@ -280,7 +315,9 @@ func writeImagesMethodNotAllowed(ctx iris.Context) {
 
 func writeImagesError(ctx iris.Context, status int, code, message string) {
 	typeName := "invalid_request_error"
-	if status >= http.StatusInternalServerError {
+	if status == http.StatusTooManyRequests {
+		typeName = "rate_limit_error"
+	} else if status >= http.StatusInternalServerError {
 		typeName = "server_error"
 	}
 	writeResponsesError(ctx, status, typeName, code, message)

@@ -157,16 +157,18 @@ func writeJournalJSON(ctx iris.Context, status int, eventType string, payload []
 	})
 }
 
-func writeJSON(ctx iris.Context, status int, value any) {
+func writeJSON(ctx iris.Context, status int, value any) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		writeSafeInternalError(ctx)
-		return
+		return err
 	}
 	payload = append(payload, '\n')
 	if err := writeJournalJSON(ctx, status, "response.json", payload); err != nil {
 		handleJournalResponseError(ctx, err)
+		return err
 	}
+	return nil
 }
 
 func handleJournalResponseError(ctx iris.Context, err error) {

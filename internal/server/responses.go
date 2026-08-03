@@ -28,7 +28,7 @@ const (
 	responsesServerErrorType = "server_error"
 )
 
-func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal) iris.Handler {
+func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		request := ctx.Request()
@@ -105,8 +105,34 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 		}
 
 		if publicRequest.Stream {
-			serveResponsesStream(ctx, requestContext, transport, privateRequest)
+			lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
+			if err != nil {
+				var quotaErr *apikey.QuotaError
+				if errors.As(err, &quotaErr) {
+					writeQuotaResponsesError(ctx, err)
+				} else {
+					writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				}
+				return
+			}
+			if lease != nil {
+				defer func() { _ = lease.release("request ended") }()
+			}
+			serveResponsesStream(ctx, requestContext, transport, privateRequest, lease)
 			return
+		}
+		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
+		if err != nil {
+			var quotaErr *apikey.QuotaError
+			if errors.As(err, &quotaErr) {
+				writeQuotaResponsesError(ctx, err)
+			} else {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			}
+			return
+		}
+		if lease != nil {
+			defer func() { _ = lease.release("request ended") }()
 		}
 		if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Now().Add(imagesWriteTimeout)); err != nil {
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
@@ -136,6 +162,11 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 		}
 		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
 			handleJournalResponseError(ctx, err)
+			return
+		}
+		if err := lease.reconcile(quotaUsageFromCodex(result.Response.Usage, 0)); err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
 		}
 	}
 }
@@ -311,7 +342,7 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 	return &codex.CodexTextConfig{Verbosity: text.Verbosity}
 }
 
-func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest) {
+func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, lease *quotaLease) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
@@ -336,6 +367,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	}
 
 	terminalWritten := false
+	var terminalUsage *codex.CodexUsage
 	lastSequence := -1
 	streamErr := transport.Stream(requestContext, privateRequest, func(event codex.CodexResponseStreamEvent) error {
 		if requestContext.Err() != nil {
@@ -362,6 +394,10 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		}
 		if event.Error != nil || event.Type == codex.CodexEventError {
 			return errors.New("upstream error event terminated public stream")
+		}
+		if isCodexTerminal(event.Type) && event.Response != nil && event.Response.Error == nil &&
+			event.Response.Status != codex.CodexResponseStatusFailed {
+			terminalUsage = event.Response.Usage
 		}
 		return nil
 	})
@@ -402,6 +438,10 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 			journalWriter.value.journal.recordError(journalWriter.failed)
 			writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
 		}
+		return
+	}
+	if terminalUsage != nil {
+		_ = lease.reconcile(quotaUsageFromCodex(terminalUsage, 0))
 	}
 }
 

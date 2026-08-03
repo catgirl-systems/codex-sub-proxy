@@ -8,17 +8,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
 )
 
-// Migrate creates the durable API-key table and its prefix index.
+// Migrate creates the durable API-key and quota tables and their indexes.
 func Migrate(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("migrate API keys: %w", ErrUnavailable)
 	}
 	if err := db.AutoMigrate(&Record{}); err != nil {
 		return fmt.Errorf("migrate API keys: %w", err)
+	}
+	if err := MigrateQuota(db); err != nil {
+		return err
 	}
 	return nil
 }
@@ -31,8 +33,8 @@ func Create(ctx context.Context, db *gorm.DB, hmacKey []byte, policy Policy) (st
 	if db == nil {
 		return "", Record{}, fmt.Errorf("create API key: %w", ErrUnavailable)
 	}
-	if err := validator.New().Struct(policy); err != nil {
-		return "", Record{}, fmt.Errorf("validate API key policy: %w", err)
+	if err := validatePolicy(policy); err != nil {
+		return "", Record{}, err
 	}
 	if policy.ExpiresAt != nil && !policy.ExpiresAt.After(time.Now().UTC()) {
 		return "", Record{}, errors.New("API key expiry must be in the future")
@@ -57,7 +59,7 @@ func Create(ctx context.Context, db *gorm.DB, hmacKey []byte, policy Policy) (st
 	return rawKey, record, nil
 }
 
-// Principal contains only the policy and identity needed by request handlers.
+// Principal contains the identity and current policy needed by request handlers.
 type Principal struct {
 	ID               string
 	Prefix           string
@@ -65,6 +67,7 @@ type Principal struct {
 	Owner            string
 	AllowedEndpoints []string
 	AllowedModels    []string
+	Policy           Policy
 }
 
 // Authorizer checks API keys against the configured SQLite store.
@@ -233,6 +236,7 @@ func (a *Authorizer) Authenticate(ctx context.Context, rawKey string) (Principal
 		Owner:            policy.Owner,
 		AllowedEndpoints: append([]string(nil), policy.AllowedEndpoints...),
 		AllowedModels:    append([]string(nil), policy.AllowedModels...),
+		Policy:           policy,
 	}, nil
 }
 
