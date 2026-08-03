@@ -414,3 +414,116 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 		t.Fatalf("upstream requests = generation %d edit %d turn IDs = %q/%q", generationRequests.Load(), editRequests.Load(), generationTurnID, editTurnID)
 	}
 }
+
+func TestImagesFailClosedArtifactStoreMarksLifecycleFailed(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "images_generation.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+	database, err := storage.Open(context.Background(), filepath.Join(t.TempDir(), "images-failing-store.sqlite3"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDatabase, err := database.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDatabase.Close() })
+	if err := apikey.Migrate(database); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateJournal(database); err != nil {
+		t.Fatal(err)
+	}
+	hmacKey := []byte("test-api-key-hmac-key")
+	policy := apikey.Policy{Name: "images-failing-store", Owner: "images-failing-store", AllowedEndpoints: []string{imagesGenerationsEndpoint}, AllowedModels: []string{"gpt-image-2"}}
+	rawKey, _, err := apikey.Create(context.Background(), database, hmacKey, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeKey, err := envelope.NewKey(1, bytes.Repeat([]byte{8}, envelope.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialKeys, err := envelope.NewKeySet(activeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialPath := filepath.Join(t.TempDir(), "credential.enc")
+	if err := codex.SaveCredential(credentialPath, codex.Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}, credentialKeys); err != nil {
+		t.Fatal(err)
+	}
+	refresher, err := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{Issuer: "https://auth.openai.com", ClientID: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imagesClient, err := codex.NewImagesClient(codex.ImagesClientOptions{
+		GenerationsURL: upstream.URL + "/generations",
+		EditsURL:       upstream.URL + "/edits",
+		Refresher:      refresher,
+		Headers:        codex.HeaderConfig{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewArtifactStore(database, filepath.Join(t.TempDir(), "artifacts"), credentialKeys, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, err := Start(Config{
+		Listen: "127.0.0.1:0", AdminListen: "127.0.0.1:0", Database: database, APIKeyHMACKey: hmacKey,
+		ImagesClient: imagesClient, ArtifactStore: store, ArtifactRequired: true,
+	}, NewReadiness())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdownResponsesTestServer(t, servers)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+imagesGenerationsEndpoint, strings.NewReader(`{"model":"gpt-image-2","prompt":"fail store"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode == http.StatusOK || bytes.Contains(body, []byte(`"data"`)) {
+		t.Fatalf("failing artifact store returned success/body: status=%d body=%s", response.StatusCode, body)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var record RequestRecord
+		queryErr := database.Where("endpoint = ?", imagesGenerationsEndpoint).Order("accepted_at DESC").First(&record).Error
+		if queryErr == nil && record.TerminalAt != nil {
+			if record.Status != requestStatusFailed {
+				t.Fatalf("failed artifact request status = %q", record.Status)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failed artifact request did not reach terminal state: %v", queryErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var artifacts int64
+	if err := database.Model(&ArtifactRecord{}).Count(&artifacts).Error; err != nil {
+		t.Fatal(err)
+	}
+	if artifacts != 0 {
+		t.Fatalf("failed artifact request left %d artifacts", artifacts)
+	}
+}

@@ -778,3 +778,88 @@ func doResponsesRequest(t *testing.T, address, rawKey, body, contentType string)
 	}
 	return response
 }
+
+func TestBusyRetentionDoesNotInterruptActiveSSE(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	separator := bytes.Index(fixture, []byte("\n\n"))
+	if separator < 0 {
+		t.Fatal("response fixture has no event separator")
+	}
+	firstEvent := fixture[:separator+2]
+	remainingEvents := fixture[separator+2:]
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		flusher, ok := writer.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream writer is not flushable")
+		}
+		if _, err := writer.Write(firstEvent); err != nil {
+			return
+		}
+		flusher.Flush()
+		<-releaseUpstream
+		_, _ = writer.Write(remainingEvents)
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+	defer response.Body.Close()
+	reader := bufio.NewReader(response.Body)
+	firstLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(firstLine, `"response.created"`) {
+		t.Fatalf("first SSE line = %q", firstLine)
+	}
+
+	now := time.Now().UTC()
+	database := servers.journal.db
+	if err := database.Create(&ConversationRecord{ID: "retention-lock", CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&EncryptedPayloadRecord{ID: "retention-lock-payload", ReplayID: "retention-lock-payload", KeyVersion: 1, Envelope: []byte("expired"), CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(-time.Minute)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	lock := database.Begin()
+	if lock.Error != nil {
+		t.Fatal(lock.Error)
+	}
+	if err := lock.Model(&ConversationRecord{}).Where("id = ?", "retention-lock").Update("updated_at", now).Error; err != nil {
+		_ = lock.Rollback()
+		t.Fatal(err)
+	}
+	retentionDone := make(chan error, 1)
+	go func() {
+		retentionDone <- servers.retention.RunOnce(context.Background(), now)
+	}()
+	time.Sleep(1100 * time.Millisecond)
+	if err := lock.Rollback().Error; err != nil {
+		t.Fatal(err)
+	}
+	var retentionErr error
+	select {
+	case retentionErr = <-retentionDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("busy retention sweep did not finish")
+	}
+	if retentionErr == nil {
+		t.Fatal("busy retention sweep unexpectedly succeeded")
+	}
+	close(releaseUpstream)
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := firstLine + string(body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(stream, `"response.completed"`) || !strings.Contains(stream, "[DONE]") {
+		t.Fatalf("active SSE after busy retention = status %d body %s", response.StatusCode, stream)
+	}
+}

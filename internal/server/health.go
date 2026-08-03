@@ -22,6 +22,7 @@ type Readiness struct {
 	storage            bool
 	keys               bool
 	credentialSnapshot func() CredentialSnapshot
+	retentionSnapshot  func() RetentionHealth
 }
 
 type ReadinessSnapshot struct {
@@ -29,6 +30,9 @@ type ReadinessSnapshot struct {
 	Keys            bool   `json:"keys"`
 	UpstreamAuth    bool   `json:"upstream_auth"`
 	CredentialState string `json:"credential_state,omitempty"`
+	Retention       bool   `json:"retention"`
+	RetentionError  string `json:"retention_error,omitempty"`
+	retentionSet    bool
 }
 
 func NewReadiness() *Readiness {
@@ -44,6 +48,14 @@ func (r *Readiness) Set(storage, keys bool, credential func() CredentialSnapshot
 	r.mu.Unlock()
 }
 
+// SetRetentionSource connects retention health to readiness without coupling
+// request handlers to the background worker.
+func (r *Readiness) SetRetentionSource(source func() RetentionHealth) {
+	r.mu.Lock()
+	r.retentionSnapshot = source
+	r.mu.Unlock()
+}
+
 func (r *Readiness) Snapshot() ReadinessSnapshot {
 	r.mu.RLock()
 	snapshot := ReadinessSnapshot{
@@ -51,17 +63,26 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 		Keys:    r.keys,
 	}
 	credential := r.credentialSnapshot
+	retention := r.retentionSnapshot
 	r.mu.RUnlock()
 	if credential != nil {
 		current := credential()
 		snapshot.UpstreamAuth = current.Available
 		snapshot.CredentialState = current.State
 	}
+	if retention != nil {
+		current := retention()
+		snapshot.retentionSet = true
+		snapshot.Retention = current.Healthy
+		if current.Err != nil {
+			snapshot.RetentionError = current.Err.Error()
+		}
+	}
 	return snapshot
 }
 
 func (s ReadinessSnapshot) Ready() bool {
-	return s.Storage && s.Keys && s.UpstreamAuth
+	return s.Storage && s.Keys && s.UpstreamAuth && (!s.retentionSet || s.Retention)
 }
 
 func newHealthApplication(readiness *Readiness) (*iris.Application, error) {

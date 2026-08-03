@@ -47,6 +47,7 @@ type Servers struct {
 	waitGroup     sync.WaitGroup
 	journal       *Journal
 	retention     *RetentionRunner
+	artifacts     *ArtifactStore
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
@@ -72,6 +73,9 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if journal != nil {
 			_ = journal.Close(context.Background())
 		}
+		if cfg.ArtifactStore != nil && (retention == nil || retention.workerDone()) {
+			_ = cfg.ArtifactStore.Close()
+		}
 	}
 	if cfg.Database != nil {
 		if err := MigrateJournal(cfg.Database); err != nil {
@@ -79,6 +83,11 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		}
 		if err := apikey.MigrateQuota(cfg.Database); err != nil {
 			return nil, err
+		}
+		if cfg.ArtifactStore != nil {
+			if err := cfg.ArtifactStore.Reconcile(context.Background()); err != nil {
+				return nil, fmt.Errorf("reconcile artifact store: %w", err)
+			}
 		}
 		var err error
 		quota, err = apikey.NewQuotaStore(cfg.Database)
@@ -108,6 +117,9 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			if err != nil {
 				closeStarted()
 				return nil, err
+			}
+			if readiness != nil {
+				readiness.SetRetentionSource(retention.Health)
 			}
 			if err := retention.Start(); err != nil {
 				closeStarted()
@@ -159,8 +171,8 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		errors:        errorsChannel,
 		journal:       journal,
 		retention:     retention,
+		artifacts:     cfg.ArtifactStore,
 	}
-
 	servers.waitGroup.Add(2)
 	go servers.serve(servers.dataServer, dataListener)
 	go servers.serve(servers.adminServer, adminListener)
@@ -246,6 +258,11 @@ func (s *Servers) closeJournal(ctx context.Context) error {
 	}
 	if s.journal != nil {
 		if err := s.journal.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.artifacts != nil && (s.retention == nil || s.retention.workerDone()) {
+		if err := s.artifacts.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

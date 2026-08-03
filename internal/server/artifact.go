@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,8 +26,12 @@ const (
 	artifactMaxChunks               = 64
 	artifactMaxPlaintextSize        = 64 << 20
 	artifactMaxOwnerFieldSize       = 255
+	artifactStateWriting            = "writing"
 	artifactStateReady              = "ready"
 	artifactStateDeleting           = "deleting"
+	artifactRootSentinel            = ".csp-artifact-root"
+	artifactReconcileBatch          = 64
+	artifactSentinelMode            = 0o600
 )
 
 var (
@@ -65,10 +70,12 @@ func (ArtifactRecord) TableName() string { return "artifacts" }
 
 // ArtifactStore is the one concrete encrypted filesystem artifact store.
 type ArtifactStore struct {
-	db   *gorm.DB
-	root string
-	keys envelope.KeySet
-	ttl  time.Duration
+	db        *gorm.DB
+	root      *os.Root
+	keys      envelope.KeySet
+	ttl       time.Duration
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // MigrateArtifacts creates the artifact metadata table.
@@ -82,8 +89,9 @@ func MigrateArtifacts(db *gorm.DB) error {
 	return nil
 }
 
-// NewArtifactStore validates the key set and creates the private artifact root.
-func NewArtifactStore(db *gorm.DB, root string, keys envelope.KeySet, ttl time.Duration) (*ArtifactStore, error) {
+// NewArtifactStore validates the key set, adopts a private artifact root, and
+// reconciles durable metadata before the store can publish files.
+func NewArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl time.Duration) (*ArtifactStore, error) {
 	if db == nil {
 		return nil, errors.New("artifact database is nil")
 	}
@@ -94,18 +102,38 @@ func NewArtifactStore(db *gorm.DB, root string, keys envelope.KeySet, ttl time.D
 	if err != nil {
 		return nil, fmt.Errorf("validate artifact encryption keys: %w", err)
 	}
-	root, err = prepareArtifactRoot(root)
+	root, err := prepareArtifactRoot(rootPath)
 	if err != nil {
 		return nil, err
 	}
 	if err := MigrateArtifacts(db); err != nil {
+		_ = root.Close()
 		return nil, err
 	}
-	return &ArtifactStore{db: db, root: root, keys: validatedKeys, ttl: ttl}, nil
+	store := &ArtifactStore{db: db, root: root, keys: validatedKeys, ttl: ttl}
+	if err := store.Reconcile(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// Close releases the descriptor-anchored artifact root.
+func (s *ArtifactStore) Close() error {
+	if s == nil || s.root == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.closeErr = s.root.Close()
+	})
+	return s.closeErr
 }
 
 // Save encrypts one image and atomically records its ciphertext path.
 func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultIndex int, mimeType string, plaintext []byte) (ArtifactRecord, error) {
+	if s == nil || s.root == nil {
+		return ArtifactRecord{}, errors.New("artifact store is closed")
+	}
 	if ctx == nil {
 		return ArtifactRecord{}, errors.New("artifact save context is nil")
 	}
@@ -113,6 +141,9 @@ func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultInd
 		return ArtifactRecord{}, err
 	}
 	if err := validateArtifactOwner(owner); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := s.checkArtifactOwner(ctx, owner); err != nil {
 		return ArtifactRecord{}, err
 	}
 	if resultIndex < 0 {
@@ -160,17 +191,54 @@ func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultInd
 		return ArtifactRecord{}, errors.New("artifact ciphertext size is invalid")
 	}
 	relativePath := artifactID + ".bin"
-	tempPath := filepath.Join(s.root, "."+artifactID+".tmp")
-	finalPath := filepath.Join(s.root, relativePath)
-	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	tempPath := "." + artifactID + ".tmp"
+	now := time.Now().UTC()
+	digest := sha256ArtifactFile(chunks)
+	record := ArtifactRecord{
+		ID:               artifactID,
+		RequestID:        owner.RequestID,
+		ConversationID:   owner.ConversationID,
+		APIKeyID:         owner.APIKeyID,
+		ResultIndex:      resultIndex,
+		MIME:             mimeType,
+		PlaintextSize:    int64(len(plaintext)),
+		CiphertextSize:   ciphertextSize,
+		CiphertextSHA256: append([]byte(nil), digest[:]...),
+		KeyVersion:       s.keys.Active.Version,
+		RelativePath:     relativePath,
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(s.ttl),
+		State:            artifactStateWriting,
+	}
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := checkArtifactOwnerTx(tx, owner); err != nil {
+			return err
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			return fmt.Errorf("store artifact writing metadata: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return ArtifactRecord{}, err
+	}
+	metadataCreated := true
+	defer func() {
+		if metadataCreated {
+			cleanupCtx := context.WithoutCancel(ctx)
+			_ = s.db.WithContext(cleanupCtx).Where("id = ? AND state = ?", record.ID, artifactStateWriting).Delete(&ArtifactRecord{}).Error
+			_ = s.removeArtifactFile(relativePath)
+		}
+	}()
+
+	file, err := s.root.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return ArtifactRecord{}, fmt.Errorf("create artifact temporary file: %w", err)
 	}
-	cleanup := true
+	tempExists := true
 	defer func() {
 		_ = file.Close()
-		if cleanup {
-			_ = os.Remove(tempPath)
+		if tempExists {
+			_ = s.root.Remove(tempPath)
 		}
 	}()
 	if err := writeArtifactFile(file, chunks); err != nil {
@@ -182,46 +250,48 @@ func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultInd
 	if err := file.Close(); err != nil {
 		return ArtifactRecord{}, fmt.Errorf("close artifact file: %w", err)
 	}
-	if err := os.Rename(tempPath, finalPath); err != nil {
+	if _, err := s.root.Lstat(relativePath); err == nil {
+		return ArtifactRecord{}, errors.New("artifact final path collision")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ArtifactRecord{}, fmt.Errorf("inspect artifact final path: %w", err)
+	}
+	if err := s.root.Rename(tempPath, relativePath); err != nil {
 		return ArtifactRecord{}, fmt.Errorf("publish artifact file: %w", err)
 	}
-	cleanup = false
-	if err := syncArtifactDirectory(s.root); err != nil {
-		_ = os.Remove(finalPath)
+	tempExists = false
+	if err := syncArtifactRoot(s.root); err != nil {
 		return ArtifactRecord{}, err
 	}
-	digest := sha256ArtifactFile(chunks)
-	record := ArtifactRecord{
-		ID:               artifactID,
-		RequestID:        owner.RequestID,
-		ConversationID:   owner.ConversationID,
-		APIKeyID:         owner.APIKeyID,
-		ResultIndex:      resultIndex,
-		MIME:             mimeType,
-		PlaintextSize:    int64(len(plaintext)),
-		CiphertextSize:   ciphertextSize,
-		CiphertextSHA256: digest[:],
-		KeyVersion:       s.keys.Active.Version,
-		RelativePath:     relativePath,
-		CreatedAt:        time.Now().UTC(),
-		ExpiresAt:        time.Now().UTC().Add(s.ttl),
-		State:            artifactStateReady,
-	}
-	if err := s.db.WithContext(ctx).Create(&record).Error; err != nil {
-		_ = removeArtifactFile(s.root, relativePath)
-		var replay ArtifactRecord
-		loadErr := s.db.WithContext(ctx).Where("request_id = ? AND conversation_id = ? AND api_key_id = ? AND result_index = ?", owner.RequestID, owner.ConversationID, owner.APIKeyID, resultIndex).First(&replay).Error
-		if loadErr == nil && replay.MIME == mimeType && replay.PlaintextSize == int64(len(plaintext)) && replay.State == artifactStateReady {
-			return replay, nil
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := checkArtifactOwnerTx(tx, owner); err != nil {
+			return err
 		}
-		return ArtifactRecord{}, fmt.Errorf("store artifact metadata: %w", err)
+		var current ArtifactRecord
+		if err := tx.Where("id = ? AND state = ?", record.ID, artifactStateWriting).First(&current).Error; err != nil {
+			return fmt.Errorf("load artifact writing metadata: %w", err)
+		}
+		result := tx.Model(&ArtifactRecord{}).Where("id = ? AND state = ?", record.ID, artifactStateWriting).Updates(map[string]any{"state": artifactStateReady})
+		if result.Error != nil {
+			return fmt.Errorf("finalize artifact metadata: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("artifact metadata was changed during publication")
+		}
+		return nil
+	}); err != nil {
+		return ArtifactRecord{}, fmt.Errorf("finalize artifact publication: %w", err)
 	}
+	metadataCreated = false
+	record.State = artifactStateReady
 	record.persisted = true
 	return record, nil
 }
 
 // Read verifies and decrypts one artifact using the DB-recorded bounds and metadata.
 func (s *ArtifactStore) Read(ctx context.Context, id string) ([]byte, error) {
+	if s == nil || s.root == nil {
+		return nil, errors.New("artifact store is closed")
+	}
 	if ctx == nil {
 		return nil, errors.New("artifact read context is nil")
 	}
@@ -241,24 +311,38 @@ func (s *ArtifactStore) Read(ctx context.Context, id string) ([]byte, error) {
 	if err := validateArtifactRecord(record); err != nil {
 		return nil, err
 	}
-	path, err := safeArtifactPath(s.root, record.RelativePath)
+	encoded, err := s.readArtifactFile(record)
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open artifact file: %w", err)
+	return decryptArtifactFile(encoded, record, s.keys)
+}
+
+func (s *ArtifactStore) readArtifactFile(record ArtifactRecord) ([]byte, error) {
+	if err := validateArtifactRelativePath(record.RelativePath); err != nil {
+		return nil, err
 	}
-	defer file.Close()
-	info, err := file.Stat()
+	info, err := s.root.Lstat(record.RelativePath)
 	if err != nil {
-		return nil, fmt.Errorf("stat artifact file: %w", err)
+		return nil, fmt.Errorf("inspect artifact file: %w", err)
 	}
-	if !info.Mode().IsRegular() || !artifactHasSingleLink(info) || info.Size() != record.CiphertextSize {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !artifactHasSingleLink(info) || info.Size() != record.CiphertextSize {
 		return nil, errors.New("artifact file metadata is invalid")
 	}
 	if record.CiphertextSize > int64(artifactHeaderSize)+int64(artifactMaxChunks)*(4+envelope.MaxEnvelopeSize) {
 		return nil, errors.New("artifact ciphertext size is too large")
+	}
+	file, err := s.root.OpenFile(record.RelativePath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open artifact file: %w", err)
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat artifact file: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !artifactHasSingleLink(info) || info.Size() != record.CiphertextSize {
+		return nil, errors.New("artifact file metadata changed")
 	}
 	encoded, err := io.ReadAll(io.LimitReader(file, record.CiphertextSize+1))
 	if err != nil {
@@ -271,11 +355,14 @@ func (s *ArtifactStore) Read(ctx context.Context, id string) ([]byte, error) {
 	if len(record.CiphertextSHA256) != sha256.Size || subtle.ConstantTimeCompare(digest[:], record.CiphertextSHA256) != 1 {
 		return nil, errors.New("artifact ciphertext digest mismatch")
 	}
-	return decryptArtifactFile(encoded, record, s.keys)
+	return encoded, nil
 }
 
 // MarkDeleting claims a bounded set of artifacts before filesystem I/O.
 func (s *ArtifactStore) MarkDeleting(ctx context.Context, ids []string) ([]ArtifactRecord, error) {
+	if s == nil || s.root == nil {
+		return nil, errors.New("artifact store is closed")
+	}
 	if ctx == nil {
 		return nil, errors.New("artifact delete context is nil")
 	}
@@ -308,6 +395,9 @@ func (s *ArtifactStore) MarkDeleting(ctx context.Context, ids []string) ([]Artif
 
 // RemoveMarked deletes ciphertext first and finalizes the DB rows afterward.
 func (s *ArtifactStore) RemoveMarked(ctx context.Context, records []ArtifactRecord) error {
+	if s == nil || s.root == nil {
+		return errors.New("artifact store is closed")
+	}
 	if ctx == nil {
 		return errors.New("artifact remove context is nil")
 	}
@@ -318,7 +408,7 @@ func (s *ArtifactStore) RemoveMarked(ctx context.Context, records []ArtifactReco
 		if record.State != artifactStateDeleting {
 			continue
 		}
-		if err := removeArtifactFile(s.root, record.RelativePath); err != nil {
+		if err := s.removeArtifactFile(record.RelativePath); err != nil {
 			return fmt.Errorf("remove artifact %q: %w", record.ID, err)
 		}
 		if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -360,42 +450,155 @@ func validateArtifactRecord(record ArtifactRecord) error {
 	return nil
 }
 
-func prepareArtifactRoot(root string) (string, error) {
-	root = strings.TrimSpace(root)
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
-		return "", errors.New("artifact root must be an absolute clean path")
+func prepareArtifactRoot(rootPath string) (*os.Root, error) {
+	rootPath = strings.TrimSpace(rootPath)
+	if rootPath == "" || !filepath.IsAbs(rootPath) || filepath.Clean(rootPath) != rootPath || rootPath == string(filepath.Separator) {
+		return nil, errors.New("artifact root must be an absolute non-root clean path")
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", fmt.Errorf("create artifact root: %w", err)
+	info, err := os.Lstat(rootPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("inspect artifact root: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(rootPath), 0o700); err != nil {
+			return nil, fmt.Errorf("create artifact root parent: %w", err)
+		}
+		if err := os.Mkdir(rootPath, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("create artifact root: %w", err)
+		}
+		info, err = os.Lstat(rootPath)
 	}
-	if err := validateArtifactRoot(root); err != nil {
-		return "", err
+	if err != nil {
+		return nil, fmt.Errorf("inspect artifact root: %w", err)
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		return "", fmt.Errorf("restrict artifact root: %w", err)
+	if err := validateArtifactRootInfo(info); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("open artifact root: %w", err)
+	}
+	rootInfo, err := root.Lstat(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("verify artifact root descriptor: %w", err)
+	}
+	if err := validateArtifactRootInfo(rootInfo); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	if err := ensureArtifactSentinel(root); err != nil {
+		_ = root.Close()
+		return nil, err
 	}
 	return root, nil
 }
 
-func validateArtifactRoot(root string) error {
-	info, err := os.Lstat(root)
-	if err != nil {
-		return fmt.Errorf("inspect artifact root: %w", err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+func validateArtifactRootInfo(info os.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("artifact root is not a directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uint32(stat.Uid) != uint32(os.Getuid()) {
+		return errors.New("artifact root is not owned by the current user")
+	}
+	if info.Mode().Perm()&0o077 != 0 || info.Mode().Perm()&0o700 != 0o700 {
+		return errors.New("artifact root permissions are not private")
 	}
 	return nil
 }
 
-func safeArtifactPath(root, relative string) (string, error) {
-	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || filepath.Base(relative) != relative || strings.ContainsRune(relative, filepath.Separator) {
-		return "", errors.New("artifact path is invalid")
+func ensureArtifactSentinel(root *os.Root) error {
+	info, err := root.Lstat(artifactRootSentinel)
+	if errors.Is(err, os.ErrNotExist) {
+		directory, openErr := root.Open(".")
+		if openErr != nil {
+			return fmt.Errorf("inspect artifact root contents: %w", openErr)
+		}
+		entries, readErr := directory.ReadDir(-1)
+		closeErr := directory.Close()
+		if readErr != nil {
+			return fmt.Errorf("read artifact root contents: %w", readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close artifact root contents: %w", closeErr)
+		}
+		if len(entries) != 0 {
+			return errors.New("artifact root is not empty for ownership adoption")
+		}
+		file, createErr := root.OpenFile(artifactRootSentinel, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, artifactSentinelMode)
+		if createErr != nil {
+			return fmt.Errorf("create artifact ownership sentinel: %w", createErr)
+		}
+		if err := writeArtifactBytes(file, []byte("codex-sub-proxy artifact root v1\n")); err != nil {
+			_ = file.Close()
+			_ = root.Remove(artifactRootSentinel)
+			return fmt.Errorf("write artifact ownership sentinel: %w", err)
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			_ = root.Remove(artifactRootSentinel)
+			return fmt.Errorf("sync artifact ownership sentinel: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			_ = root.Remove(artifactRootSentinel)
+			return fmt.Errorf("close artifact ownership sentinel: %w", err)
+		}
+		if err := syncArtifactRoot(root); err != nil {
+			_ = root.Remove(artifactRootSentinel)
+			return err
+		}
+		return nil
 	}
-	if err := validateArtifactRoot(root); err != nil {
-		return "", err
+	if err != nil {
+		return fmt.Errorf("inspect artifact ownership sentinel: %w", err)
 	}
-	return filepath.Join(root, relative), nil
+	if err := validateArtifactSentinelInfo(info); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(artifactRootSentinel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open artifact ownership sentinel: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 128))
+	if err != nil {
+		return fmt.Errorf("read artifact ownership sentinel: %w", err)
+	}
+	if string(data) != "codex-sub-proxy artifact root v1\n" {
+		return errors.New("artifact ownership sentinel is invalid")
+	}
+	return nil
+}
+
+func validateArtifactSentinelInfo(info os.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !artifactHasSingleLink(info) || info.Mode().Perm() != artifactSentinelMode {
+		return errors.New("artifact ownership sentinel is not private")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uint32(stat.Uid) != uint32(os.Getuid()) {
+		return errors.New("artifact ownership sentinel is not owned by the current user")
+	}
+	return nil
+}
+
+func syncArtifactRoot(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("open artifact root for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync artifact root: %w", err)
+	}
+	return nil
+}
+
+func validateArtifactRelativePath(relative string) error {
+	if relative == "" || relative == artifactRootSentinel || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || filepath.Base(relative) != relative || strings.ContainsRune(relative, filepath.Separator) {
+		return errors.New("artifact path is invalid")
+	}
+	return nil
 }
 
 func artifactHasSingleLink(info os.FileInfo) bool {
@@ -403,12 +606,11 @@ func artifactHasSingleLink(info os.FileInfo) bool {
 	return ok && stat.Nlink == 1
 }
 
-func removeArtifactFile(root, relative string) error {
-	path, err := safeArtifactPath(root, relative)
-	if err != nil {
+func (s *ArtifactStore) removeArtifactFile(relative string) error {
+	if err := validateArtifactRelativePath(relative); err != nil {
 		return err
 	}
-	info, err := os.Lstat(path)
+	info, err := s.root.Lstat(relative)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -418,22 +620,256 @@ func removeArtifactFile(root, relative string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !artifactHasSingleLink(info) {
 		return errors.New("artifact file is not a private regular file")
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.root.Remove(relative); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("unlink artifact file: %w", err)
 	}
 	return nil
 }
 
-func syncArtifactDirectory(root string) error {
-	directory, err := os.Open(root)
-	if err != nil {
-		return fmt.Errorf("open artifact directory: %w", err)
+func checkArtifactOwnerTx(tx *gorm.DB, owner ArtifactOwner) error {
+	var request RequestRecord
+	if err := tx.Where("request_id = ?", owner.RequestID).First(&request).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("artifact owner request is missing")
+		}
+		return fmt.Errorf("load artifact owner request: %w", err)
 	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("sync artifact directory: %w", err)
+	if request.ConversationID != owner.ConversationID || request.APIKeyID != owner.APIKeyID {
+		return errors.New("artifact owner request does not match")
+	}
+	if request.TerminalAt != nil {
+		return errors.New("artifact owner request is terminal")
+	}
+	var conversation ConversationRecord
+	if err := tx.Where("id = ?", owner.ConversationID).First(&conversation).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("artifact owner conversation is missing")
+		}
+		return fmt.Errorf("load artifact owner conversation: %w", err)
+	}
+	if conversation.DeletingAt != nil {
+		return errors.New("artifact owner conversation is deleting")
 	}
 	return nil
+}
+
+func (s *ArtifactStore) checkArtifactOwner(ctx context.Context, owner ArtifactOwner) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return checkArtifactOwnerTx(tx, owner)
+	})
+}
+
+// Reconcile removes only recognized crash remnants and repairs durable phases.
+func (s *ArtifactStore) Reconcile(ctx context.Context) error {
+	if s == nil || s.root == nil {
+		return errors.New("artifact store is closed")
+	}
+	if ctx == nil {
+		return errors.New("artifact reconciliation context is nil")
+	}
+	if err := ensureArtifactSentinel(s.root); err != nil {
+		return err
+	}
+	var errs []error
+	removed := false
+	directory, err := s.root.Open(".")
+	if err != nil {
+		return fmt.Errorf("open artifact root for reconciliation: %w", err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = directory.Close()
+			return err
+		}
+		entries, readErr := directory.ReadDir(artifactReconcileBatch)
+		for _, entry := range entries {
+			name := entry.Name()
+			if name == artifactRootSentinel {
+				continue
+			}
+			kind, id := artifactFileKind(name)
+			if kind == "" {
+				errs = append(errs, fmt.Errorf("unrecognized artifact root entry %q", name))
+				continue
+			}
+			info, infoErr := s.root.Lstat(name)
+			if infoErr != nil {
+				if errors.Is(infoErr, os.ErrNotExist) {
+					continue
+				}
+				errs = append(errs, fmt.Errorf("inspect artifact root entry %q: %w", name, infoErr))
+				continue
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !artifactHasSingleLink(info) {
+				errs = append(errs, fmt.Errorf("artifact root entry %q is not a private regular file", name))
+				continue
+			}
+			if kind == "temp" {
+				if err := s.removeArtifactFile(name); err != nil {
+					errs = append(errs, fmt.Errorf("remove stale artifact temporary file %q: %w", name, err))
+				} else {
+					removed = true
+				}
+				continue
+			}
+			var record ArtifactRecord
+			recordErr := s.db.WithContext(ctx).Where("id = ? AND relative_path = ?", id, name).First(&record).Error
+			if errors.Is(recordErr, gorm.ErrRecordNotFound) {
+				recognized, shapeErr := s.recognizedCiphertext(name, info)
+				if shapeErr != nil {
+					errs = append(errs, shapeErr)
+				} else if !recognized {
+					errs = append(errs, fmt.Errorf("unrecognized artifact ciphertext %q", name))
+				} else if err := s.removeArtifactFile(name); err != nil {
+					errs = append(errs, fmt.Errorf("remove orphan artifact %q: %w", name, err))
+				} else {
+					removed = true
+				}
+				continue
+			}
+			if recordErr != nil {
+				errs = append(errs, fmt.Errorf("load artifact reconciliation record %q: %w", name, recordErr))
+				continue
+			}
+			switch record.State {
+			case artifactStateWriting:
+				ready := record
+				ready.State = artifactStateReady
+				encoded, readFileErr := s.readArtifactFile(ready)
+				if errors.Is(readFileErr, os.ErrNotExist) {
+					if err := s.db.WithContext(ctx).Delete(&record).Error; err != nil {
+						errs = append(errs, fmt.Errorf("remove missing writing artifact %q: %w", record.ID, err))
+					}
+				} else if readFileErr != nil {
+					errs = append(errs, fmt.Errorf("verify writing artifact %q: %w", record.ID, readFileErr))
+				} else if _, decryptErr := decryptArtifactFile(encoded, ready, s.keys); decryptErr != nil {
+					errs = append(errs, fmt.Errorf("verify writing artifact %q: %w", record.ID, decryptErr))
+				} else if err := s.db.WithContext(ctx).Model(&ArtifactRecord{}).Where("id = ? AND state = ?", record.ID, artifactStateWriting).Update("state", artifactStateReady).Error; err != nil {
+					errs = append(errs, fmt.Errorf("finalize writing artifact %q: %w", record.ID, err))
+				}
+			case artifactStateReady:
+				if _, readFileErr := s.readArtifactFile(record); errors.Is(readFileErr, os.ErrNotExist) {
+					if err := s.db.WithContext(ctx).Delete(&record).Error; err != nil {
+						errs = append(errs, fmt.Errorf("remove missing artifact %q: %w", record.ID, err))
+					}
+				} else if readFileErr != nil {
+					errs = append(errs, fmt.Errorf("verify artifact %q: %w", record.ID, readFileErr))
+				}
+			case artifactStateDeleting:
+				if err := s.removeArtifactFile(name); err != nil {
+					errs = append(errs, fmt.Errorf("remove deleting artifact %q: %w", record.ID, err))
+				} else if err := s.db.WithContext(ctx).Delete(&record).Error; err != nil {
+					errs = append(errs, fmt.Errorf("remove deleting artifact metadata %q: %w", record.ID, err))
+				} else {
+					removed = true
+				}
+			default:
+				errs = append(errs, fmt.Errorf("artifact %q has unknown state %q", record.ID, record.State))
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				errs = append(errs, fmt.Errorf("read artifact root: %w", readErr))
+			}
+			break
+		}
+		if len(entries) == 0 {
+			break
+		}
+	}
+	if err := directory.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close artifact root reconciliation: %w", err))
+	}
+	lastID := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var records []ArtifactRecord
+		query := s.db.WithContext(ctx).Where("state IN ? AND id > ?", []string{artifactStateWriting, artifactStateReady, artifactStateDeleting}, lastID).Order("id ASC").Limit(artifactReconcileBatch)
+		if err := query.Find(&records).Error; err != nil {
+			errs = append(errs, fmt.Errorf("load artifact reconciliation metadata: %w", err))
+			break
+		}
+		if len(records) == 0 {
+			break
+		}
+		for _, record := range records {
+			lastID = record.ID
+			if err := validateArtifactRelativePath(record.RelativePath); err != nil {
+				errs = append(errs, fmt.Errorf("artifact %q path is invalid: %w", record.ID, err))
+				continue
+			}
+			if _, err := s.root.Lstat(record.RelativePath); errors.Is(err, os.ErrNotExist) {
+				if err := s.db.WithContext(ctx).Delete(&record).Error; err != nil {
+					errs = append(errs, fmt.Errorf("remove missing artifact metadata %q: %w", record.ID, err))
+				}
+			} else if err != nil {
+				errs = append(errs, fmt.Errorf("inspect artifact metadata path %q: %w", record.ID, err))
+			}
+		}
+	}
+	if removed {
+		if err := syncArtifactRoot(s.root); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func artifactFileKind(name string) (string, string) {
+	switch {
+	case strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".tmp"):
+		id := strings.TrimSuffix(strings.TrimPrefix(name, "."), ".tmp")
+		if validJournalUUID(id) {
+			return "temp", id
+		}
+	case strings.HasSuffix(name, ".bin"):
+		id := strings.TrimSuffix(name, ".bin")
+		if validJournalUUID(id) {
+			return "final", id
+		}
+	}
+	return "", ""
+}
+
+func (s *ArtifactStore) recognizedCiphertext(name string, info os.FileInfo) (bool, error) {
+	if info.Size() < artifactHeaderSize || info.Size() > int64(artifactHeaderSize)+int64(artifactMaxChunks)*(4+envelope.MaxEnvelopeSize) {
+		return false, fmt.Errorf("artifact ciphertext %q has an invalid size", name)
+	}
+	file, err := s.root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, fmt.Errorf("open artifact ciphertext %q: %w", name, err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, info.Size()+1))
+	if err != nil {
+		return false, fmt.Errorf("read artifact ciphertext %q: %w", name, err)
+	}
+	return validArtifactCiphertextShape(data), nil
+}
+
+func validArtifactCiphertextShape(data []byte) bool {
+	if len(data) < artifactHeaderSize || !sameArtifactMagic(data[:4], artifactMagic[:]) || data[4] != artifactFormatVersion {
+		return false
+	}
+	count := int(binary.BigEndian.Uint32(data[5:9]))
+	if count <= 0 || count > artifactMaxChunks {
+		return false
+	}
+	offset := artifactHeaderSize
+	for range count {
+		if len(data)-offset < 4 {
+			return false
+		}
+		length := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+		offset += 4
+		if length <= 0 || length > envelope.MaxEnvelopeSize || length > len(data)-offset {
+			return false
+		}
+		offset += length
+	}
+	return offset == len(data)
 }
 
 func writeArtifactFile(file *os.File, chunks [][]byte) error {

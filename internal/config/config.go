@@ -256,6 +256,9 @@ func normalizeArtifactRoot(path string) (string, error) {
 		return "", errors.New("artifact root must be absolute")
 	}
 	cleaned := filepath.Clean(expanded)
+	if cleaned == string(filepath.Separator) {
+		return "", errors.New("artifact root must not be the filesystem root")
+	}
 	if cleaned != expanded {
 		return "", errors.New("artifact root must be clean")
 	}

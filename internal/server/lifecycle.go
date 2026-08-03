@@ -56,12 +56,13 @@ func (AccountRecord) TableName() string { return "accounts" }
 
 // ConversationRecord stores one stable conversation identity.
 type ConversationRecord struct {
-	ID           string    `gorm:"column:id;primaryKey;size:36"`
-	AccountID    string    `gorm:"column:account_id;size:255;index"`
-	CreatedAt    time.Time `gorm:"column:created_at;not null"`
-	UpdatedAt    time.Time `gorm:"column:updated_at;not null"`
-	ExpiresAt    time.Time `gorm:"column:expires_at;not null;index"`
-	RequestCount int64     `gorm:"column:request_count;not null;default:0"`
+	ID           string     `gorm:"column:id;primaryKey;size:36"`
+	AccountID    string     `gorm:"column:account_id;size:255;index"`
+	CreatedAt    time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt    time.Time  `gorm:"column:updated_at;not null"`
+	ExpiresAt    time.Time  `gorm:"column:expires_at;not null;index"`
+	RequestCount int64      `gorm:"column:request_count;not null;default:0"`
+	DeletingAt   *time.Time `gorm:"column:deleting_at;index"`
 }
 
 func (ConversationRecord) TableName() string { return "conversations" }
@@ -317,6 +318,9 @@ func (j *Journal) materializeRecord(tx *gorm.DB, source JournalRecord, request J
 			return err
 		}
 	case source.EventType == "request.running":
+		if err := j.ensureLifecycleOwner(tx, request); err != nil {
+			return err
+		}
 		var row RequestRecord
 		if err := tx.Where("request_id = ?", source.RequestID).First(&row).Error; err != nil {
 			return fmt.Errorf("load lifecycle request: %w", err)
@@ -332,6 +336,9 @@ func (j *Journal) materializeRecord(tx *gorm.DB, source JournalRecord, request J
 			}
 		}
 	case source.EventType == "request.input":
+		if err := j.ensureLifecycleOwner(tx, request); err != nil {
+			return err
+		}
 		if !json.Valid(plain) {
 			return errors.New("lifecycle input is not valid JSON")
 		}
@@ -364,6 +371,9 @@ func (j *Journal) materializeRecord(tx *gorm.DB, source JournalRecord, request J
 		if !knownStreamEvent(source.EventType) {
 			return fmt.Errorf("unknown lifecycle event type %q", source.EventType)
 		}
+		if err := j.ensureLifecycleOwner(tx, request); err != nil {
+			return err
+		}
 		if err := validateStreamPayload(plain); err != nil {
 			return err
 		}
@@ -387,6 +397,10 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 		}
 	} else if err != nil {
 		return fmt.Errorf("load lifecycle conversation: %w", err)
+	} else if existingConversation.DeletingAt != nil {
+		return errors.New("lifecycle conversation is deleting")
+	} else {
+		conversation = existingConversation
 	}
 	var row RequestRecord
 	err = tx.Where("request_id = ?", accepted.RequestID).First(&row).Error
@@ -406,12 +420,39 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 	} else if row.ReplayID != source.ReplayID || row.ConversationID != accepted.ConversationID || row.Endpoint != accepted.Endpoint || row.Model != accepted.Model || row.APIKeyID != accepted.APIKeyID || row.Mode != accepted.Mode {
 		return errors.New("lifecycle request metadata conflicts")
 	}
-	result := tx.Model(&ConversationRecord{}).Where("id = ?", conversation.ID).Updates(map[string]any{
+	result := tx.Model(&ConversationRecord{}).Where("id = ? AND deleting_at IS NULL", conversation.ID).Updates(map[string]any{
 		"updated_at":    source.CreatedAt,
 		"request_count": gorm.Expr("request_count + 1"),
 	})
 	if result.Error != nil {
 		return fmt.Errorf("update lifecycle conversation: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("lifecycle conversation was deleted during materialization")
+	}
+	return nil
+}
+
+func (j *Journal) ensureLifecycleOwner(tx *gorm.DB, request JournalRequest) error {
+	var row RequestRecord
+	if err := tx.Where("request_id = ?", request.ID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("lifecycle request is missing")
+		}
+		return fmt.Errorf("load lifecycle request: %w", err)
+	}
+	if row.ConversationID != request.ConversationID {
+		return errors.New("lifecycle request conversation conflicts")
+	}
+	var conversation ConversationRecord
+	if err := tx.Where("id = ?", request.ConversationID).First(&conversation).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("lifecycle conversation is missing")
+		}
+		return fmt.Errorf("load lifecycle conversation: %w", err)
+	}
+	if conversation.DeletingAt != nil {
+		return errors.New("lifecycle conversation is deleting")
 	}
 	return nil
 }
@@ -462,7 +503,7 @@ func (j *Journal) ensureStreamEvent(tx *gorm.DB, source JournalRecord) error {
 }
 
 func (j *Journal) ensureUsage(tx *gorm.DB, source JournalRecord, usage lifecycleUsagePayload) error {
-	if err := j.ensureRequestExists(tx, source.RequestID); err != nil {
+	if err := j.ensureLifecycleOwnerByID(tx, source.RequestID); err != nil {
 		return err
 	}
 	var existing UsageRecord
@@ -484,7 +525,7 @@ func (j *Journal) ensureUsage(tx *gorm.DB, source JournalRecord, usage lifecycle
 }
 
 func (j *Journal) ensureTerminal(tx *gorm.DB, source JournalRecord, terminal lifecycleTerminalPayload) error {
-	if err := j.ensureRequestExists(tx, source.RequestID); err != nil {
+	if err := j.ensureLifecycleOwnerByID(tx, source.RequestID); err != nil {
 		return err
 	}
 	if err := j.ensureEncryptedPayload(tx, source, mustJSON(terminal)); err != nil {
@@ -542,12 +583,15 @@ func (j *Journal) ensureTerminal(tx *gorm.DB, source JournalRecord, terminal lif
 	return nil
 }
 
-func (j *Journal) ensureRequestExists(tx *gorm.DB, requestID string) error {
+func (j *Journal) ensureLifecycleOwnerByID(tx *gorm.DB, requestID string) error {
 	var row RequestRecord
 	if err := tx.Where("request_id = ?", requestID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("lifecycle request is missing")
+		}
 		return fmt.Errorf("load lifecycle request: %w", err)
 	}
-	return nil
+	return j.ensureLifecycleOwner(tx, JournalRequest{ID: row.ID, ConversationID: row.ConversationID})
 }
 
 func (j *Journal) decryptJournalPayload(record JournalRecord) ([]byte, error) {
