@@ -376,3 +376,45 @@ func TestAPIKeyHMACKeyLoadsConfiguredValueWithoutLengthValidation(t *testing.T) 
 		})
 	}
 }
+func TestAdminSecretLookupsPreserveConfiguredBytes(t *testing.T) {
+	security := Default().Security
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case security.AdminTokenHMACKeyEnv:
+			return " \t", true
+		case security.AdminBootstrapTokenEnv:
+			return "csp_admin_bootstrap", true
+		default:
+			return "", false
+		}
+	}
+	hmacKey, err := security.AdminTokenHMACKey(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(hmacKey) != " \t" {
+		t.Fatalf("HMAC bytes = %q", hmacKey)
+	}
+	bootstrap, err := security.AdminBootstrapToken(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(bootstrap) != "csp_admin_bootstrap" {
+		t.Fatalf("bootstrap bytes = %q", bootstrap)
+	}
+}
+
+func TestDataKeysAvailabilityDoesNotRequireAdminHMAC(t *testing.T) {
+	security := Default().Security
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case security.PayloadEncryptionKeyEnv, security.CredentialEncryptionKeyEnv, security.APIKeyHMACKeyEnv:
+			return "key", true
+		default:
+			return "", false
+		}
+	}
+	if !security.DataKeysAvailable(lookup) {
+		t.Fatal("data keys reported unavailable without admin HMAC")
+	}
+}

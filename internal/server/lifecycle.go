@@ -128,15 +128,20 @@ func (UsageRecord) TableName() string { return "usage" }
 
 // AuditRecord stores a safe audit fact and an optional encrypted detail envelope.
 type AuditRecord struct {
-	ID        string    `gorm:"column:id;primaryKey;size:36"`
-	RequestID string    `gorm:"column:request_id;size:36;index"`
-	APIKeyID  string    `gorm:"column:api_key_id;size:255;index"`
-	Endpoint  string    `gorm:"column:endpoint;size:128;index"`
-	EventType string    `gorm:"column:event_type;not null;size:128;index"`
-	Status    int       `gorm:"column:status;not null;index"`
-	PayloadID string    `gorm:"column:payload_id;size:36;index"`
-	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
-	ExpiresAt time.Time `gorm:"column:expires_at;not null;index"`
+	ID            string    `gorm:"column:id;primaryKey;size:36"`
+	RequestID     string    `gorm:"column:request_id;size:36;index"`
+	APIKeyID      string    `gorm:"column:api_key_id;size:255;index"`
+	Endpoint      string    `gorm:"column:endpoint;size:128;index"`
+	EventType     string    `gorm:"column:event_type;not null;size:128;index"`
+	Status        int       `gorm:"column:status;not null;index"`
+	PayloadID     string    `gorm:"column:payload_id;size:36;index"`
+	CreatedAt     time.Time `gorm:"column:created_at;not null;index"`
+	ExpiresAt     time.Time `gorm:"column:expires_at;not null;index"`
+	PrincipalID   string    `gorm:"column:principal_id;size:36;index"`
+	PrincipalName string    `gorm:"column:principal_name;size:128"`
+	Action        string    `gorm:"column:action;size:128;index"`
+	TargetID      string    `gorm:"column:target_id;size:36;index"`
+	Metadata      string    `gorm:"column:metadata;type:text"`
 }
 
 func (AuditRecord) TableName() string { return "audit_records" }
@@ -177,6 +182,7 @@ func migrateLifecycle(db *gorm.DB) error {
 		&StreamEventRecord{},
 		&UsageRecord{},
 		&AuditRecord{},
+		&AdminToken{},
 	); err != nil {
 		return fmt.Errorf("migrate lifecycle projections: %w", err)
 	}

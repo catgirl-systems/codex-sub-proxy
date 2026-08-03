@@ -25,6 +25,8 @@ type Config struct {
 	AdminListen          string
 	Database             *gorm.DB
 	APIKeyHMACKey        []byte
+	AdminTokenHMACKey    []byte
+	AdminBootstrapToken  []byte
 	PayloadKeys          envelope.KeySet
 	ResponsesTransport   *codex.ResponsesTransport
 	ImagesClient         *codex.ImagesClient
@@ -127,15 +129,29 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			}
 		}
 	}
+	var adminStore *AdminTokenStore
+	if cfg.Database != nil {
+		if err := MigrateAdminTokens(cfg.Database); err == nil {
+			adminStore = NewAdminTokenStore(cfg.Database, cfg.AdminTokenHMACKey)
+			if len(cfg.AdminBootstrapToken) > 0 {
+				_, _ = adminStore.MaterializeBootstrap(context.Background(), cfg.AdminBootstrapToken)
+			}
+		}
+	}
+	if readiness != nil && (cfg.Database != nil || cfg.AdminTokenHMACKey != nil || cfg.AdminBootstrapToken != nil) {
+		readiness.SetAdminSource(func() bool {
+			return adminStore != nil && adminStore.Available(context.Background())
+		})
+	}
 	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal, quota, cfg.ArtifactStore, cfg.ArtifactRequired)
 	if err != nil {
 		closeStarted()
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
-	adminHandler, err := newHealthApplication(readiness)
+	adminHandler, err := newAdminApplication(readiness, adminStore)
 	if err != nil {
 		closeStarted()
-		return nil, fmt.Errorf("build admin health application: %w", err)
+		return nil, fmt.Errorf("build admin application: %w", err)
 	}
 
 	dataListener, err := net.Listen("tcp", cfg.Listen)

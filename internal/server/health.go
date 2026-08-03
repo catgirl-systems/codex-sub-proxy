@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"sync"
 
@@ -23,6 +22,7 @@ type Readiness struct {
 	keys               bool
 	credentialSnapshot func() CredentialSnapshot
 	retentionSnapshot  func() RetentionHealth
+	adminSnapshot      func() bool
 }
 
 type ReadinessSnapshot struct {
@@ -32,7 +32,9 @@ type ReadinessSnapshot struct {
 	CredentialState string `json:"credential_state,omitempty"`
 	Retention       bool   `json:"retention"`
 	RetentionError  string `json:"retention_error,omitempty"`
+	Admin           bool   `json:"admin"`
 	retentionSet    bool
+	adminSet        bool
 }
 
 func NewReadiness() *Readiness {
@@ -56,6 +58,13 @@ func (r *Readiness) SetRetentionSource(source func() RetentionHealth) {
 	r.mu.Unlock()
 }
 
+// SetAdminSource connects admin token availability to the admin readiness endpoint.
+func (r *Readiness) SetAdminSource(source func() bool) {
+	r.mu.Lock()
+	r.adminSnapshot = source
+	r.mu.Unlock()
+}
+
 func (r *Readiness) Snapshot() ReadinessSnapshot {
 	r.mu.RLock()
 	snapshot := ReadinessSnapshot{
@@ -64,6 +73,7 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 	}
 	credential := r.credentialSnapshot
 	retention := r.retentionSnapshot
+	admin := r.adminSnapshot
 	r.mu.RUnlock()
 	if credential != nil {
 		current := credential()
@@ -78,6 +88,10 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 			snapshot.RetentionError = current.Err.Error()
 		}
 	}
+	if admin != nil {
+		snapshot.adminSet = true
+		snapshot.Admin = admin()
+	}
 	return snapshot
 }
 
@@ -85,15 +99,18 @@ func (s ReadinessSnapshot) Ready() bool {
 	return s.Storage && s.Keys && s.UpstreamAuth && (!s.retentionSet || s.Retention)
 }
 
-func newHealthApplication(readiness *Readiness) (*iris.Application, error) {
-	app := buildHealthApplication(readiness)
-	if err := app.Build(); err != nil {
-		return nil, fmt.Errorf("build health application: %w", err)
+func (s ReadinessSnapshot) AdminReady() bool {
+	if !s.adminSet {
+		return s.Ready()
 	}
-	return app, nil
+	return s.Ready() && s.Admin
 }
 
 func buildHealthApplication(readiness *Readiness) *iris.Application {
+	return buildHealthApplicationWithMode(readiness, false)
+}
+
+func buildHealthApplicationWithMode(readiness *Readiness, admin bool) *iris.Application {
 	app := iris.New()
 	app.Any("/healthz", func(ctx iris.Context) {
 		if ctx.Method() != http.MethodGet {
@@ -117,7 +134,7 @@ func buildHealthApplication(readiness *Readiness) *iris.Application {
 		}
 		status := http.StatusServiceUnavailable
 		name := "unavailable"
-		if snapshot.Ready() {
+		if snapshot.Ready() && (!admin || snapshot.AdminReady()) {
 			status = http.StatusOK
 			name = "ready"
 		}
@@ -127,6 +144,10 @@ func buildHealthApplication(readiness *Readiness) *iris.Application {
 		}{Status: name, Checks: snapshot})
 	})
 	return app
+}
+
+func buildAdminHealthApplication(readiness *Readiness) *iris.Application {
+	return buildHealthApplicationWithMode(readiness, true)
 }
 
 const journalRequestValueKey = "csp-journal-request"

@@ -56,6 +56,8 @@ func run(args []string) error {
 	payloadKeys, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
 	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
 	apiKeyHMACKey, apiKeyHMACErr := cfg.Security.APIKeyHMACKey(os.LookupEnv)
+	adminHMACKey, _ := cfg.Security.AdminTokenHMACKey(os.LookupEnv)
+	adminBootstrapToken, _ := cfg.Security.AdminBootstrapToken(os.LookupEnv)
 	if payloadErr == nil && credentialErr == nil {
 		if err := config.RequireDistinctActiveKeys(payloadKeys, credentialKeys); err != nil {
 			return err
@@ -100,7 +102,7 @@ func run(args []string) error {
 		}()
 	}
 
-	keysReady := cfg.Security.KeysAvailable(os.LookupEnv)
+	keysReady := cfg.Security.DataKeysAvailable(os.LookupEnv)
 	keysReady = keysReady && payloadErr == nil && credentialErr == nil && apiKeyHMACErr == nil
 	var credentialSnapshot func() server.CredentialSnapshot
 	var responsesTransport *codex.ResponsesTransport
@@ -139,15 +141,17 @@ func run(args []string) error {
 
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 	servers, err := server.Start(server.Config{
-		Listen:             cfg.Server.Listen,
-		AdminListen:        cfg.Server.AdminListen,
-		Database:           db,
-		APIKeyHMACKey:      apiKeyHMACKey,
-		ResponsesTransport: responsesTransport,
-		PayloadKeys:        payloadKeys,
-		ImagesClient:       imagesClient,
-		ArtifactStore:      artifactStore,
-		ArtifactRequired:   true,
+		Listen:              cfg.Server.Listen,
+		AdminListen:         cfg.Server.AdminListen,
+		Database:            db,
+		APIKeyHMACKey:       apiKeyHMACKey,
+		AdminTokenHMACKey:   adminHMACKey,
+		AdminBootstrapToken: adminBootstrapToken,
+		ResponsesTransport:  responsesTransport,
+		PayloadKeys:         payloadKeys,
+		ImagesClient:        imagesClient,
+		ArtifactStore:       artifactStore,
+		ArtifactRequired:    true,
 		Retention: server.RetentionConfig{
 			ArtifactTTL:   cfg.Retention.ArtifactTTL,
 			PayloadTTL:    cfg.Retention.PayloadTTL,

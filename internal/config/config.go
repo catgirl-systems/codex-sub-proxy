@@ -87,6 +87,7 @@ type SecurityConfig struct {
 	CredentialEncryptionPreviousKeyVersions []uint32 `toml:"credential_encryption_previous_key_versions" validate:"max=4,unique,dive,gt=0"`
 	APIKeyHMACKeyEnv                        string   `toml:"api_key_hmac_key_env" validate:"required"`
 	AdminTokenHMACKeyEnv                    string   `toml:"admin_token_hmac_key_env" validate:"required"`
+	AdminBootstrapTokenEnv                  string   `toml:"admin_bootstrap_token_env" validate:"required"`
 }
 
 type ResponsesTransport string
@@ -196,6 +197,7 @@ func Default() Config {
 			CredentialEncryptionKeyVersion: 1,
 			APIKeyHMACKeyEnv:               "CSP_API_KEY_HMAC_KEY",
 			AdminTokenHMACKeyEnv:           "CSP_ADMIN_TOKEN_HMAC_KEY",
+			AdminBootstrapTokenEnv:         "CSP_ADMIN_BOOTSTRAP_TOKEN",
 		},
 		Codex: CodexConfig{
 			CredentialFile:     defaultCredentialFile,
@@ -270,7 +272,6 @@ func (s SecurityConfig) KeysAvailable(lookup func(string) (string, bool)) bool {
 	names := []string{
 		s.PayloadEncryptionKeyEnv,
 		s.CredentialEncryptionKeyEnv,
-		s.AdminTokenHMACKeyEnv,
 	}
 	names = append(names, s.PayloadEncryptionPreviousKeyEnvs...)
 	names = append(names, s.CredentialEncryptionPreviousKeyEnvs...)
@@ -283,15 +284,31 @@ func (s SecurityConfig) KeysAvailable(lookup func(string) (string, bool)) bool {
 			return false
 		}
 	}
-	name := s.APIKeyHMACKeyEnv
-	if strings.TrimSpace(name) == "" {
-		return false
-	}
-	value, ok := lookup(name)
-	if !ok || value == "" {
-		return false
+	for _, name := range []string{s.APIKeyHMACKeyEnv, s.AdminTokenHMACKeyEnv} {
+		if strings.TrimSpace(name) == "" {
+			return false
+		}
+		value, ok := lookup(name)
+		if !ok || value == "" {
+			return false
+		}
 	}
 	return true
+}
+
+// DataKeysAvailable checks only keys needed by the data plane.
+func (s SecurityConfig) DataKeysAvailable(lookup func(string) (string, bool)) bool {
+	if strings.TrimSpace(s.PayloadEncryptionKeyEnv) == "" || strings.TrimSpace(s.CredentialEncryptionKeyEnv) == "" || strings.TrimSpace(s.APIKeyHMACKeyEnv) == "" {
+		return false
+	}
+	for _, name := range append(append([]string{s.PayloadEncryptionKeyEnv, s.CredentialEncryptionKeyEnv}, s.PayloadEncryptionPreviousKeyEnvs...), s.CredentialEncryptionPreviousKeyEnvs...) {
+		value, ok := lookup(name)
+		if !ok || strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	value, ok := lookup(s.APIKeyHMACKeyEnv)
+	return ok && value != ""
 }
 
 // PayloadKeySet loads the active and previous payload keys.
@@ -333,6 +350,32 @@ func (s SecurityConfig) APIKeyHMACKey(lookup func(string) (string, bool)) ([]byt
 	value, ok := lookup(name)
 	if !ok || value == "" {
 		return nil, fmt.Errorf("API-key HMAC key is unavailable")
+	}
+	return []byte(value), nil
+}
+
+// AdminTokenHMACKey loads the admin token HMAC key without trimming its bytes.
+func (s SecurityConfig) AdminTokenHMACKey(lookup func(string) (string, bool)) ([]byte, error) {
+	name := s.AdminTokenHMACKeyEnv
+	if strings.TrimSpace(name) == "" {
+		return nil, errors.New("admin token HMAC key environment name is empty")
+	}
+	value, ok := lookup(name)
+	if !ok || value == "" {
+		return nil, errors.New("admin token HMAC key is unavailable")
+	}
+	return []byte(value), nil
+}
+
+// AdminBootstrapToken loads the optional full token from its dedicated lookup.
+func (s SecurityConfig) AdminBootstrapToken(lookup func(string) (string, bool)) ([]byte, error) {
+	name := s.AdminBootstrapTokenEnv
+	if strings.TrimSpace(name) == "" {
+		return nil, errors.New("admin bootstrap token environment name is empty")
+	}
+	value, ok := lookup(name)
+	if !ok || value == "" {
+		return nil, nil
 	}
 	return []byte(value), nil
 }
@@ -440,6 +483,7 @@ func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Security.CredentialEncryptionKeyEnv, "CSP_SECURITY_CREDENTIAL_ENCRYPTION_KEY_ENV")
 	overrideString(&cfg.Security.APIKeyHMACKeyEnv, "CSP_SECURITY_API_KEY_HMAC_KEY_ENV")
 	overrideString(&cfg.Security.AdminTokenHMACKeyEnv, "CSP_SECURITY_ADMIN_TOKEN_HMAC_KEY_ENV")
+	overrideString(&cfg.Security.AdminBootstrapTokenEnv, "CSP_SECURITY_ADMIN_BOOTSTRAP_TOKEN_ENV")
 	overrideString(&cfg.Codex.CredentialFile, "CSP_CODEX_CREDENTIAL_FILE")
 	journalMode := string(cfg.Journal.Mode)
 	overrideString(&journalMode, "CSP_JOURNAL_MODE")
