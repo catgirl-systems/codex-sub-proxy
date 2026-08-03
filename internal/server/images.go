@@ -139,10 +139,16 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
+		if err := validateQuotaUsageFromCodex(result.Usage); err != nil {
+			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		if err := lease.reconcile(quotaUsageFromCodex(result.Usage, len(result.Images))); err != nil {
+		usage := quotaUsageFromCodex(result.Usage, len(result.Images))
+		if err := lease.reconcile(usage); err != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
+		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
 			return
 		}
 	}
@@ -275,10 +281,16 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
+		if err := validateQuotaUsageFromCodex(result.Usage); err != nil {
+			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		if err := lease.reconcile(quotaUsageFromCodex(result.Usage, len(result.Images))); err != nil {
+		usage := quotaUsageFromCodex(result.Usage, len(result.Images))
+		if err := lease.reconcile(usage); err != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
+		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
 			return
 		}
 	}

@@ -13,10 +13,13 @@ import (
 )
 
 type quotaLease struct {
-	store  *apikey.QuotaStore
-	id     string
-	closed bool
+	store        *apikey.QuotaStore
+	id           string
+	closed       bool
+	successKnown bool
 }
+
+var errQuotaFinalization = errors.New("quota success finalization failed")
 
 func admitRequestQuota(ctx context.Context, store *apikey.QuotaStore, principal apikey.Principal, request apikey.QuotaRequest) (*quotaLease, error) {
 	if store == nil {
@@ -36,15 +39,17 @@ func (lease *quotaLease) reconcile(usage apikey.QuotaUsage) error {
 	if lease == nil || lease.closed {
 		return nil
 	}
-	if err := lease.store.Reconcile(context.Background(), lease.id, usage); err != nil {
-		return err
-	}
+	lease.successKnown = true
+	err := lease.store.Reconcile(context.Background(), lease.id, usage)
 	lease.closed = true
+	if err != nil {
+		return errors.Join(errQuotaFinalization, err)
+	}
 	return nil
 }
 
 func (lease *quotaLease) release(reason string) error {
-	if lease == nil || lease.closed {
+	if lease == nil || lease.closed || lease.successKnown {
 		return nil
 	}
 	if err := lease.store.Release(context.Background(), lease.id, reason); err != nil {
@@ -131,4 +136,42 @@ func quotaUsageFromCodex(usage *codex.CodexUsage, images int) apikey.QuotaUsage 
 		result.Tokens = int64(usage.TotalTokens)
 	}
 	return result
+}
+
+func validateQuotaUsageFromCodex(usage *codex.CodexUsage) error {
+	if usage == nil {
+		return nil
+	}
+	if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.TotalTokens < 0 || usage.PromptCacheHitTokens < 0 {
+		return errors.New("upstream usage is invalid")
+	}
+	if usage.InputTokensDetails != nil {
+		values := []int{
+			usage.InputTokensDetails.CachedTokens,
+			usage.InputTokensDetails.CacheWriteTokens,
+			usage.InputTokensDetails.OrchestrationInputTokens,
+			usage.InputTokensDetails.OrchestrationInputCachedTokens,
+			usage.InputTokensDetails.ImageTokens,
+			usage.InputTokensDetails.TextTokens,
+		}
+		for _, value := range values {
+			if value < 0 {
+				return errors.New("upstream usage is invalid")
+			}
+		}
+	}
+	if usage.OutputTokensDetails != nil {
+		values := []int{
+			usage.OutputTokensDetails.ReasoningTokens,
+			usage.OutputTokensDetails.OrchestrationOutputTokens,
+			usage.OutputTokensDetails.ImageTokens,
+			usage.OutputTokensDetails.TextTokens,
+		}
+		for _, value := range values {
+			if value < 0 {
+				return errors.New("upstream usage is invalid")
+			}
+		}
+	}
+	return nil
 }

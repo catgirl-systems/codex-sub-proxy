@@ -16,12 +16,13 @@ import (
 )
 
 const (
-	quotaBatchSize        = 256
-	maxQuotaCount         = int64(1 << 60)
-	maxQuotaWindow        = 365 * 24 * time.Hour
-	reservationStatusOpen = "pending"
-	reservationStatusDone = "closed"
-	reservationStatusDrop = "released"
+	quotaBatchSize              = 256
+	maxQuotaCount               = int64(1 << 60)
+	maxQuotaWindow              = 365 * 24 * time.Hour
+	reservationStatusOpen       = "pending"
+	reservationStatusFinalizing = "finalizing"
+	reservationStatusDone       = "closed"
+	reservationStatusDrop       = "released"
 )
 
 var (
@@ -79,6 +80,7 @@ type QuotaAdmission struct {
 	KeyID       string
 	OwnerID     string
 	PeriodStart time.Time
+	BucketID    *string
 	Requested   QuotaRequest
 	Status      string
 }
@@ -123,13 +125,14 @@ type QuotaRollingAdmission struct {
 
 func (QuotaRollingAdmission) TableName() string { return "quota_rolling_admissions" }
 
-// QuotaReservation stores one pending, reconciled, or released admission.
+// QuotaReservation stores one pending, finalizing, reconciled, or released admission.
 type QuotaReservation struct {
 	ID                      string     `gorm:"column:id;primaryKey;size:36"`
 	KeyID                   string     `gorm:"column:key_id;not null;size:32;index"`
 	RequestID               string     `gorm:"column:request_id;not null;size:36;uniqueIndex"`
 	OwnerID                 string     `gorm:"column:owner_id;not null;size:36;index"`
 	PeriodStart             time.Time  `gorm:"column:period_start;not null;index"`
+	BucketID                *string    `gorm:"column:bucket_id;size:36;index"`
 	RequestedRequests       int64      `gorm:"column:requested_requests;not null"`
 	RequestedTokens         int64      `gorm:"column:requested_tokens;not null"`
 	RequestedImages         int64      `gorm:"column:requested_images;not null"`
@@ -249,6 +252,11 @@ func quotaPolicyEnabled(policy Policy) bool {
 		policy.CostMicrounitReservationDefault > 0 || policy.CostMicrounitReservationCeiling > 0
 }
 
+func periodQuotaEnabled(policy Policy) bool {
+	return policy.PeriodRequestLimit > 0 || policy.PeriodTokenLimit > 0 ||
+		policy.PeriodImageLimit > 0 || policy.PeriodCostMicrounitLimit > 0
+}
+
 // Admit atomically checks and reserves all configured quota dimensions.
 func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy, request QuotaRequest) (*QuotaAdmission, error) {
 	if store == nil || store.db == nil {
@@ -300,16 +308,25 @@ func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy,
 			}
 			return newQuotaError("rate", now, resetAt)
 		}
-		periodStart := periodStartAt(now, policy.PeriodDuration)
-		bucket, err := lockQuotaBucket(tx, keyID, periodStart, now)
-		if err != nil {
-			return err
+		var (
+			periodStart time.Time
+			bucket      *QuotaBucket
+			bucketID    *string
+		)
+		if periodQuotaEnabled(policy) {
+			periodStart = periodStartAt(now, policy.PeriodDuration)
+			lockedBucket, err := lockQuotaBucket(tx, keyID, periodStart, now)
+			if err != nil {
+				return err
+			}
+			bucket = &lockedBucket
+			if err := checkBucketLimits(policy, *bucket, request, now); err != nil {
+				return err
+			}
+			bucketID = &lockedBucket.ID
 		}
 		if state.ActiveRequests == math.MaxInt64 {
 			return errors.New("quota concurrency state overflow")
-		}
-		if err := checkBucketLimits(policy, bucket, request, now); err != nil {
-			return err
 		}
 		state.ActiveRequests++
 		if policy.RollingRequestCount > 0 {
@@ -322,27 +339,29 @@ func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy,
 		}).Error; err != nil {
 			return fmt.Errorf("update quota state: %w", err)
 		}
-		var ok bool
-		if bucket.ReservedRequests, ok = quotaAdd(bucket.ReservedRequests, request.Requests); !ok {
-			return errors.New("quota request reservation overflow")
-		}
-		if bucket.ReservedTokens, ok = quotaAdd(bucket.ReservedTokens, request.Tokens); !ok {
-			return errors.New("quota token reservation overflow")
-		}
-		if bucket.ReservedImages, ok = quotaAdd(bucket.ReservedImages, request.Images); !ok {
-			return errors.New("quota image reservation overflow")
-		}
-		if bucket.ReservedCostMicrounits, ok = quotaAdd(bucket.ReservedCostMicrounits, request.CostMicrounits); !ok {
-			return errors.New("quota cost reservation overflow")
-		}
-		if err := tx.Model(&QuotaBucket{}).Where("id = ?", bucket.ID).Updates(map[string]any{
-			"reserved_requests":        bucket.ReservedRequests,
-			"reserved_tokens":          bucket.ReservedTokens,
-			"reserved_images":          bucket.ReservedImages,
-			"reserved_cost_microunits": bucket.ReservedCostMicrounits,
-			"updated_at":               now,
-		}).Error; err != nil {
-			return fmt.Errorf("update quota bucket: %w", err)
+		if bucket != nil {
+			var ok bool
+			if bucket.ReservedRequests, ok = quotaAdd(bucket.ReservedRequests, request.Requests); !ok {
+				return errors.New("quota request reservation overflow")
+			}
+			if bucket.ReservedTokens, ok = quotaAdd(bucket.ReservedTokens, request.Tokens); !ok {
+				return errors.New("quota token reservation overflow")
+			}
+			if bucket.ReservedImages, ok = quotaAdd(bucket.ReservedImages, request.Images); !ok {
+				return errors.New("quota image reservation overflow")
+			}
+			if bucket.ReservedCostMicrounits, ok = quotaAdd(bucket.ReservedCostMicrounits, request.CostMicrounits); !ok {
+				return errors.New("quota cost reservation overflow")
+			}
+			if err := tx.Model(&QuotaBucket{}).Where("id = ?", bucket.ID).Updates(map[string]any{
+				"reserved_requests":        bucket.ReservedRequests,
+				"reserved_tokens":          bucket.ReservedTokens,
+				"reserved_images":          bucket.ReservedImages,
+				"reserved_cost_microunits": bucket.ReservedCostMicrounits,
+				"updated_at":               now,
+			}).Error; err != nil {
+				return fmt.Errorf("update quota bucket: %w", err)
+			}
 		}
 		if policy.RollingRequestCount > 0 {
 			rollingID, err := newQuotaUUID()
@@ -358,10 +377,10 @@ func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy,
 		}
 		reservation = QuotaReservation{
 			ID: reservationID, KeyID: keyID, RequestID: requestID, OwnerID: store.ownerID,
-			PeriodStart: periodStart, RequestedRequests: request.Requests,
-			RequestedTokens: request.Tokens, RequestedImages: request.Images,
-			RequestedCostMicrounits: request.CostMicrounits, Status: reservationStatusOpen,
-			CreatedAt: now,
+			PeriodStart: periodStart, BucketID: bucketID,
+			RequestedRequests: request.Requests, RequestedTokens: request.Tokens,
+			RequestedImages: request.Images, RequestedCostMicrounits: request.CostMicrounits,
+			Status: reservationStatusOpen, CreatedAt: now,
 		}
 		if err := tx.Create(&reservation).Error; err != nil {
 			return fmt.Errorf("store quota reservation: %w", err)
@@ -373,12 +392,12 @@ func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy,
 	}
 	return &QuotaAdmission{
 		ID: reservation.ID, RequestID: reservation.RequestID, KeyID: reservation.KeyID,
-		OwnerID: reservation.OwnerID, PeriodStart: reservation.PeriodStart,
+		OwnerID: reservation.OwnerID, PeriodStart: reservation.PeriodStart, BucketID: reservation.BucketID,
 		Requested: request, Status: reservation.Status,
 	}, nil
 }
 
-// Reconcile closes one reservation and moves reserved amounts to actual usage.
+// Reconcile records success before it applies the reservation.
 func (store *QuotaStore) Reconcile(ctx context.Context, reservationID string, usage QuotaUsage) error {
 	if store == nil || store.db == nil {
 		return fmt.Errorf("reconcile quota: %w", ErrUnavailable)
@@ -393,44 +412,48 @@ func (store *QuotaStore) Reconcile(ctx context.Context, reservationID string, us
 		return err
 	}
 	now := store.now().UTC()
+	if err := store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return beginQuotaFinalization(tx, reservationID, usage)
+	}); err != nil {
+		return err
+	}
 	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var reservation QuotaReservation
-		if err := tx.Where("id = ?", reservationID).First(&reservation).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrQuotaReservationNotFound
-			}
-			return fmt.Errorf("load quota reservation: %w", err)
-		}
-		state, err := lockQuotaState(tx, reservation.KeyID, now)
-		if err != nil {
-			return err
-		}
-		if err := tx.Where("id = ?", reservationID).First(&reservation).Error; err != nil {
-			return fmt.Errorf("reload quota reservation: %w", err)
-		}
-		if reservation.Status != reservationStatusOpen {
-			return nil
-		}
-		if usage.Requests == 0 {
-			usage.Requests = reservation.RequestedRequests
-		}
-		if err := decrementActive(&state); err != nil {
-			return err
-		}
-		bucket, err := loadQuotaBucket(tx, reservation.KeyID, reservation.PeriodStart)
-		if err != nil {
-			return err
-		}
-		if err := moveReservationToUsage(tx, &bucket, reservation, usage, now); err != nil {
-			return err
-		}
-		if err := tx.Model(&QuotaState{}).Where("key_id = ?", reservation.KeyID).Updates(map[string]any{
-			"active_requests": state.ActiveRequests, "updated_at": now,
-		}).Error; err != nil {
-			return fmt.Errorf("update quota concurrency: %w", err)
-		}
-		return markQuotaReservation(tx, reservation.ID, reservationStatusDone, usage, now, "")
+		return applyFinalizingReservation(tx, reservationID, now)
 	})
+}
+
+func beginQuotaFinalization(tx *gorm.DB, reservationID string, usage QuotaUsage) error {
+	var reservation QuotaReservation
+	if err := tx.Where("id = ?", reservationID).First(&reservation).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrQuotaReservationNotFound
+		}
+		return fmt.Errorf("load quota reservation: %w", err)
+	}
+	if reservation.Status != reservationStatusOpen {
+		return nil
+	}
+	if usage.Requests == 0 {
+		usage.Requests = reservation.RequestedRequests
+	}
+	if usage.CostMicrounits == 0 {
+		usage.CostMicrounits = reservation.RequestedCostMicrounits
+	}
+	if err := validateQuotaUsage(usage); err != nil {
+		return err
+	}
+	result := tx.Model(&QuotaReservation{}).Where("id = ? AND status = ?", reservationID, reservationStatusOpen).
+		Updates(map[string]any{
+			"status":                 reservationStatusFinalizing,
+			"actual_requests":        usage.Requests,
+			"actual_tokens":          usage.Tokens,
+			"actual_images":          usage.Images,
+			"actual_cost_microunits": usage.CostMicrounits,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("record quota success: %w", result.Error)
+	}
+	return nil
 }
 
 // Release closes one reservation without charging its reserved amounts.
@@ -456,39 +479,53 @@ func (store *QuotaStore) Release(ctx context.Context, reservationID, reason stri
 			}
 			return fmt.Errorf("load quota reservation: %w", err)
 		}
-		state, err := lockQuotaState(tx, reservation.KeyID, now)
-		if err != nil {
-			return err
-		}
-		if err := tx.Where("id = ?", reservationID).First(&reservation).Error; err != nil {
-			return fmt.Errorf("reload quota reservation: %w", err)
-		}
 		if reservation.Status != reservationStatusOpen {
 			return nil
 		}
-		if err := decrementActive(&state); err != nil {
-			return err
-		}
-		bucket, err := loadQuotaBucket(tx, reservation.KeyID, reservation.PeriodStart)
-		if err != nil {
-			return err
-		}
-		if err := subtractReservation(&bucket, reservation); err != nil {
-			return err
-		}
-		if err := saveQuotaBucket(tx, bucket, now); err != nil {
-			return err
-		}
-		if err := tx.Model(&QuotaState{}).Where("key_id = ?", reservation.KeyID).Updates(map[string]any{
-			"active_requests": state.ActiveRequests, "updated_at": now,
-		}).Error; err != nil {
-			return fmt.Errorf("update quota concurrency: %w", err)
-		}
-		return markQuotaReservation(tx, reservation.ID, reservationStatusDrop, QuotaUsage{}, now, reason)
+		return releasePendingReservation(tx, reservation, now, reason)
 	})
 }
 
-// RecoverPending releases reservations left by a previous process owner.
+func releasePendingReservation(tx *gorm.DB, reservation QuotaReservation, now time.Time, reason string) error {
+	state, err := lockQuotaState(tx, reservation.KeyID, now)
+	if err != nil {
+		return err
+	}
+	var current QuotaReservation
+	if err := tx.Where("id = ?", reservation.ID).First(&current).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return fmt.Errorf("reload quota reservation: %w", err)
+	}
+	if current.Status != reservationStatusOpen {
+		return nil
+	}
+	reservation = current
+	if err := decrementActive(&state); err != nil {
+		return err
+	}
+	bucket, err := loadReservationBucket(tx, reservation)
+	if err != nil {
+		return err
+	}
+	if bucket != nil {
+		if err := subtractReservation(bucket, reservation); err != nil {
+			return err
+		}
+		if err := saveQuotaBucket(tx, *bucket, now); err != nil {
+			return err
+		}
+	}
+	if err := tx.Model(&QuotaState{}).Where("key_id = ?", reservation.KeyID).Updates(map[string]any{
+		"active_requests": state.ActiveRequests, "updated_at": now,
+	}).Error; err != nil {
+		return fmt.Errorf("update quota concurrency: %w", err)
+	}
+	return markQuotaReservation(tx, reservation.ID, reservationStatusOpen, reservationStatusDrop, QuotaUsage{}, now, reason)
+}
+
+// RecoverPending applies recorded successes and releases in-flight reservations.
 func (store *QuotaStore) RecoverPending(ctx context.Context) error {
 	if store == nil || store.db == nil {
 		return fmt.Errorf("recover quotas: %w", ErrUnavailable)
@@ -499,14 +536,25 @@ func (store *QuotaStore) RecoverPending(ctx context.Context) error {
 	now := store.now().UTC()
 	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for {
+			var finalizing []QuotaReservation
+			result := tx.Where("status = ?", reservationStatusFinalizing).
+				Order("id ASC").Limit(quotaBatchSize).Find(&finalizing)
+			if result.Error != nil {
+				return fmt.Errorf("load finalizing quota reservations: %w", result.Error)
+			}
 			var pending []QuotaReservation
-			result := tx.Where("status = ? AND owner_id <> ?", reservationStatusOpen, store.ownerID).
+			result = tx.Where("status = ? AND owner_id <> ?", reservationStatusOpen, store.ownerID).
 				Order("id ASC").Limit(quotaBatchSize).Find(&pending)
 			if result.Error != nil {
 				return fmt.Errorf("load pending quota reservations: %w", result.Error)
 			}
-			if len(pending) == 0 {
+			if len(finalizing) == 0 && len(pending) == 0 {
 				return nil
+			}
+			for _, candidate := range finalizing {
+				if err := applyFinalizingReservation(tx, candidate.ID, now); err != nil {
+					return err
+				}
 			}
 			for _, candidate := range pending {
 				var reservation QuotaReservation
@@ -519,34 +567,67 @@ func (store *QuotaStore) RecoverPending(ctx context.Context) error {
 				if reservation.Status != reservationStatusOpen || reservation.OwnerID == store.ownerID {
 					continue
 				}
-				state, err := lockQuotaState(tx, reservation.KeyID, now)
-				if err != nil {
-					return err
-				}
-				if err := decrementActive(&state); err != nil {
-					return err
-				}
-				bucket, err := loadQuotaBucket(tx, reservation.KeyID, reservation.PeriodStart)
-				if err != nil {
-					return err
-				}
-				if err := subtractReservation(&bucket, reservation); err != nil {
-					return err
-				}
-				if err := saveQuotaBucket(tx, bucket, now); err != nil {
-					return err
-				}
-				if err := tx.Model(&QuotaState{}).Where("key_id = ?", reservation.KeyID).Updates(map[string]any{
-					"active_requests": state.ActiveRequests, "updated_at": now,
-				}).Error; err != nil {
-					return fmt.Errorf("update recovered quota concurrency: %w", err)
-				}
-				if err := markQuotaReservation(tx, reservation.ID, reservationStatusDrop, QuotaUsage{}, now, "process crash recovery"); err != nil {
+				if err := releasePendingReservation(tx, reservation, now, "process crash recovery"); err != nil {
 					return err
 				}
 			}
 		}
 	})
+}
+
+func applyFinalizingReservation(tx *gorm.DB, reservationID string, now time.Time) error {
+	var reservation QuotaReservation
+	if err := tx.Where("id = ?", reservationID).First(&reservation).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return fmt.Errorf("load finalizing quota reservation: %w", err)
+	}
+	if reservation.Status != reservationStatusFinalizing {
+		return nil
+	}
+	state, err := lockQuotaState(tx, reservation.KeyID, now)
+	if err != nil {
+		return err
+	}
+	var current QuotaReservation
+	if err := tx.Where("id = ?", reservation.ID).First(&current).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return fmt.Errorf("reload finalizing quota reservation: %w", err)
+	}
+	if current.Status != reservationStatusFinalizing {
+		return nil
+	}
+	reservation = current
+	usage := QuotaUsage{
+		Requests:       reservation.ActualRequests,
+		Tokens:         reservation.ActualTokens,
+		Images:         reservation.ActualImages,
+		CostMicrounits: reservation.ActualCostMicrounits,
+	}
+	if err := validateQuotaUsage(usage); err != nil {
+		return fmt.Errorf("validate recorded quota success: %w", err)
+	}
+	if err := decrementActive(&state); err != nil {
+		return err
+	}
+	bucket, err := loadReservationBucket(tx, reservation)
+	if err != nil {
+		return err
+	}
+	if bucket != nil {
+		if err := moveReservationToUsage(tx, bucket, reservation, usage, now); err != nil {
+			return err
+		}
+	}
+	if err := tx.Model(&QuotaState{}).Where("key_id = ?", reservation.KeyID).Updates(map[string]any{
+		"active_requests": state.ActiveRequests, "updated_at": now,
+	}).Error; err != nil {
+		return fmt.Errorf("update quota concurrency: %w", err)
+	}
+	return markQuotaReservation(tx, reservation.ID, reservationStatusFinalizing, reservationStatusDone, usage, now, "")
 }
 
 func validateQuotaRequest(request QuotaRequest) error {
@@ -656,6 +737,26 @@ func loadQuotaBucket(tx *gorm.DB, keyID string, periodStart time.Time) (QuotaBuc
 	return bucket, nil
 }
 
+func loadReservationBucket(tx *gorm.DB, reservation QuotaReservation) (*QuotaBucket, error) {
+	if reservation.BucketID != nil {
+		bucketID := strings.TrimSpace(*reservation.BucketID)
+		if bucketID != "" {
+			var bucket QuotaBucket
+			if err := tx.Where("id = ?", bucketID).First(&bucket).Error; err != nil {
+				return nil, fmt.Errorf("load quota bucket: %w", err)
+			}
+			return &bucket, nil
+		}
+	}
+	if reservation.PeriodStart.IsZero() {
+		return nil, nil
+	}
+	bucket, err := loadQuotaBucket(tx, reservation.KeyID, reservation.PeriodStart)
+	if err != nil {
+		return nil, err
+	}
+	return &bucket, nil
+}
 func checkReservationCeilings(policy Policy, request QuotaRequest, now time.Time) error {
 	checks := []struct {
 		kind    string
@@ -774,7 +875,7 @@ func saveQuotaBucket(tx *gorm.DB, bucket QuotaBucket, now time.Time) error {
 	return nil
 }
 
-func markQuotaReservation(tx *gorm.DB, id, status string, usage QuotaUsage, now time.Time, reason string) error {
+func markQuotaReservation(tx *gorm.DB, id, fromStatus, status string, usage QuotaUsage, now time.Time, reason string) error {
 	updates := map[string]any{
 		"status":                 status,
 		"actual_requests":        usage.Requests,
@@ -787,12 +888,9 @@ func markQuotaReservation(tx *gorm.DB, id, status string, usage QuotaUsage, now 
 		updates["recovery_reason"] = reason
 		updates["recovery_at"] = now
 	}
-	result := tx.Model(&QuotaReservation{}).Where("id = ? AND status = ?", id, reservationStatusOpen).Updates(updates)
+	result := tx.Model(&QuotaReservation{}).Where("id = ? AND status = ?", id, fromStatus).Updates(updates)
 	if result.Error != nil {
 		return fmt.Errorf("close quota reservation: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return nil
 	}
 	return nil
 }

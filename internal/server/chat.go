@@ -260,12 +260,17 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeChatError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_response_too_large", "The upstream response is too large.")
 			return
 		}
-		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
-			handleJournalResponseError(ctx, err)
+		if err := validateQuotaUsageFromCodex(result.Response.Usage); err != nil {
+			writeChatError(ctx, http.StatusBadGateway, responsesServerErrorType, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		if err := lease.reconcile(quotaUsageFromCodex(result.Response.Usage, 0)); err != nil {
+		usage := quotaUsageFromCodex(result.Response.Usage, 0)
+		if err := lease.reconcile(usage); err != nil {
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
+			handleJournalResponseError(ctx, err)
 			return
 		}
 	}
@@ -1063,6 +1068,7 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 	}
 
 	state := newChatStreamState(model, includeUsage, writer, flusher)
+	state.lease = lease
 	streamErr := transport.Stream(requestContext, privateRequest, state.event)
 	if requestContext.Err() != nil {
 		return
@@ -1100,9 +1106,6 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 		reportJournalFailure()
 		return
 	}
-	if state.response != nil && state.response.Error == nil && state.response.Status != codex.CodexResponseStatusFailed {
-		_ = lease.reconcile(quotaUsageFromCodex(state.response.Usage, 0))
-	}
 }
 
 type chatToolStreamState struct {
@@ -1120,6 +1123,8 @@ type chatStreamState struct {
 	includeUsage bool
 	writer       http.ResponseWriter
 	flusher      http.Flusher
+	lease        *quotaLease
+	quotaFailure bool
 	roleSent     bool
 	finishSent   bool
 	text         string
@@ -1177,8 +1182,14 @@ func (state *chatStreamState) event(event codex.CodexResponseStreamEvent) error 
 		if event.Response == nil && event.Type != codex.CodexEventError {
 			return state.fail(errors.New("terminal response is missing"))
 		}
+		if event.Response == nil {
+			return state.fail(errors.New("terminal response is missing"))
+		}
+		if err := state.validateResponse(event.Response); err != nil {
+			return state.fail(err)
+		}
 		if state.includeUsage {
-			if event.Response == nil || event.Response.Usage == nil {
+			if state.lease == nil && event.Response.Usage == nil {
 				return state.fail(errors.New("upstream usage is missing"))
 			}
 			usage, err := chatResponseUsage(event.Response.Usage)
@@ -1186,6 +1197,14 @@ func (state *chatStreamState) event(event codex.CodexResponseStreamEvent) error 
 				return state.fail(err)
 			}
 			state.mappedUsage = &usage
+		}
+		if err := validateQuotaUsageFromCodex(event.Response.Usage); err != nil {
+			return state.fail(err)
+		}
+		usage := quotaUsageFromCodex(event.Response.Usage, 0)
+		if err := state.lease.reconcile(usage); err != nil {
+			state.quotaFailure = true
+			return state.fail(errQuotaFinalization)
 		}
 		if err := state.writeRole(); err != nil {
 			state.writeErr = err
@@ -1514,6 +1533,20 @@ func (state *chatStreamState) reconcileText(text string) error {
 	return state.writeText(text[len(state.text):])
 }
 
+func (state *chatStreamState) validateResponse(response *codex.CodexResponse) error {
+	if response == nil {
+		return errors.New("terminal response is missing")
+	}
+	text, _, err := chatResponseOutput(response)
+	if err != nil {
+		return err
+	}
+	if len(text) > maxChatStringBytes || !strings.HasPrefix(text, state.text) {
+		return errors.New("upstream text was inconsistent with emitted text")
+	}
+	return nil
+}
+
 func (state *chatStreamState) reconcileResponse(response *codex.CodexResponse) error {
 	if response == nil {
 		return errors.New("terminal response is missing")
@@ -1579,7 +1612,9 @@ func (state *chatStreamState) writeError(err error) error {
 		return nil
 	}
 	var responseError openai.Error
-	if errors.Is(err, errChatStreamAbort) {
+	if state.quotaFailure {
+		responseError = openai.Error{Type: responsesServerErrorType, Code: "internal_error", Message: "Internal server error."}
+	} else if errors.Is(err, errChatStreamAbort) {
 		responseError = openai.Error{Type: responsesServerErrorType, Code: "invalid_upstream_response", Message: "The upstream response was invalid."}
 	} else {
 		_, responseError = responsesError(err)

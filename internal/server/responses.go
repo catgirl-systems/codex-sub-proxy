@@ -160,12 +160,17 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_response_too_large", "The upstream response is too large.")
 			return
 		}
-		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
-			handleJournalResponseError(ctx, err)
+		if err := validateQuotaUsageFromCodex(result.Response.Usage); err != nil {
+			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
-		if err := lease.reconcile(quotaUsageFromCodex(result.Response.Usage, 0)); err != nil {
+		usage := quotaUsageFromCodex(result.Response.Usage, 0)
+		if err := lease.reconcile(usage); err != nil {
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
+			handleJournalResponseError(ctx, err)
 			return
 		}
 	}
@@ -367,7 +372,6 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	}
 
 	terminalWritten := false
-	var terminalUsage *codex.CodexUsage
 	lastSequence := -1
 	streamErr := transport.Stream(requestContext, privateRequest, func(event codex.CodexResponseStreamEvent) error {
 		if requestContext.Err() != nil {
@@ -386,6 +390,18 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		if !keep {
 			return nil
 		}
+		successTerminal := isCodexTerminal(event.Type) && event.Type != codex.CodexEventError &&
+			event.Response != nil && event.Response.Error == nil &&
+			event.Response.Status != codex.CodexResponseStatusFailed
+		if successTerminal {
+			if err := validateQuotaUsageFromCodex(event.Response.Usage); err != nil {
+				return fmt.Errorf("%w: %v", codex.ErrCodexStreamMalformed, err)
+			}
+			usage := quotaUsageFromCodex(event.Response.Usage, 0)
+			if err := lease.reconcile(usage); err != nil {
+				return err
+			}
+		}
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
 			return err
 		}
@@ -394,10 +410,6 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		}
 		if event.Error != nil || event.Type == codex.CodexEventError {
 			return errors.New("upstream error event terminated public stream")
-		}
-		if isCodexTerminal(event.Type) && event.Response != nil && event.Response.Error == nil &&
-			event.Response.Status != codex.CodexResponseStatusFailed {
-			terminalUsage = event.Response.Usage
 		}
 		return nil
 	})
@@ -410,7 +422,12 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		return
 	}
 	if !terminalWritten {
-		_, responseError := responsesError(streamErr)
+		var responseError openai.Error
+		if errors.Is(streamErr, errQuotaFinalization) {
+			responseError = openai.Error{Type: responsesServerErrorType, Code: "internal_error", Message: "Internal server error."}
+		} else {
+			_, responseError = responsesError(streamErr)
+		}
 		errorEvent := openai.ResponseErrorEvent{
 			Type:           openai.EventError,
 			Code:           responseError.Code,
@@ -439,9 +456,6 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 			writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
 		}
 		return
-	}
-	if terminalUsage != nil {
-		_ = lease.reconcile(quotaUsageFromCodex(terminalUsage, 0))
 	}
 }
 
