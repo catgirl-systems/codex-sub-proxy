@@ -106,3 +106,8 @@ func (w *journalSSEWriter) forwardFrame(frame []byte) error {
 		return err
 	})
 }
+
+func writeJournalSSEFailure(writer http.ResponseWriter, flusher http.Flusher, payload []byte) {
+	_ = writeResponsesSSERecord(writer, flusher, payload)
+	_ = writeResponsesSSERecord(writer, flusher, []byte("[DONE]"))
+}

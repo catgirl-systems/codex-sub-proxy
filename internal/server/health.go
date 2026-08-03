@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -134,34 +135,58 @@ func finishJournalRequest(ctx iris.Context, journal *Journal, request JournalReq
 	}
 }
 
-func journalPayload(ctx iris.Context, eventType string, payload []byte) error {
+func writeJournalJSON(ctx iris.Context, status int, eventType string, payload []byte) error {
 	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
-	if !ok || value == nil {
-		_, err := ctx.ResponseWriter().Write(payload)
+	if !ok || value == nil || value.journal == nil {
+		ctx.Header("Content-Type", "application/json")
+		ctx.StatusCode(status)
+		written, err := ctx.ResponseWriter().Write(payload)
+		if err == nil && written != len(payload) {
+			return errors.New("short JSON response write")
+		}
 		return err
 	}
 	return value.journal.Forward(ctx.Request().Context(), value.request, eventType, payload, func(_ context.Context, _ string) error {
-		_, err := ctx.ResponseWriter().Write(payload)
-		if err == nil {
-			if flusher, ok := ctx.ResponseWriter().(http.Flusher); ok {
-				flusher.Flush()
-			}
+		ctx.Header("Content-Type", "application/json")
+		ctx.StatusCode(status)
+		written, err := ctx.ResponseWriter().Write(payload)
+		if err == nil && written != len(payload) {
+			return errors.New("short JSON response write")
 		}
 		return err
 	})
 }
 
-func writeJournalJSON(ctx iris.Context, status int, eventType string, payload []byte) error {
-	ctx.Header("Content-Type", "application/json")
-	ctx.StatusCode(status)
-	return journalPayload(ctx, eventType, payload)
-}
-
 func writeJSON(ctx iris.Context, status int, value any) {
 	payload, err := json.Marshal(value)
 	if err != nil {
+		writeSafeInternalError(ctx)
 		return
 	}
 	payload = append(payload, '\n')
-	_ = writeJournalJSON(ctx, status, "response.json", payload)
+	if err := writeJournalJSON(ctx, status, "response.json", payload); err != nil {
+		handleJournalResponseError(ctx, err)
+	}
+}
+
+func handleJournalResponseError(ctx iris.Context, err error) {
+	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
+	if ok && value != nil && value.journal != nil {
+		if value.journal.mode == journalModeDurable && ctx.ResponseWriter().Written() < 0 {
+			value.journal.recordError(err)
+			writeSafeInternalError(ctx)
+			return
+		}
+		value.journal.recordError(err)
+		return
+	}
+	if ctx.ResponseWriter().Written() < 0 {
+		writeSafeInternalError(ctx)
+	}
+}
+
+func writeSafeInternalError(ctx iris.Context) {
+	ctx.Header("Content-Type", "application/json")
+	ctx.StatusCode(http.StatusInternalServerError)
+	_, _ = ctx.ResponseWriter().Write([]byte(`{"error":{"message":"Internal server error.","type":"server_error","code":"internal_error"}}` + "\n"))
 }

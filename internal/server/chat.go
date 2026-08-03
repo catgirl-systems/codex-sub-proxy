@@ -247,10 +247,8 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeChatError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_response_too_large", "The upstream response is too large.")
 			return
 		}
-		ctx.Header("Content-Type", "application/json")
-		ctx.StatusCode(http.StatusOK)
-		if err := journalPayload(ctx, "response.json", payload); err != nil {
-			return
+		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
+			handleJournalResponseError(ctx, err)
 		}
 	}
 }
@@ -1013,6 +1011,7 @@ func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 
 func serveChatStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, model string, includeUsage bool) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
+	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
@@ -1021,19 +1020,36 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 	if !ok {
 		return
 	}
+	baseFlusher := flusher
 	writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
 		return
 	}
-	if journalWriter, journalFlusher := newJournalSSEWriter(ctx, writer); journalWriter != nil {
-		writer = journalWriter
+	var journalWriter *journalSSEWriter
+	if wrapped, journalFlusher := newJournalSSEWriter(ctx, writer); wrapped != nil {
+		journalWriter = wrapped
+		writer = wrapped
 		flusher = journalFlusher
+	}
+	reportJournalFailure := func() bool {
+		if journalWriter == nil || journalWriter.failed == nil {
+			return false
+		}
+		journalWriter.value.journal.recordError(journalWriter.failed)
+		payload, err := json.Marshal(openai.ErrorResponse{Error: openai.Error{Type: responsesServerErrorType, Code: "internal_error", Message: "Internal server error."}})
+		if err == nil {
+			writeJournalSSEFailure(baseWriter, baseFlusher, payload)
+		}
+		return true
 	}
 
 	state := newChatStreamState(model, includeUsage, writer, flusher)
 	streamErr := transport.Stream(requestContext, privateRequest, state.event)
 	if requestContext.Err() != nil {
+		return
+	}
+	if reportJournalFailure() {
 		return
 	}
 	if state.writeErr != nil {
@@ -1047,17 +1063,24 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 		if err == nil {
 			err = errors.New("upstream stream ended without a terminal event")
 		}
-		_ = state.writeError(err)
-		_ = writeResponsesSSERecord(writer, flusher, []byte("[DONE]"))
+		if writeErr := state.writeError(err); writeErr != nil && reportJournalFailure() {
+			return
+		}
+		if writeErr := writeResponsesSSERecord(writer, flusher, []byte("[DONE]")); writeErr != nil && reportJournalFailure() {
+			return
+		}
 		return
 	}
 	if includeUsage {
 		usage := *state.mappedUsage
 		if err := state.writeChunk(chatCompletionChunk{ID: state.identity.id, Object: "chat.completion.chunk", Created: state.identity.created, Model: state.identity.model, Choices: []chatChunkChoice{}, Usage: &usage}); err != nil {
+			reportJournalFailure()
 			return
 		}
 	}
-	_ = writeResponsesSSERecord(writer, flusher, []byte("[DONE]"))
+	if err := writeResponsesSSERecord(writer, flusher, []byte("[DONE]")); err != nil {
+		reportJournalFailure()
+	}
 }
 
 type chatToolStreamState struct {

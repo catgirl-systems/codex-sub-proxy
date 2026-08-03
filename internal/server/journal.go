@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -29,12 +30,6 @@ var (
 	// ErrJournalClosed indicates that the journal no longer accepts records.
 	ErrJournalClosed = errors.New("journal is closed")
 )
-
-// JournalApply applies one journal record to an idempotent receiver.
-//
-// The receiver must use replayID as its durable uniqueness key. The journal
-// marks a record applied only after this function returns nil.
-type JournalApply func(ctx context.Context, replayID, eventType string, payload []byte) error
 
 // JournalRequestRecord stores the next sequence number for one request.
 type JournalRequestRecord struct {
@@ -66,12 +61,28 @@ func (JournalRecord) TableName() string {
 	return "journal_records"
 }
 
+// JournalReceipt is the durable projection of one recovered event.
+type JournalReceipt struct {
+	ReplayID  string    `gorm:"column:replay_id;primaryKey;size:36"`
+	RequestID string    `gorm:"column:request_id;not null;size:36"`
+	Sequence  uint64    `gorm:"column:sequence;not null"`
+	Mode      string    `gorm:"column:mode;not null;size:16"`
+	EventType string    `gorm:"column:event_type;not null;size:128"`
+	Payload   []byte    `gorm:"column:payload;not null"`
+	Checksum  []byte    `gorm:"column:checksum;not null;size:32"`
+	CreatedAt time.Time `gorm:"column:created_at;not null"`
+}
+
+func (JournalReceipt) TableName() string {
+	return "journal_receipts"
+}
+
 // MigrateJournal creates the journal tables and their uniqueness indexes.
 func MigrateJournal(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("journal database is nil")
 	}
-	if err := db.AutoMigrate(&JournalRequestRecord{}, &JournalRecord{}); err != nil {
+	if err := db.AutoMigrate(&JournalRequestRecord{}, &JournalRecord{}, &JournalReceipt{}); err != nil {
 		return fmt.Errorf("migrate journal: %w", err)
 	}
 	return nil
@@ -101,13 +112,16 @@ type Journal struct {
 	mode          string
 	queue         chan journalWork
 	drainDeadline time.Duration
+	lifecycleMu   sync.RWMutex
+	accepting     bool
+	closed        chan struct{}
+	closeOnce     sync.Once
+	closedOnce    sync.Once
+	inFlight      sync.WaitGroup
 
-	lifecycleMu sync.RWMutex
-	accepting   bool
-	closed      chan struct{}
-	closeOnce   sync.Once
-	inFlight    sync.WaitGroup
-
+	enqueueMu      sync.Mutex
+	closing        bool
+	enqueueErr     error
 	workerMu       sync.Mutex
 	workerStarted  bool
 	workerCancel   context.CancelFunc
@@ -120,6 +134,7 @@ type Journal struct {
 
 	errorMu   sync.Mutex
 	workerErr error
+	errorSink chan<- error
 }
 
 func newJournal(db *gorm.DB, mode string, queueCapacity int, drainDeadline time.Duration) (*Journal, error) {
@@ -169,9 +184,8 @@ func (j *Journal) Start() error {
 		return nil
 	}
 	j.lifecycleMu.RLock()
-	accepting := j.accepting
-	j.lifecycleMu.RUnlock()
-	if !accepting {
+	defer j.lifecycleMu.RUnlock()
+	if !j.accepting {
 		return ErrJournalClosed
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -309,19 +323,15 @@ func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType
 		records = append(records, state.requestRecord)
 	}
 	records = append(records, record)
-	applyErr := apply(ctx, replayID)
-	queueErr := j.enqueue(ctx, journalWork{records: records})
-	if queueErr == nil {
-		state.requestQueued = true
-		state.nextSequence++
-	}
-	if applyErr != nil && queueErr != nil {
-		return errors.Join(applyErr, queueErr)
-	}
-	if applyErr != nil {
+	if applyErr := apply(ctx, replayID); applyErr != nil {
 		return applyErr
 	}
-	return queueErr
+	if queueErr := j.enqueue(ctx, journalWork{records: records}); queueErr != nil {
+		return queueErr
+	}
+	state.requestQueued = true
+	state.nextSequence++
+	return nil
 }
 
 func (j *Journal) requestState(request JournalRequest) *journalRequestState {
@@ -341,6 +351,7 @@ func (j *Journal) appendDurable(ctx context.Context, state *journalRequestState,
 			return fmt.Errorf("load journal request %q: %w", state.request.ID, err)
 		}
 		record.Sequence = requestRow.NextSequence
+		record.Checksum = journalChecksum(record)
 		if err := tx.Model(&JournalRequestRecord{}).
 			Where("request_id = ?", state.request.ID).
 			Update("next_sequence", requestRow.NextSequence+1).Error; err != nil {
@@ -355,6 +366,7 @@ func (j *Journal) appendDurable(ctx context.Context, state *journalRequestState,
 
 // CompleteRequest records a best-effort request that produced no output.
 func (j *Journal) CompleteRequest(ctx context.Context, request JournalRequest) error {
+	defer j.deleteRequest(request.ID)
 	if ctx == nil {
 		return errors.New("journal completion context is nil")
 	}
@@ -374,23 +386,49 @@ func (j *Journal) CompleteRequest(ctx context.Context, request JournalRequest) e
 		}
 		state.requestQueued = true
 	}
-	j.requestsMu.Lock()
-	delete(j.requests, request.ID)
-	j.requestsMu.Unlock()
 	return nil
 }
 
+func (j *Journal) deleteRequest(requestID string) {
+	j.requestsMu.Lock()
+	delete(j.requests, requestID)
+	j.requestsMu.Unlock()
+}
+
 func (j *Journal) enqueue(ctx context.Context, work journalWork) error {
+	if ctx == nil {
+		return errors.New("journal queue context is nil")
+	}
 	if j.queue == nil {
 		return errors.New("journal worker is not running")
 	}
-	select {
-	case j.queue <- work:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("journal queue backpressure: %w", ctx.Err())
-	case <-j.closed:
-		return ErrJournalClosed
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("journal queue backpressure: %w", ctx.Err())
+		default:
+		}
+		j.enqueueMu.Lock()
+		if j.closing {
+			err := j.enqueueErr
+			j.enqueueMu.Unlock()
+			if err == nil {
+				return ErrJournalClosed
+			}
+			return err
+		}
+		select {
+		case j.queue <- work:
+			j.enqueueMu.Unlock()
+			return nil
+		default:
+			j.enqueueMu.Unlock()
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("journal queue backpressure: %w", ctx.Err())
+		case <-j.closed:
+		}
 	}
 }
 
@@ -437,14 +475,29 @@ func (j *Journal) recordError(err error) {
 		return
 	}
 	j.errorMu.Lock()
-	if j.workerErr == nil {
-		j.workerErr = err
+	if j.workerErr != nil {
+		j.errorMu.Unlock()
+		return
 	}
+	j.workerErr = err
+	sink := j.errorSink
+	j.errorMu.Unlock()
+	if sink != nil {
+		select {
+		case sink <- err:
+		default:
+		}
+	}
+}
+
+func (j *Journal) setErrorSink(sink chan<- error) {
+	j.errorMu.Lock()
+	j.errorSink = sink
 	j.errorMu.Unlock()
 }
 
-// Replay applies pending records in stable database order.
-func (j *Journal) Replay(ctx context.Context, apply JournalApply) error {
+// Replay applies pending records to the durable receipt projection.
+func (j *Journal) Replay(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("journal replay context is nil")
 	}
@@ -452,33 +505,9 @@ func (j *Journal) Replay(ctx context.Context, apply JournalApply) error {
 		return err
 	}
 	defer j.endOperation()
-	var pending int64
-	if err := j.db.WithContext(ctx).
-		Model(&JournalRecord{}).
-		Where("applied = ?", false).
-		Count(&pending).Error; err != nil {
-		return fmt.Errorf("count pending journal records: %w", err)
-	}
-	if pending == 0 {
-		return nil
-	}
-	if apply == nil {
-		return errors.New("journal replay callback is required")
-	}
-	var oversized int64
-	if err := j.db.WithContext(ctx).
-		Model(&JournalRecord{}).
-		Where("applied = ? AND length(payload) > ?", false, maxJournalPayloadBytes).
-		Count(&oversized).Error; err != nil {
-		return fmt.Errorf("check pending journal payload sizes: %w", err)
-	}
-	if oversized != 0 {
-		return errors.New("pending journal payload exceeds limit")
-	}
 	for {
 		var record JournalRecord
 		result := j.db.WithContext(ctx).
-			Model(&JournalRecord{}).
 			Where("applied = ?", false).
 			Order("created_at asc").
 			Order("replay_id asc").
@@ -493,17 +522,81 @@ func (j *Journal) Replay(ctx context.Context, apply JournalApply) error {
 		if err := validateJournalRecord(record); err != nil {
 			return fmt.Errorf("validate journal replay %q: %w", record.ReplayID, err)
 		}
-		if err := apply(ctx, record.ReplayID, record.EventType, append([]byte(nil), record.Payload...)); err != nil {
+		if err := j.applyReceipt(ctx, record); err != nil {
 			return fmt.Errorf("apply journal replay %q: %w", record.ReplayID, err)
-		}
-		if err := j.markApplied(ctx, record.ReplayID); err != nil {
-			return fmt.Errorf("mark journal replay %q applied: %w", record.ReplayID, err)
 		}
 	}
 }
 
-func (j *Journal) markApplied(ctx context.Context, replayID string) error {
+func (j *Journal) applyReceipt(ctx context.Context, record JournalRecord) error {
 	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var source JournalRecord
+		if err := tx.Where("replay_id = ?", record.ReplayID).First(&source).Error; err != nil {
+			return fmt.Errorf("load journal source: %w", err)
+		}
+		if source.Applied {
+			return nil
+		}
+		if err := validateJournalRecord(source); err != nil {
+			return err
+		}
+		var receipt JournalReceipt
+		receiptResult := tx.Where("replay_id = ?", source.ReplayID).Limit(1).Find(&receipt)
+		if receiptResult.Error != nil {
+			return fmt.Errorf("load journal receipt: %w", receiptResult.Error)
+		}
+		if receiptResult.RowsAffected != 0 {
+			if !journalReceiptMatches(receipt, source) {
+				return errors.New("journal receipt does not match source record")
+			}
+		} else {
+			receipt = JournalReceipt{
+				ReplayID:  source.ReplayID,
+				RequestID: source.RequestID,
+				Sequence:  source.Sequence,
+				Mode:      source.Mode,
+				EventType: source.EventType,
+				Payload:   append([]byte{}, source.Payload...),
+				Checksum:  append([]byte{}, source.Checksum...),
+				CreatedAt: source.CreatedAt,
+			}
+			if err := tx.Create(&receipt).Error; err != nil {
+				return fmt.Errorf("store journal receipt: %w", err)
+			}
+		}
+		now := time.Now().UTC()
+		result := tx.Model(&JournalRecord{}).
+			Where("replay_id = ? AND applied = ?", source.ReplayID, false).
+			Updates(map[string]any{"applied": true, "applied_at": now})
+		if result.Error != nil {
+			return fmt.Errorf("mark journal source applied: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			var current JournalRecord
+			if err := tx.Where("replay_id = ?", source.ReplayID).First(&current).Error; err != nil {
+				return err
+			}
+			if !current.Applied {
+				return errors.New("journal source was not marked applied")
+			}
+		}
+		return nil
+	})
+}
+
+func journalReceiptMatches(receipt JournalReceipt, record JournalRecord) bool {
+	return receipt.ReplayID == record.ReplayID &&
+		receipt.RequestID == record.RequestID &&
+		receipt.Sequence == record.Sequence &&
+		receipt.Mode == record.Mode &&
+		receipt.EventType == record.EventType &&
+		bytes.Equal(receipt.Payload, record.Payload) &&
+		bytes.Equal(receipt.Checksum, record.Checksum) &&
+		receipt.CreatedAt.Equal(record.CreatedAt)
+}
+
+func (j *Journal) markApplied(ctx context.Context, replayID string) error {
+	return j.db.WithContext(context.WithoutCancel(ctx)).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UTC()
 		result := tx.Model(&JournalRecord{}).
 			Where("replay_id = ? AND applied = ?", replayID, false).
@@ -537,7 +630,6 @@ func (j *Journal) Close(ctx context.Context) error {
 	j.closeOnce.Do(func() {
 		j.lifecycleMu.Lock()
 		j.accepting = false
-		close(j.closed)
 		j.lifecycleMu.Unlock()
 	})
 	inFlightDone := make(chan struct{})
@@ -548,6 +640,7 @@ func (j *Journal) Close(ctx context.Context) error {
 	select {
 	case <-inFlightDone:
 	case <-drainContext.Done():
+		j.stopEnqueue(drainContext.Err())
 		j.stopWorker(true)
 		j.waitWorker()
 		return j.closeError(drainContext.Err())
@@ -558,18 +651,34 @@ func (j *Journal) Close(ctx context.Context) error {
 	workerDone := j.workerDone
 	j.workerMu.Unlock()
 	if !workerStarted && len(j.queue) != 0 {
+		j.stopEnqueue(nil)
 		return j.closeError(errors.New("journal worker was not started"))
 	}
 	if workerStarted {
 		select {
 		case <-workerDone:
 		case <-drainContext.Done():
+			j.stopEnqueue(drainContext.Err())
 			j.stopWorker(true)
 			j.waitWorker()
 			return j.closeError(drainContext.Err())
 		}
 	}
+	j.stopEnqueue(nil)
 	return j.closeError(nil)
+}
+
+func (j *Journal) stopEnqueue(cause error) {
+	j.enqueueMu.Lock()
+	j.closing = true
+	if j.enqueueErr == nil {
+		if cause == nil {
+			cause = ErrJournalClosed
+		}
+		j.enqueueErr = cause
+	}
+	j.closedOnce.Do(func() { close(j.closed) })
+	j.enqueueMu.Unlock()
 }
 
 func (j *Journal) stopWorker(cancel bool) {
@@ -610,23 +719,27 @@ func (j *Journal) closeError(cause error) error {
 }
 
 func newJournalRecord(replayID, requestID string, sequence uint64, mode, eventType string, payload []byte, applied bool) (JournalRecord, error) {
+	if !validJournalUUID(replayID) || !validJournalUUID(requestID) {
+		return JournalRecord{}, errors.New("journal record ID is invalid")
+	}
 	if err := validateJournalMode(mode); err != nil {
 		return JournalRecord{}, err
 	}
 	if err := validateJournalEvent(eventType, payload); err != nil {
 		return JournalRecord{}, err
 	}
-	return JournalRecord{
+	record := JournalRecord{
 		ReplayID:  replayID,
 		RequestID: requestID,
 		Sequence:  sequence,
 		Mode:      mode,
 		EventType: eventType,
 		Payload:   append([]byte{}, payload...),
-		Checksum:  journalChecksum(payload),
 		CreatedAt: time.Now().UTC(),
 		Applied:   applied,
-	}, nil
+	}
+	record.Checksum = journalChecksum(record)
+	return record, nil
 }
 
 func validateJournalMode(mode string) error {
@@ -656,7 +769,7 @@ func validateJournalRecord(record JournalRecord) error {
 	if err := validateJournalEvent(record.EventType, record.Payload); err != nil {
 		return err
 	}
-	if len(record.Checksum) != sha256.Size || !bytes.Equal(record.Checksum, journalChecksum(record.Payload)) {
+	if len(record.Checksum) != sha256.Size || !bytes.Equal(record.Checksum, journalChecksum(record)) {
 		return errors.New("journal record checksum is invalid")
 	}
 	if record.CreatedAt.IsZero() {
@@ -665,9 +778,27 @@ func validateJournalRecord(record JournalRecord) error {
 	return nil
 }
 
-func journalChecksum(payload []byte) []byte {
-	sum := sha256.Sum256(payload)
-	return append([]byte(nil), sum[:]...)
+func journalChecksum(record JournalRecord) []byte {
+	hash := sha256.New()
+	hash.Write([]byte("codex-sub-proxy journal record v1"))
+	writeBytes := func(value []byte) {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write(value)
+	}
+	writeString := func(value string) {
+		writeBytes([]byte(value))
+	}
+	writeString(record.ReplayID)
+	writeString(record.RequestID)
+	var sequence [8]byte
+	binary.BigEndian.PutUint64(sequence[:], record.Sequence)
+	_, _ = hash.Write(sequence[:])
+	writeString(record.Mode)
+	writeString(record.EventType)
+	writeBytes(record.Payload)
+	return hash.Sum(nil)
 }
 
 func newJournalUUID() (string, error) {

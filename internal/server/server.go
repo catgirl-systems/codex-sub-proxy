@@ -29,7 +29,6 @@ type Config struct {
 	JournalMode          string
 	JournalQueueCapacity int
 	JournalDrainDeadline time.Duration
-	JournalApply         JournalApply
 }
 
 type Servers struct {
@@ -56,6 +55,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
 
+	errorsChannel := make(chan error, 8)
 	var journal *Journal
 	if cfg.Database != nil {
 		if err := MigrateJournal(cfg.Database); err != nil {
@@ -66,7 +66,8 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if err != nil {
 			return nil, err
 		}
-		if err := journal.Replay(context.Background(), cfg.JournalApply); err != nil {
+		journal.setErrorSink(errorsChannel)
+		if err := journal.Replay(context.Background()); err != nil {
 			return nil, fmt.Errorf("replay journal: %w", err)
 		}
 		if err := journal.Start(); err != nil {
@@ -122,7 +123,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		adminListener: adminListener,
 		dataAddr:      dataListener.Addr().String(),
 		adminAddr:     adminListener.Addr().String(),
-		errors:        make(chan error, 2),
+		errors:        errorsChannel,
 		journal:       journal,
 	}
 

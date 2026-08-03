@@ -186,6 +186,77 @@ func TestJournalQueueBackpressureHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestBestEffortFailedForwardDoesNotQueueOutput(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeBestEffort, 1)
+	request, err := journal.BeginRequest(context.Background())
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte("never delivered"), func(context.Context, string) error {
+		return errors.New("forward failed")
+	}); err == nil {
+		t.Fatal("failed forward succeeded")
+	}
+	var outputCount int64
+	if err := db.Model(&JournalRecord{}).Where("event_type = ?", "response.json").Count(&outputCount).Error; err != nil {
+		t.Fatalf("count output records: %v", err)
+	}
+	if outputCount != 0 || len(journal.queue) != 0 {
+		t.Fatalf("failed output was queued: rows=%d queue=%d", outputCount, len(journal.queue))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := journal.CompleteRequest(ctx, request); err == nil {
+		t.Fatal("canceled completion succeeded")
+	}
+	if journal.requestState(request) != nil {
+		t.Fatal("request state remained after canceled completion")
+	}
+	if err := journal.Close(context.Background()); err != nil {
+		t.Fatalf("close journal: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get database: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+}
+
+func TestJournalCloseDeadlineUnblocksAdmittedEnqueue(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeBestEffort, 1)
+	journal.queue <- journalWork{records: []JournalRecord{{ReplayID: "filled"}}}
+	if err := journal.beginOperation(); err != nil {
+		t.Fatalf("admit enqueue: %v", err)
+	}
+	forwardDone := make(chan error, 1)
+	go func() {
+		defer journal.endOperation()
+		forwardDone <- journal.enqueue(context.Background(), journalWork{records: []JournalRecord{{ReplayID: "blocked"}}})
+	}()
+	closeContext, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := journal.Close(closeContext); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close error = %v, want deadline", err)
+	}
+	select {
+	case err := <-forwardDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("admitted enqueue error = %v, want deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admitted enqueue remained blocked")
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get database: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+}
+
 func TestJournalReplayRejectsChecksumCorruption(t *testing.T) {
 	journal, db := openTestJournal(t, journalModeDurable, 1)
 	request, err := journal.BeginRequest(context.Background())
@@ -207,54 +278,47 @@ func TestJournalReplayRejectsChecksumCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen journal: %v", err)
 	}
-	called := false
-	if err := journal.Replay(context.Background(), func(context.Context, string, string, []byte) error {
-		called = true
-		return nil
-	}); err == nil {
+	if err := journal.Replay(context.Background()); err == nil {
 		t.Fatal("corrupt journal replay succeeded")
 	}
-	if called {
-		t.Fatal("corrupt record reached receiver")
+	var receipts int64
+	if err := db.Model(&JournalReceipt{}).Count(&receipts).Error; err != nil {
+		t.Fatalf("count receipts: %v", err)
+	}
+	if receipts != 0 {
+		t.Fatalf("receipt count = %d, want 0", receipts)
 	}
 	closeTestJournal(t, journal, db)
 }
 
 func TestJournalReplayUsesReplayIDForIdempotence(t *testing.T) {
 	journal, db := openTestJournal(t, journalModeDurable, 1)
-	seen := make(map[string]struct{})
 	request, err := journal.BeginRequest(context.Background())
 	if err != nil {
 		t.Fatalf("begin request: %v", err)
 	}
-	if err := journal.Forward(context.Background(), request, "response.json", []byte("payload"), func(_ context.Context, replayID string) error {
-		seen[replayID] = struct{}{}
-		return errors.New("crash after receiver apply")
+	if err := journal.Forward(context.Background(), request, "response.json", []byte("payload"), func(context.Context, string) error {
+		return errors.New("leave pending")
 	}); err == nil {
 		t.Fatal("forward unexpectedly succeeded")
-	}
-	if len(seen) != 1 {
-		t.Fatalf("receiver calls before reopen = %d, want 1", len(seen))
 	}
 	if err := journal.Close(context.Background()); err != nil {
 		t.Fatalf("close journal: %v", err)
 	}
+
 	journal, err = newJournal(db, journalModeDurable, 1, time.Second)
 	if err != nil {
 		t.Fatalf("reopen journal: %v", err)
 	}
-	apply := func(_ context.Context, replayID, _ string, _ []byte) error {
-		if _, exists := seen[replayID]; exists {
-			return nil
-		}
-		seen[replayID] = struct{}{}
-		return errors.New("forced crash")
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay after reopen: %v", err)
 	}
-	if err := journal.Replay(context.Background(), apply); err != nil {
-		t.Fatalf("replay after receiver apply: %v", err)
+	var receipts []JournalReceipt
+	if err := db.Find(&receipts).Error; err != nil {
+		t.Fatalf("load receipts: %v", err)
 	}
-	if len(seen) != 1 {
-		t.Fatalf("receiver calls after reopen = %d, want 1", len(seen))
+	if len(receipts) != 1 {
+		t.Fatalf("receipt count after replay = %d, want 1", len(receipts))
 	}
 	var pending int64
 	if err := db.Model(&JournalRecord{}).Where("applied = ?", false).Count(&pending).Error; err != nil {
@@ -262,6 +326,92 @@ func TestJournalReplayUsesReplayIDForIdempotence(t *testing.T) {
 	}
 	if pending != 0 {
 		t.Fatalf("pending records after replay = %d, want 0", pending)
+	}
+	if err := db.Model(&JournalRecord{}).Where("replay_id = ?", receipts[0].ReplayID).Update("applied", false).Error; err != nil {
+		t.Fatalf("reset source state: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay duplicate receipt: %v", err)
+	}
+	if err := db.Model(&JournalReceipt{}).Count(&pending).Error; err != nil {
+		t.Fatalf("count duplicate receipts: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("receipt count after duplicate replay = %d, want 1", pending)
+	}
+	closeTestJournal(t, journal, db)
+}
+func TestJournalReplayRejectsImmutableFieldTampering(t *testing.T) {
+	tamperers := []struct {
+		name string
+		edit func(*JournalRecord)
+	}{
+		{name: "replay id", edit: func(record *JournalRecord) {
+			record.ReplayID = "11111111-1111-4111-8111-111111111111"
+		}},
+		{name: "request id", edit: func(record *JournalRecord) {
+			record.RequestID = "22222222-2222-4222-8222-222222222222"
+		}},
+		{name: "sequence", edit: func(record *JournalRecord) {
+			record.Sequence++
+		}},
+		{name: "mode", edit: func(record *JournalRecord) {
+			record.Mode = journalModeBestEffort
+		}},
+		{name: "event type", edit: func(record *JournalRecord) {
+			record.EventType = "tampered.event"
+		}},
+		{name: "payload", edit: func(record *JournalRecord) {
+			record.Payload = []byte("tampered payload")
+		}},
+	}
+	for _, test := range tamperers {
+		t.Run(test.name, func(t *testing.T) {
+			journal, db := openTestJournal(t, journalModeDurable, 1)
+			request, err := journal.BeginRequest(context.Background())
+			if err != nil {
+				t.Fatalf("begin request: %v", err)
+			}
+			if err := journal.Forward(context.Background(), request, "response.json", []byte("payload"), func(context.Context, string) error {
+				return errors.New("leave pending")
+			}); err == nil {
+				t.Fatal("forward unexpectedly succeeded")
+			}
+			var record JournalRecord
+			if err := db.Where("event_type = ?", "response.json").First(&record).Error; err != nil {
+				t.Fatalf("load record: %v", err)
+			}
+			originalReplayID := record.ReplayID
+			test.edit(&record)
+			if err := db.Model(&JournalRecord{}).Where("replay_id = ?", originalReplayID).Updates(map[string]any{
+				"replay_id":  record.ReplayID,
+				"request_id": record.RequestID,
+				"sequence":   record.Sequence,
+				"mode":       record.Mode,
+				"event_type": record.EventType,
+				"payload":    record.Payload,
+			}).Error; err != nil {
+				t.Fatalf("save tampered record: %v", err)
+			}
+			if err := journal.Close(context.Background()); err != nil {
+				t.Fatalf("close seed journal: %v", err)
+			}
+			journal, err = newJournal(db, journalModeDurable, 1, time.Second)
+			if err != nil {
+				t.Fatalf("reopen journal: %v", err)
+			}
+			if err := journal.Replay(context.Background()); err == nil {
+				t.Fatal("tampered replay succeeded")
+			}
+			var receipts int64
+			if err := db.Model(&JournalReceipt{}).Count(&receipts).Error; err != nil {
+				t.Fatalf("count receipts: %v", err)
+			}
+			if receipts != 0 {
+				t.Fatalf("receipt count = %d, want 0", receipts)
+			}
+			closeTestJournal(t, journal, db)
+		})
 	}
 }
 
@@ -290,6 +440,7 @@ func TestJournalSequencesAndReplayIDsAreUniqueUnderConcurrency(t *testing.T) {
 			t.Fatalf("concurrent forward: %v", err)
 		}
 	}
+
 	var records []JournalRecord
 	if err := db.Where("request_id = ?", request.ID).Order("sequence asc").Find(&records).Error; err != nil {
 		t.Fatalf("load records: %v", err)
@@ -304,6 +455,95 @@ func TestJournalSequencesAndReplayIDsAreUniqueUnderConcurrency(t *testing.T) {
 	}
 	if err := journal.CompleteRequest(context.Background(), request); err != nil {
 		t.Fatalf("complete request: %v", err)
+	}
+}
+func TestServerStartupReplaysPendingJournalReceipt(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 1)
+	request, err := journal.BeginRequest(context.Background())
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"recovered":true}`), func(context.Context, string) error {
+		return errors.New("forced interruption")
+	}); err == nil {
+		t.Fatal("forward unexpectedly succeeded")
+	}
+	if err := journal.Close(context.Background()); err != nil {
+		t.Fatalf("close seed journal: %v", err)
+	}
+
+	start := func() *Servers {
+		servers, err := startWithWriteTimeout(Config{
+			Listen:      "127.0.0.1:0",
+			AdminListen: "127.0.0.1:0",
+			Database:    db,
+		}, NewReadiness(), time.Second)
+		if err != nil {
+			t.Fatalf("start server: %v", err)
+		}
+		return servers
+	}
+	servers := start()
+	var receipts int64
+	if err := db.Model(&JournalReceipt{}).Count(&receipts).Error; err != nil {
+		t.Fatalf("count startup receipts: %v", err)
+	}
+	if receipts != 1 {
+		t.Fatalf("startup receipt count = %d, want 1", receipts)
+	}
+	if err := servers.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown first server: %v", err)
+	}
+	servers = start()
+	if err := db.Model(&JournalReceipt{}).Count(&receipts).Error; err != nil {
+		t.Fatalf("count repeated receipts: %v", err)
+	}
+	if receipts != 1 {
+		t.Fatalf("repeated receipt count = %d, want 1", receipts)
+	}
+	if err := servers.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown second server: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get database: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+}
+
+func TestServerStartupRejectsCorruptPendingJournal(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 1)
+	request, err := journal.BeginRequest(context.Background())
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte("corrupt me"), func(context.Context, string) error {
+		return errors.New("forced interruption")
+	}); err == nil {
+		t.Fatal("forward unexpectedly succeeded")
+	}
+	if err := db.Model(&JournalRecord{}).Where("event_type = ?", "response.json").Update("event_type", "tampered").Error; err != nil {
+		t.Fatalf("tamper journal event: %v", err)
+	}
+	if err := journal.Close(context.Background()); err != nil {
+		t.Fatalf("close seed journal: %v", err)
+	}
+	_, err = startWithWriteTimeout(Config{
+		Listen:      "127.0.0.1:0",
+		AdminListen: "127.0.0.1:0",
+		Database:    db,
+	}, NewReadiness(), time.Second)
+	if err == nil {
+		t.Fatal("corrupt journal allowed server startup")
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get database: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
 	}
 }
 func TestResponsesStreamWritesEachJournaledFrameOnce(t *testing.T) {

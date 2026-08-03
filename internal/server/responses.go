@@ -134,10 +134,8 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_response_too_large", "The upstream response is too large.")
 			return
 		}
-		ctx.Header("Content-Type", "application/json")
-		ctx.StatusCode(http.StatusOK)
-		if err := journalPayload(ctx, "response.json", payload); err != nil {
-			return
+		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
+			handleJournalResponseError(ctx, err)
 		}
 	}
 }
@@ -315,6 +313,7 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 
 func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
+	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
@@ -323,13 +322,16 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	if !ok {
 		return
 	}
+	baseFlusher := flusher
 	writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
 		return
 	}
-	if journalWriter, journalFlusher := newJournalSSEWriter(ctx, writer); journalWriter != nil {
-		writer = journalWriter
+	var journalWriter *journalSSEWriter
+	if wrapped, journalFlusher := newJournalSSEWriter(ctx, writer); wrapped != nil {
+		journalWriter = wrapped
+		writer = wrapped
 		flusher = journalFlusher
 	}
 
@@ -366,6 +368,11 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	if requestContext.Err() != nil {
 		return
 	}
+	if journalWriter != nil && journalWriter.failed != nil {
+		journalWriter.value.journal.recordError(journalWriter.failed)
+		writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
+		return
+	}
 	if !terminalWritten {
 		_, responseError := responsesError(streamErr)
 		errorEvent := openai.ResponseErrorEvent{
@@ -379,6 +386,10 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 			return
 		}
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
+			if journalWriter != nil && journalWriter.failed != nil {
+				journalWriter.value.journal.recordError(journalWriter.failed)
+				writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
+			}
 			return
 		}
 		terminalWritten = true
@@ -386,7 +397,12 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	if requestContext.Err() != nil {
 		return
 	}
-	_ = writeResponsesSSERecord(writer, flusher, []byte("[DONE]"))
+	if err := writeResponsesSSERecord(writer, flusher, []byte("[DONE]")); err != nil {
+		if journalWriter != nil && journalWriter.failed != nil {
+			journalWriter.value.journal.recordError(journalWriter.failed)
+			writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
+		}
+	}
 }
 
 func writeResponsesSSERecord(writer http.ResponseWriter, flusher http.Flusher, payload []byte) error {
