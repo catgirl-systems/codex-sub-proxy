@@ -24,7 +24,7 @@ type modelsResponse struct {
 	Data   []modelObject `json:"data"`
 }
 
-func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imageClients ...*codex.ImagesClient) (*iris.Application, error) {
+func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal) (*iris.Application, error) {
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
 	app.Get(modelsEndpoint, func(ctx iris.Context) {
@@ -52,14 +52,10 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 		}
 		writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
 	})
-	app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport))
-	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport))
-	var imagesClient *codex.ImagesClient
-	if len(imageClients) > 0 {
-		imagesClient = imageClients[0]
-	}
-	app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient))
-	app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient))
+	app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport, journal))
+	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal))
+	app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal))
+	app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal))
 	if err := app.Build(); err != nil {
 		return nil, err
 	}

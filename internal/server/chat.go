@@ -125,7 +125,7 @@ type chatNamedToolFunction struct {
 	Name string `json:"name" validate:"required,max=64"`
 }
 
-func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport) iris.Handler {
+func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		request := ctx.Request()
@@ -192,6 +192,14 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeAPIKeyError(ctx, err)
 			return
 		}
+		journalRequestID, err := startJournalRequest(ctx, journal)
+		if err != nil {
+			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		if journal != nil {
+			defer finishJournalRequest(ctx, journal, journalRequestID)
+		}
 		if transport == nil {
 			writeChatError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -241,7 +249,9 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 		}
 		ctx.Header("Content-Type", "application/json")
 		ctx.StatusCode(http.StatusOK)
-		_, _ = ctx.ResponseWriter().Write(payload)
+		if err := journalPayload(ctx, "response.json", payload); err != nil {
+			return
+		}
 	}
 }
 
@@ -1002,7 +1012,7 @@ func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 }
 
 func serveChatStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, model string, includeUsage bool) {
-	writer := ctx.ResponseWriter()
+	var writer http.ResponseWriter = ctx.ResponseWriter()
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
@@ -1013,8 +1023,12 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 	}
 	writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
-	if err := http.NewResponseController(writer.Naive()).SetWriteDeadline(time.Time{}); err != nil {
+	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
 		return
+	}
+	if journalWriter, journalFlusher := newJournalSSEWriter(ctx, writer); journalWriter != nil {
+		writer = journalWriter
+		flusher = journalFlusher
 	}
 
 	state := newChatStreamState(model, includeUsage, writer, flusher)

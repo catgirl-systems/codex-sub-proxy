@@ -76,6 +76,8 @@ func run(args []string) error {
 			log.Printf("storage is unavailable: %v", err)
 		} else if err := apikey.Migrate(db); err != nil {
 			log.Printf("storage is unavailable: %v", err)
+		} else if err := server.MigrateJournal(db); err != nil {
+			log.Printf("storage is unavailable: %v", err)
 		} else {
 			storageReady = true
 		}
@@ -129,12 +131,15 @@ func run(args []string) error {
 
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 	servers, err := server.Start(server.Config{
-		Listen:             cfg.Server.Listen,
-		AdminListen:        cfg.Server.AdminListen,
-		Database:           db,
-		APIKeyHMACKey:      apiKeyHMACKey,
-		ResponsesTransport: responsesTransport,
-		ImagesClient:       imagesClient,
+		Listen:               cfg.Server.Listen,
+		AdminListen:          cfg.Server.AdminListen,
+		Database:             db,
+		APIKeyHMACKey:        apiKeyHMACKey,
+		ResponsesTransport:   responsesTransport,
+		ImagesClient:         imagesClient,
+		JournalMode:          string(cfg.Journal.Mode),
+		JournalQueueCapacity: cfg.Journal.QueueCapacity,
+		JournalDrainDeadline: cfg.Journal.DrainDeadline,
 	}, readiness)
 	if err != nil {
 		return err

@@ -28,7 +28,7 @@ const (
 	responsesServerErrorType = "server_error"
 )
 
-func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport) iris.Handler {
+func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		request := ctx.Request()
@@ -86,6 +86,14 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeAPIKeyError(ctx, err)
 			return
 		}
+		journalRequestID, err := startJournalRequest(ctx, journal)
+		if err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		if journal != nil {
+			defer finishJournalRequest(ctx, journal, journalRequestID)
+		}
 		if transport == nil {
 			writeResponsesError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -128,7 +136,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 		}
 		ctx.Header("Content-Type", "application/json")
 		ctx.StatusCode(http.StatusOK)
-		if _, err := ctx.ResponseWriter().Write(payload); err != nil {
+		if err := journalPayload(ctx, "response.json", payload); err != nil {
 			return
 		}
 	}
@@ -306,7 +314,7 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 }
 
 func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest) {
-	writer := ctx.ResponseWriter()
+	var writer http.ResponseWriter = ctx.ResponseWriter()
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
@@ -317,8 +325,12 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	}
 	writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
-	if err := http.NewResponseController(writer.Naive()).SetWriteDeadline(time.Time{}); err != nil {
+	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
 		return
+	}
+	if journalWriter, journalFlusher := newJournalSSEWriter(ctx, writer); journalWriter != nil {
+		writer = journalWriter
+		flusher = journalFlusher
 	}
 
 	terminalWritten := false

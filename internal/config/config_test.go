@@ -37,6 +37,38 @@ func TestLoadEmptyFileAndEnvironmentOverrides(t *testing.T) {
 		t.Fatalf("credential file = %q", cfg.Codex.CredentialFile)
 	}
 }
+func TestJournalConfigDefaultsAndEnvironmentOverrides(t *testing.T) {
+	defaults := Default()
+	if defaults.Journal.Mode != JournalModeDurable {
+		t.Fatalf("journal mode = %q, want %q", defaults.Journal.Mode, JournalModeDurable)
+	}
+	if defaults.Journal.QueueCapacity != defaultJournalQueueCapacity {
+		t.Fatalf("journal queue capacity = %d, want %d", defaults.Journal.QueueCapacity, defaultJournalQueueCapacity)
+	}
+	if defaults.Journal.DrainDeadline != defaultJournalDrainDeadline {
+		t.Fatalf("journal drain deadline = %s, want %s", defaults.Journal.DrainDeadline, defaultJournalDrainDeadline)
+	}
+	t.Setenv("CSP_JOURNAL_MODE", string(JournalModeBestEffort))
+	t.Setenv("CSP_JOURNAL_QUEUE_CAPACITY", "3")
+	t.Setenv("CSP_JOURNAL_DRAIN_DEADLINE", "2s")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load journal config: %v", err)
+	}
+	if cfg.Journal.Mode != JournalModeBestEffort || cfg.Journal.QueueCapacity != 3 || cfg.Journal.DrainDeadline != 2*time.Second {
+		t.Fatalf("journal config = %+v", cfg.Journal)
+	}
+}
+
+func TestJournalConfigRejectsInvalidMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[journal]\nmode = \"other\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("invalid journal mode was accepted")
+	}
+}
 
 func TestResponsesTransportPolicyDefaultsToWebSocketAndRejectsUnknownValues(t *testing.T) {
 	if got := Default().Codex.ResponsesTransport; got != ResponsesTransportWebSocketPreferred {

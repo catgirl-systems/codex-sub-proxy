@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,11 +16,13 @@ import (
 )
 
 const (
-	defaultListen         = "127.0.0.1:4000"
-	defaultAdminListen    = "127.0.0.1:4001"
-	defaultSQLitePath     = "~/.local/share/codex-sub-proxy/csp.sqlite3"
-	defaultBusyTimeout    = 5 * time.Second
-	defaultCredentialFile = "~/.config/codex-sub-proxy/credential.enc"
+	defaultListen               = "127.0.0.1:4000"
+	defaultAdminListen          = "127.0.0.1:4001"
+	defaultSQLitePath           = "~/.local/share/codex-sub-proxy/csp.sqlite3"
+	defaultBusyTimeout          = 5 * time.Second
+	defaultCredentialFile       = "~/.config/codex-sub-proxy/credential.enc"
+	defaultJournalQueueCapacity = 64
+	defaultJournalDrainDeadline = 10 * time.Second
 )
 
 type Config struct {
@@ -27,6 +30,7 @@ type Config struct {
 	Storage  StorageConfig  `toml:"storage"`
 	Security SecurityConfig `toml:"security"`
 	Codex    CodexConfig    `toml:"codex"`
+	Journal  JournalConfig  `toml:"journal"`
 }
 
 type ServerConfig struct {
@@ -37,6 +41,20 @@ type ServerConfig struct {
 type StorageConfig struct {
 	SQLitePath  string        `toml:"sqlite_path" validate:"required"`
 	BusyTimeout time.Duration `toml:"busy_timeout" validate:"gt=0,lte=86400000000000"`
+}
+
+// JournalMode selects the append and forward ordering.
+type JournalMode string
+
+const (
+	JournalModeDurable    JournalMode = "durable"
+	JournalModeBestEffort JournalMode = "best-effort"
+)
+
+type JournalConfig struct {
+	Mode          JournalMode   `toml:"mode" validate:"oneof=durable best-effort"`
+	QueueCapacity int           `toml:"queue_capacity" validate:"gt=0,lte=4096"`
+	DrainDeadline time.Duration `toml:"drain_deadline" validate:"gt=0,lte=86400000000000"`
 }
 
 type SecurityConfig struct {
@@ -162,6 +180,11 @@ func Default() Config {
 		Codex: CodexConfig{
 			CredentialFile:     defaultCredentialFile,
 			ResponsesTransport: ResponsesTransportWebSocketPreferred,
+		},
+		Journal: JournalConfig{
+			Mode:          JournalModeDurable,
+			QueueCapacity: defaultJournalQueueCapacity,
+			DrainDeadline: defaultJournalDrainDeadline,
 		},
 	}
 }
@@ -363,6 +386,15 @@ func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Security.APIKeyHMACKeyEnv, "CSP_SECURITY_API_KEY_HMAC_KEY_ENV")
 	overrideString(&cfg.Security.AdminTokenHMACKeyEnv, "CSP_SECURITY_ADMIN_TOKEN_HMAC_KEY_ENV")
 	overrideString(&cfg.Codex.CredentialFile, "CSP_CODEX_CREDENTIAL_FILE")
+	journalMode := string(cfg.Journal.Mode)
+	overrideString(&journalMode, "CSP_JOURNAL_MODE")
+	cfg.Journal.Mode = JournalMode(journalMode)
+	if err := overrideInt(&cfg.Journal.QueueCapacity, "CSP_JOURNAL_QUEUE_CAPACITY"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Journal.DrainDeadline, "CSP_JOURNAL_DRAIN_DEADLINE"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -379,6 +411,19 @@ func overrideDuration(dst *time.Duration, names ...string) error {
 	for _, name := range names {
 		if value, ok := os.LookupEnv(name); ok {
 			parsed, err := time.ParseDuration(strings.TrimSpace(value))
+			if err != nil {
+				return fmt.Errorf("parse %s: %w", name, err)
+			}
+			*dst = parsed
+			return nil
+		}
+	}
+	return nil
+}
+func overrideInt(dst *int, names ...string) error {
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok {
+			parsed, err := strconv.Atoi(strings.TrimSpace(value))
 			if err != nil {
 				return fmt.Errorf("parse %s: %w", name, err)
 			}

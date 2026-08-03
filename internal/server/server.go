@@ -20,12 +20,16 @@ const (
 )
 
 type Config struct {
-	Listen             string
-	AdminListen        string
-	Database           *gorm.DB
-	APIKeyHMACKey      []byte
-	ResponsesTransport *codex.ResponsesTransport
-	ImagesClient       *codex.ImagesClient
+	Listen               string
+	AdminListen          string
+	Database             *gorm.DB
+	APIKeyHMACKey        []byte
+	ResponsesTransport   *codex.ResponsesTransport
+	ImagesClient         *codex.ImagesClient
+	JournalMode          string
+	JournalQueueCapacity int
+	JournalDrainDeadline time.Duration
+	JournalApply         JournalApply
 }
 
 type Servers struct {
@@ -37,6 +41,7 @@ type Servers struct {
 	adminAddr     string
 	errors        chan error
 	waitGroup     sync.WaitGroup
+	journal       *Journal
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
@@ -50,22 +55,52 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	if cfg.AdminListen == "" {
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
-	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient)
+
+	var journal *Journal
+	if cfg.Database != nil {
+		if err := MigrateJournal(cfg.Database); err != nil {
+			return nil, err
+		}
+		var err error
+		journal, err = newJournal(cfg.Database, cfg.JournalMode, cfg.JournalQueueCapacity, cfg.JournalDrainDeadline)
+		if err != nil {
+			return nil, err
+		}
+		if err := journal.Replay(context.Background(), cfg.JournalApply); err != nil {
+			return nil, fmt.Errorf("replay journal: %w", err)
+		}
+		if err := journal.Start(); err != nil {
+			return nil, fmt.Errorf("start journal: %w", err)
+		}
+	}
+	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal)
 	if err != nil {
+		if journal != nil {
+			_ = journal.Close(context.Background())
+		}
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
 	adminHandler, err := newHealthApplication(readiness)
 	if err != nil {
+		if journal != nil {
+			_ = journal.Close(context.Background())
+		}
 		return nil, fmt.Errorf("build admin health application: %w", err)
 	}
 
 	dataListener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
+		if journal != nil {
+			_ = journal.Close(context.Background())
+		}
 		return nil, fmt.Errorf("listen for data plane on %q: %w", cfg.Listen, err)
 	}
 	adminListener, err := net.Listen("tcp", cfg.AdminListen)
 	if err != nil {
 		_ = dataListener.Close()
+		if journal != nil {
+			_ = journal.Close(context.Background())
+		}
 		return nil, fmt.Errorf("listen for admin plane on %q: %w", cfg.AdminListen, err)
 	}
 	servers := &Servers{
@@ -88,7 +123,9 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		dataAddr:      dataListener.Addr().String(),
 		adminAddr:     adminListener.Addr().String(),
 		errors:        make(chan error, 2),
+		journal:       journal,
 	}
+
 	servers.waitGroup.Add(2)
 	go servers.serve(servers.dataServer, dataListener)
 	go servers.serve(servers.adminServer, adminListener)
@@ -108,6 +145,9 @@ func (s *Servers) Errors() <-chan error {
 }
 
 func (s *Servers) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("shutdown context is nil")
+	}
 	shutdownErrors := make(chan error, 2)
 	go func() {
 		shutdownErrors <- s.dataServer.Shutdown(ctx)
@@ -125,6 +165,9 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			s.forceClose()
+			if err := s.closeJournal(ctx); err != nil {
+				errs = append(errs, err)
+			}
 			return errors.Join(append(errs, ctx.Err())...)
 		}
 	}
@@ -139,11 +182,24 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-serveDone:
+		if err := s.closeJournal(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		return errors.Join(errs...)
 	case <-ctx.Done():
 		s.forceClose()
+		if err := s.closeJournal(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		return errors.Join(append(errs, ctx.Err())...)
 	}
+}
+
+func (s *Servers) closeJournal(ctx context.Context) error {
+	if s.journal == nil {
+		return nil
+	}
+	return s.journal.Close(ctx)
 }
 
 func (s *Servers) forceClose() {

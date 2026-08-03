@@ -45,7 +45,7 @@ var (
 	errImagesUnsupportedForm = errors.New("multipart field is not supported")
 )
 
-func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient) iris.Handler {
+func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
@@ -90,6 +90,14 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeAPIKeyError(ctx, err)
 			return
 		}
+		journalRequestID, err := startJournalRequest(ctx, journal)
+		if err != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
+		if journal != nil {
+			defer finishJournalRequest(ctx, journal, journalRequestID)
+		}
 		if client == nil {
 			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -122,7 +130,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 	}
 }
 
-func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient) iris.Handler {
+func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
@@ -189,6 +197,14 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 		if err := authorizer.AuthorizePrincipal(request.Context(), principal, imagesEditsEndpoint, publicRequest.Model); err != nil {
 			writeAPIKeyError(ctx, err)
 			return
+		}
+		journalRequestID, err := startJournalRequest(ctx, journal)
+		if err != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
+		if journal != nil {
+			defer finishJournalRequest(ctx, journal, journalRequestID)
 		}
 		if client == nil {
 			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
