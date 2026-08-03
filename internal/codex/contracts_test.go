@@ -413,6 +413,53 @@ func TestCodexWebSocketRejectsDuplicateTerminal(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesSSEDoneOrdering(t *testing.T) {
+	terminal := `data: {"type":"response.completed","response":{"status":"completed"}}` + "\n\n"
+	tests := []struct {
+		name      string
+		raw       string
+		wantError error
+	}{
+		{name: "early", raw: "data: [DONE]\n\n", wantError: ErrCodexStreamMalformed},
+		{name: "duplicate", raw: terminal + "data: [DONE]\n\ndata: [DONE]\n\n", wantError: ErrCodexStreamDuplicateTerminal},
+		{name: "post done data", raw: terminal + "data: [DONE]\n\ndata: {\"type\":\"response.created\"}\n\n", wantError: ErrCodexStreamDuplicateTerminal},
+		{name: "post done event field", raw: terminal + "data: [DONE]\n\nevent: response.completed\n\n", wantError: ErrCodexStreamDuplicateTerminal},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ParseCodexResponsesSSE(strings.NewReader(test.raw))
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("error = %v, want %v", err, test.wantError)
+			}
+		})
+	}
+	if _, err := ParseCodexResponsesSSE(strings.NewReader(terminal + "data: [DONE]\n\n")); err != nil {
+		t.Fatalf("valid terminal then DONE: %v", err)
+	}
+}
+
+func TestCodexResponsesSSERequiresTerminalResponse(t *testing.T) {
+	for _, eventType := range []string{CodexEventResponseCompleted, CodexEventResponseDone, CodexEventResponseIncomplete, CodexEventResponseFailed} {
+		t.Run(eventType, func(t *testing.T) {
+			raw := `data: {"type":"` + eventType + `"}` + "\n\n"
+			_, err := ParseCodexResponsesSSE(strings.NewReader(raw))
+			if !errors.Is(err, ErrCodexStreamMalformed) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCodexResponsesSSEResponseErrorFailsStream(t *testing.T) {
+	raw := `data: {"type":"response.created","response":{"status":"in_progress","error":{"code":"provider_error"}}}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"status":"completed"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	result, err := ParseCodexResponsesSSE(strings.NewReader(raw))
+	if err == nil || !errors.Is(err, ErrCodexStreamFailed) {
+		t.Fatalf("error = %v, result = %#v", err, result)
+	}
+}
+
 func TestCodexImageFixturesDecodeAndEncode(t *testing.T) {
 	for _, name := range []string{"images_generation.json", "images_edit.json"} {
 		raw, err := os.ReadFile("testdata/" + name)

@@ -314,6 +314,172 @@ func TestChatStreamRejectsIncompleteToolArguments(t *testing.T) {
 	}
 }
 
+func TestChatCompletionMixedTextAndToolsRetainsContent(t *testing.T) {
+	response := &codex.CodexResponse{
+		Status: codex.CodexResponseStatusCompleted,
+		Output: []codex.CodexOutputItem{
+			{Type: "message", Role: "assistant", Content: []codex.CodexContentPart{{Type: "output_text", Text: "answer"}}},
+			{Type: "function_call", ID: "fc-1", CallID: "call-1", Name: "lookup", Arguments: `{}`},
+		},
+	}
+	payload, err := chatCompletionPayload(response, "gpt-5.6-sol")
+	if err != nil {
+		t.Fatalf("encode mixed completion: %v", err)
+	}
+	var completion chatCompletionResponse
+	if err := json.Unmarshal(payload, &completion); err != nil {
+		t.Fatalf("decode mixed completion: %v", err)
+	}
+	message := completion.Choices[0].Message
+	if message.Content == nil || *message.Content != "answer" || len(message.ToolCalls) != 1 {
+		t.Fatalf("mixed message = %#v", message)
+	}
+}
+
+func TestChatRequestRejectsToolCallIDOnNonToolRoles(t *testing.T) {
+	for _, role := range []string{"developer", "system", "user", "assistant"} {
+		t.Run(role, func(t *testing.T) {
+			request := chatCompletionRequest{
+				Model:    "gpt-5.6-sol",
+				Messages: []chatMessage{{Role: role, Content: json.RawMessage(`"hello"`), ToolCallID: "call-1"}},
+			}
+			if err := validateChatRequestOnly(request); err == nil {
+				t.Fatal("nonempty tool_call_id was accepted")
+			}
+		})
+	}
+}
+
+func TestChatStreamReconcilesTerminalText(t *testing.T) {
+	tests := []struct {
+		name       string
+		terminal   string
+		wantText   string
+		wantFinish bool
+	}{
+		{name: "suffix", terminal: "hello", wantText: "hello", wantFinish: true},
+		{name: "mismatch", terminal: "heXlo", wantFinish: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			state := newChatStreamState("gpt-5.6-sol", false, recorder, recorder)
+			if err := state.event(codex.CodexResponseStreamEvent{
+				Type: codex.CodexEventResponseOutputTextDelta, Delta: "hel",
+			}); err != nil {
+				t.Fatalf("delta: %v", err)
+			}
+			err := state.event(codex.CodexResponseStreamEvent{
+				Type: codex.CodexEventResponseCompleted,
+				Response: &codex.CodexResponse{
+					Status: codex.CodexResponseStatusCompleted,
+					Output: []codex.CodexOutputItem{{Type: "message", Role: "assistant", Content: []codex.CodexContentPart{{Type: "output_text", Text: test.terminal}}}},
+				},
+			})
+			if test.wantFinish && err != nil {
+				t.Fatalf("terminal: %v", err)
+			}
+			if !test.wantFinish && err == nil {
+				t.Fatal("mismatched terminal text was accepted")
+			}
+			if state.finishSent != test.wantFinish {
+				t.Fatalf("finish sent = %t, want %t", state.finishSent, test.wantFinish)
+			}
+			if test.wantFinish {
+				var got string
+				for _, chunk := range decodeChatChunks(t, recorder.Body.String()) {
+					for _, choice := range chunk.Choices {
+						if choice.Delta.Content != nil {
+							got += *choice.Delta.Content
+						}
+					}
+				}
+				if got != test.wantText {
+					t.Fatalf("stream text = %q, want %q", got, test.wantText)
+				}
+			}
+		})
+	}
+}
+
+func TestChatStreamRejectsMissingOrInvalidRequestedUsage(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage *codex.CodexUsage
+	}{
+		{name: "missing"},
+		{name: "negative", usage: &codex.CodexUsage{InputTokens: -1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			state := newChatStreamState("gpt-5.6-sol", true, recorder, recorder)
+			err := state.event(codex.CodexResponseStreamEvent{
+				Type: codex.CodexEventResponseCompleted,
+				Response: &codex.CodexResponse{
+					Status: codex.CodexResponseStatusCompleted, Usage: test.usage,
+				},
+			})
+			if err == nil || state.finishSent {
+				t.Fatalf("usage error = %v, finish sent = %t", err, state.finishSent)
+			}
+			if recorder.Body.Len() != 0 {
+				t.Fatalf("invalid usage emitted success chunks: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestChatStreamRejectsMissingResponseAndResponseError(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	state := newChatStreamState("gpt-5.6-sol", false, recorder, recorder)
+	if err := state.event(codex.CodexResponseStreamEvent{Type: codex.CodexEventResponseDone}); err == nil {
+		t.Fatal("terminal without response was accepted")
+	}
+	recorder = httptest.NewRecorder()
+	state = newChatStreamState("gpt-5.6-sol", false, recorder, recorder)
+	if err := state.event(codex.CodexResponseStreamEvent{
+		Type:     codex.CodexEventResponseCreated,
+		Response: &codex.CodexResponse{Error: &codex.CodexError{Code: "provider_error"}},
+	}); err != nil {
+		t.Fatalf("response error event: %v", err)
+	}
+	if state.failure == nil || state.finishSent || recorder.Body.Len() != 0 {
+		t.Fatalf("response error state = %#v, body=%s", state, recorder.Body.String())
+	}
+}
+
+func TestChatStreamRejectsAnnotationsAndUnknownSemanticValues(t *testing.T) {
+	annotated := &codex.CodexResponse{
+		Status: codex.CodexResponseStatusCompleted,
+		Output: []codex.CodexOutputItem{{Type: "message", Content: []codex.CodexContentPart{
+			{Type: "output_text", Text: "text", Annotations: []json.RawMessage{json.RawMessage(`{"type":"url_citation"}`)}},
+		}}},
+	}
+	if _, err := chatCompletionPayload(annotated, "gpt-5.6-sol"); err == nil {
+		t.Fatal("annotated output was accepted")
+	}
+	tests := []codex.CodexResponseStreamEvent{
+		{Type: "response.output_text.annotation.added", Annotation: json.RawMessage(`{"type":"url_citation"}`)},
+		{Type: codex.CodexEventResponseContentPartAdded, Part: &codex.CodexContentPart{Type: "output_text", Annotations: []json.RawMessage{json.RawMessage(`{}`)}}},
+		{Type: codex.CodexEventResponseOutputItemAdded, Item: &codex.CodexOutputItem{Type: "image_generation_call"}},
+		{Type: codex.CodexEventResponseContentPartAdded, Part: &codex.CodexContentPart{Type: "image"}},
+		{Type: "response.unknown.semantic"},
+	}
+	for _, event := range tests {
+		t.Run(event.Type, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			state := newChatStreamState("gpt-5.6-sol", false, recorder, recorder)
+			if err := state.event(event); err == nil {
+				t.Fatalf("event %q was accepted", event.Type)
+			}
+			if state.finishSent || recorder.Body.Len() != 0 {
+				t.Fatalf("event %q emitted success output: %s", event.Type, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func decodeChatChunks(t *testing.T, body string) []chatCompletionChunk {
 	t.Helper()
 	var chunks []chatCompletionChunk

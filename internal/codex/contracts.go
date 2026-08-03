@@ -596,7 +596,17 @@ func parseCodexResponsesSSE(reader io.Reader, onEvent func(CodexResponseStreamEv
 		payload := bytes.TrimSpace(data.Bytes())
 		if bytes.Equal(payload, []byte("[DONE]")) {
 			data.Reset()
+			if decoder.doneSeen {
+				return ErrCodexStreamDuplicateTerminal
+			}
+			if decoder.terminalType == "" {
+				return fmt.Errorf("%w: upstream [DONE] arrived before terminal event", ErrCodexStreamMalformed)
+			}
+			decoder.doneSeen = true
 			return nil
+		}
+		if decoder.doneSeen {
+			return ErrCodexStreamDuplicateTerminal
 		}
 		var event CodexResponseStreamEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
@@ -618,6 +628,9 @@ func parseCodexResponsesSSE(reader io.Reader, onEvent func(CodexResponseStreamEv
 		return nil
 	}
 	consumeLine := func(line []byte) error {
+		if decoder.doneSeen && len(line) > 0 && !bytes.HasPrefix(line, []byte(":")) {
+			return ErrCodexStreamDuplicateTerminal
+		}
 		switch {
 		case len(line) == 0:
 			return flush()
@@ -717,6 +730,7 @@ type codexStreamDecoder struct {
 	terminalType string
 	response     *CodexResponse
 	failed       bool
+	doneSeen     bool
 	payloadBytes int
 }
 
@@ -738,8 +752,12 @@ func (decoder *codexStreamDecoder) add(event CodexResponseStreamEvent) error {
 	if len(decoder.events) >= maxCodexStreamEvents {
 		return fmt.Errorf("%w: event count exceeds limit", ErrCodexStreamMalformed)
 	}
+	if isCodexResponseTerminalEvent(event.Type) && event.Response == nil {
+		return fmt.Errorf("%w: terminal event response is missing", ErrCodexStreamMalformed)
+	}
 	decoder.events = append(decoder.events, event)
-	decoder.failed = decoder.failed || event.Error != nil
+	decoder.failed = decoder.failed || event.Error != nil ||
+		(event.Response != nil && event.Response.Error != nil)
 	if !isCodexTerminalEvent(event.Type) {
 		return nil
 	}
@@ -778,6 +796,15 @@ func (decoder *codexStreamDecoder) finish() (CodexStreamResult, error) {
 		return result, &CodexStreamFailureError{Category: category, Status: status}
 	}
 	return result, nil
+}
+
+func isCodexResponseTerminalEvent(eventType string) bool {
+	switch eventType {
+	case CodexEventResponseCompleted, CodexEventResponseDone, CodexEventResponseIncomplete, CodexEventResponseFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 func isCodexTerminalEvent(eventType string) bool {

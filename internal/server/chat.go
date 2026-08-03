@@ -427,6 +427,9 @@ func validateChatMessage(message chatMessage) error {
 	}
 	switch message.Role {
 	case "developer", "system", "user":
+		if message.ToolCallID != "" {
+			return errors.New("tool call id is only valid on tool messages")
+		}
 		if !present {
 			return errors.New("message content is required")
 		}
@@ -434,6 +437,9 @@ func validateChatMessage(message chatMessage) error {
 			return errors.New("tool calls are only valid on assistant messages")
 		}
 	case "assistant":
+		if message.ToolCallID != "" {
+			return errors.New("tool call id is only valid on tool messages")
+		}
 		if !present && len(message.ToolCalls) == 0 {
 			return errors.New("assistant message must contain content or tool calls")
 		}
@@ -863,17 +869,16 @@ func chatCompletionPayload(response *codex.CodexResponse, model string) ([]byte,
 		return nil, err
 	}
 	content := text
-	if text == "" && len(tools) > 0 {
-		content = ""
-	}
 	usage, err := chatResponseUsage(response.Usage)
 	if err != nil {
 		return nil, err
 	}
 	identity := newChatIdentity(response, model)
 	message := chatCompletionMessage{Role: "assistant", Content: &content}
-	if len(tools) > 0 {
+	if text == "" && len(tools) > 0 {
 		message.Content = nil
+	}
+	if len(tools) > 0 {
 		message.ToolCalls = tools
 	}
 	result := chatCompletionResponse{
@@ -896,6 +901,9 @@ func chatResponseOutput(response *codex.CodexResponse) (string, []chatToolCallOu
 			for _, part := range item.Content {
 				switch part.Type {
 				case "output_text":
+					if len(part.Annotations) != 0 {
+						return "", nil, errors.New("upstream output annotations are not representable")
+					}
 					if err := appendBoundedChatText(&text, part.Text); err != nil {
 						return "", nil, err
 					}
@@ -1030,12 +1038,7 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 		return
 	}
 	if includeUsage {
-		usage, err := chatResponseUsage(state.usage)
-		if err != nil {
-			_ = state.writeError(err)
-			_ = writeResponsesSSERecord(writer, flusher, []byte("[DONE]"))
-			return
-		}
+		usage := *state.mappedUsage
 		if err := state.writeChunk(chatCompletionChunk{ID: state.identity.id, Object: "chat.completion.chunk", Created: state.identity.created, Model: state.identity.model, Choices: []chatChunkChoice{}, Usage: &usage}); err != nil {
 			return
 		}
@@ -1060,8 +1063,8 @@ type chatStreamState struct {
 	flusher      http.Flusher
 	roleSent     bool
 	finishSent   bool
-	textBytes    int
-	usage        *codex.CodexUsage
+	text         string
+	mappedUsage  *chatCompletionUsage
 	response     *codex.CodexResponse
 	failure      error
 	writeErr     error
@@ -1079,13 +1082,20 @@ func newChatStreamState(model string, includeUsage bool, writer http.ResponseWri
 	}
 }
 
+func (state *chatStreamState) fail(err error) error {
+	if err == nil {
+		err = errors.New("upstream stream event is invalid")
+	}
+	state.failure = fmt.Errorf("%w: %v", errChatStreamAbort, err)
+	return errChatStreamAbort
+}
+
 func (state *chatStreamState) event(event codex.CodexResponseStreamEvent) error {
 	if state.failure != nil {
 		return errChatStreamAbort
 	}
 	if event.Response != nil {
 		state.response = event.Response
-		state.usage = event.Response.Usage
 		if !state.roleSent {
 			if event.Response.ID != "" {
 				state.identity.id = event.Response.ID
@@ -1100,39 +1110,115 @@ func (state *chatStreamState) event(event codex.CodexResponseStreamEvent) error 
 	}
 	if event.Error != nil || event.Type == codex.CodexEventError ||
 		event.Type == codex.CodexEventResponseFailed ||
-		(event.Response != nil && event.Response.Status == codex.CodexResponseStatusFailed) {
+		(event.Response != nil && (event.Response.Error != nil || event.Response.Status == codex.CodexResponseStatusFailed)) {
 		state.failure = errors.New("upstream stream failed")
 		return nil
 	}
 	if isCodexTerminal(event.Type) {
+		if event.Response == nil && event.Type != codex.CodexEventError {
+			return state.fail(errors.New("terminal response is missing"))
+		}
+		if state.includeUsage {
+			if event.Response == nil || event.Response.Usage == nil {
+				return state.fail(errors.New("upstream usage is missing"))
+			}
+			usage, err := chatResponseUsage(event.Response.Usage)
+			if err != nil {
+				return state.fail(err)
+			}
+			state.mappedUsage = &usage
+		}
 		if err := state.writeRole(); err != nil {
 			state.writeErr = err
 			return err
 		}
 		if err := state.reconcileResponse(event.Response); err != nil {
-			state.failure = fmt.Errorf("%w: %v", errChatStreamAbort, err)
-			return errChatStreamAbort
+			return state.fail(err)
 		}
 		if err := state.finish(event.Response); err != nil {
-			state.failure = fmt.Errorf("%w: %v", errChatStreamAbort, err)
-			return errChatStreamAbort
+			return state.fail(err)
 		}
 		return nil
 	}
-	if err := state.writeRole(); err != nil {
-		state.writeErr = err
-		return err
-	}
+
 	switch event.Type {
+	case codex.CodexEventResponseCreated, "response.queued", "response.in_progress",
+		codex.CodexEventResponseMetadata, "response.rate_limits.updated",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+		return nil
 	case codex.CodexEventResponseOutputTextDelta:
+		if event.Annotation != nil {
+			return state.fail(errors.New("upstream output annotations are not representable"))
+		}
+		if event.Part != nil {
+			if _, err := chatStreamPartText(event.Part); err != nil {
+				return state.fail(err)
+			}
+		}
+		if err := state.writeRole(); err != nil {
+			state.writeErr = err
+			return err
+		}
 		if event.Delta != "" {
 			if err := state.writeText(event.Delta); err != nil {
 				state.writeErr = err
 				return err
 			}
 		}
+	case "response.output_text.done":
+		if event.Annotation != nil {
+			return state.fail(errors.New("upstream output annotations are not representable"))
+		}
+		if err := state.writeRole(); err != nil {
+			state.writeErr = err
+			return err
+		}
+		if event.Text != "" {
+			if err := state.reconcileText(event.Text); err != nil {
+				return state.fail(err)
+			}
+		}
+	case codex.CodexEventResponseContentPartAdded, "response.content_part.done":
+		text, err := chatStreamPartText(event.Part)
+		if err != nil {
+			return state.fail(err)
+		}
+		if err := state.writeRole(); err != nil {
+			state.writeErr = err
+			return err
+		}
+		if text != "" {
+			if err := state.reconcileText(text); err != nil {
+				return state.fail(err)
+			}
+		}
 	case codex.CodexEventResponseOutputItemAdded, codex.CodexEventResponseOutputItemDone:
-		if event.Item != nil && event.Item.Type == "function_call" {
+		if event.Item == nil {
+			return state.fail(errors.New("upstream output item is missing"))
+		}
+		switch event.Item.Type {
+		case "reasoning":
+			return nil
+		case "message":
+			text, err := chatStreamMessageText(event.Item)
+			if err != nil {
+				return state.fail(err)
+			}
+			if err := state.writeRole(); err != nil {
+				state.writeErr = err
+				return err
+			}
+			if text != "" {
+				if err := state.reconcileText(text); err != nil {
+					return state.fail(err)
+				}
+			}
+		case "function_call":
+			if err := state.writeRole(); err != nil {
+				state.writeErr = err
+				return err
+			}
 			tool := state.tool(event.Item.ID, event.Item.CallID, event.Item.Name)
 			if err := state.writeToolMetadata(tool); err != nil {
 				state.writeErr = err
@@ -1140,29 +1226,71 @@ func (state *chatStreamState) event(event codex.CodexResponseStreamEvent) error 
 			}
 			if event.Item.Arguments != "" {
 				if err := state.addToolArguments(tool, event.Item.Arguments, true); err != nil {
-					state.failure = fmt.Errorf("%w: %v", errChatStreamAbort, err)
-					return errChatStreamAbort
+					return state.fail(err)
 				}
 			}
+		default:
+			return state.fail(errors.New("upstream output item is not representable"))
 		}
 	case codex.CodexEventResponseFunctionArgsDelta:
+		if err := state.writeRole(); err != nil {
+			state.writeErr = err
+			return err
+		}
 		fragment := event.Delta
 		if fragment == "" {
 			fragment = event.Arguments
 		}
 		tool := state.tool(event.ItemID, "", "")
 		if err := state.addToolArguments(tool, fragment, false); err != nil {
-			state.failure = fmt.Errorf("%w: %v", errChatStreamAbort, err)
-			return errChatStreamAbort
+			return state.fail(err)
 		}
 	case codex.CodexEventResponseFunctionArgsDone:
+		if err := state.writeRole(); err != nil {
+			state.writeErr = err
+			return err
+		}
 		tool := state.tool(event.ItemID, "", "")
 		if err := state.addToolArguments(tool, event.Arguments, true); err != nil {
-			state.failure = fmt.Errorf("%w: %v", errChatStreamAbort, err)
-			return errChatStreamAbort
+			return state.fail(err)
 		}
+	default:
+		return state.fail(fmt.Errorf("upstream stream event %q is not representable", event.Type))
 	}
 	return nil
+}
+
+func chatStreamPartText(part *codex.CodexContentPart) (string, error) {
+	if part == nil {
+		return "", errors.New("upstream content part is missing")
+	}
+	if part.Type != "output_text" {
+		return "", errors.New("upstream output content is not representable")
+	}
+	if len(part.Annotations) != 0 {
+		return "", errors.New("upstream output annotations are not representable")
+	}
+	if err := validateBoundedString(part.Text, maxChatStringBytes); err != nil {
+		return "", errors.New("upstream text is too large")
+	}
+	return part.Text, nil
+}
+
+func chatStreamMessageText(item *codex.CodexOutputItem) (string, error) {
+	if item.Role != "" && item.Role != "assistant" {
+		return "", errors.New("upstream message role is invalid")
+	}
+	var text string
+	for index := range item.Content {
+		partText, err := chatStreamPartText(&item.Content[index])
+		if err != nil {
+			return "", err
+		}
+		if err := appendBoundedChatText(&text, partText); err != nil {
+			return "", err
+		}
+	}
+	return text, nil
 }
 func (state *chatStreamState) writeRole() error {
 	if state.roleSent {
@@ -1173,12 +1301,18 @@ func (state *chatStreamState) writeRole() error {
 }
 
 func (state *chatStreamState) writeText(text string) error {
-	if len(text) > maxChatStringBytes || state.textBytes > maxChatStringBytes-len(text) {
+	if text == "" {
+		return nil
+	}
+	if len(text) > maxChatStringBytes || len(state.text) > maxChatStringBytes-len(text) {
 		return errors.New("upstream text is too large")
 	}
-	state.textBytes += len(text)
 	value := text
-	return state.writeChunk(chatCompletionChunk{ID: state.identity.id, Object: "chat.completion.chunk", Created: state.identity.created, Model: state.identity.model, Choices: []chatChunkChoice{{Index: 0, Delta: chatChunkDelta{Content: &value}, FinishReason: nil, Logprobs: nil}}, Usage: nil})
+	if err := state.writeChunk(chatCompletionChunk{ID: state.identity.id, Object: "chat.completion.chunk", Created: state.identity.created, Model: state.identity.model, Choices: []chatChunkChoice{{Index: 0, Delta: chatChunkDelta{Content: &value}, FinishReason: nil, Logprobs: nil}}, Usage: nil}); err != nil {
+		return err
+	}
+	state.text += text
+	return nil
 }
 
 func (state *chatStreamState) tool(itemID, callID, name string) *chatToolStreamState {
@@ -1314,18 +1448,23 @@ func (state *chatStreamState) addToolArguments(tool *chatToolStreamState, fragme
 	return nil
 }
 
+func (state *chatStreamState) reconcileText(text string) error {
+	if len(text) > maxChatStringBytes || !strings.HasPrefix(text, state.text) {
+		return errors.New("upstream text was inconsistent with emitted text")
+	}
+	return state.writeText(text[len(state.text):])
+}
+
 func (state *chatStreamState) reconcileResponse(response *codex.CodexResponse) error {
 	if response == nil {
-		return nil
+		return errors.New("terminal response is missing")
 	}
 	text, tools, err := chatResponseOutput(response)
 	if err != nil {
 		return err
 	}
-	if state.textBytes == 0 && text != "" {
-		if err := state.writeText(text); err != nil {
-			return err
-		}
+	if err := state.reconcileText(text); err != nil {
+		return err
 	}
 	for _, output := range tools {
 		tool := state.outputTool(output.ID, output.Function.Name)
@@ -1343,6 +1482,12 @@ func (state *chatStreamState) finish(response *codex.CodexResponse) error {
 	if state.finishSent {
 		return errors.New("upstream stream sent duplicate terminal event")
 	}
+	if response == nil {
+		return errors.New("terminal response is missing")
+	}
+	if state.includeUsage && state.mappedUsage == nil {
+		return errors.New("upstream usage is missing")
+	}
 	for _, tool := range state.tools {
 		if tool.id == "" || tool.name == "" || tool.arguments.Len() == 0 || validateChatJSONValue([]byte(tool.arguments.String()), maxChatArgumentsBytes) != nil {
 			return errors.New("upstream tool call is incomplete")
@@ -1351,13 +1496,12 @@ func (state *chatStreamState) finish(response *codex.CodexResponse) error {
 			return err
 		}
 	}
-	reason := "stop"
-	toolCount := len(state.tools)
-	if response != nil {
-		reason = chatFinishReason(response, toolCount)
+	reason := chatFinishReason(response, len(state.tools))
+	if err := state.writeChunk(chatCompletionChunk{ID: state.identity.id, Object: "chat.completion.chunk", Created: state.identity.created, Model: state.identity.model, Choices: []chatChunkChoice{{Index: 0, Delta: chatChunkDelta{Content: nil}, FinishReason: &reason, Logprobs: nil}}, Usage: nil}); err != nil {
+		return err
 	}
 	state.finishSent = true
-	return state.writeChunk(chatCompletionChunk{ID: state.identity.id, Object: "chat.completion.chunk", Created: state.identity.created, Model: state.identity.model, Choices: []chatChunkChoice{{Index: 0, Delta: chatChunkDelta{Content: nil}, FinishReason: &reason, Logprobs: nil}}, Usage: nil})
+	return nil
 }
 
 func (state *chatStreamState) writeChunk(chunk chatCompletionChunk) error {
