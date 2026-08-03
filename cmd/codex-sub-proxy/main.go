@@ -64,6 +64,7 @@ func run(args []string) error {
 
 	readiness := server.NewReadiness()
 	var db *gorm.DB
+	var artifactStore *server.ArtifactStore
 	storageReady := false
 	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
 	if err != nil {
@@ -78,8 +79,15 @@ func run(args []string) error {
 			log.Printf("storage is unavailable: %v", err)
 		} else if err := server.MigrateJournal(db); err != nil {
 			log.Printf("storage is unavailable: %v", err)
+		} else if payloadErr != nil {
+			log.Printf("artifact storage is unavailable: %v", payloadErr)
 		} else {
-			storageReady = true
+			artifactStore, err = server.NewArtifactStore(db, cfg.Storage.ArtifactRoot, payloadKeys, cfg.Retention.ArtifactTTL)
+			if err != nil {
+				log.Printf("storage is unavailable: %v", err)
+			} else {
+				storageReady = true
+			}
 		}
 	}
 	if db != nil {
@@ -131,13 +139,23 @@ func run(args []string) error {
 
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 	servers, err := server.Start(server.Config{
-		Listen:               cfg.Server.Listen,
-		AdminListen:          cfg.Server.AdminListen,
-		Database:             db,
-		APIKeyHMACKey:        apiKeyHMACKey,
-		ResponsesTransport:   responsesTransport,
-		PayloadKeys:          payloadKeys,
-		ImagesClient:         imagesClient,
+		Listen:             cfg.Server.Listen,
+		AdminListen:        cfg.Server.AdminListen,
+		Database:           db,
+		APIKeyHMACKey:      apiKeyHMACKey,
+		ResponsesTransport: responsesTransport,
+		PayloadKeys:        payloadKeys,
+		ImagesClient:       imagesClient,
+		ArtifactStore:      artifactStore,
+		ArtifactRequired:   true,
+		Retention: server.RetentionConfig{
+			ArtifactTTL:   cfg.Retention.ArtifactTTL,
+			PayloadTTL:    cfg.Retention.PayloadTTL,
+			MetadataTTL:   cfg.Retention.MetadataTTL,
+			SweepInterval: cfg.Retention.SweepInterval,
+			BatchSize:     cfg.Retention.BatchSize,
+			DrainDeadline: cfg.Retention.DrainDeadline,
+		},
 		JournalMode:          string(cfg.Journal.Mode),
 		JournalQueueCapacity: cfg.Journal.QueueCapacity,
 		JournalDrainDeadline: cfg.Journal.DrainDeadline,

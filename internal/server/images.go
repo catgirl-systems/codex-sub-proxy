@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -45,7 +46,7 @@ var (
 	errImagesUnsupportedForm = errors.New("multipart field is not supported")
 )
 
-func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
+func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setJournalAuditContext(ctx, journal, imagesGenerationsEndpoint)
@@ -147,6 +148,11 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
 		}
+		if err := persistImageArtifacts(request.Context(), artifacts, artifactRequired, imageArtifactOwner(ctx), result.Images); err != nil {
+			markJournalTerminal(ctx, requestStatusFailed, "")
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
 		if err := validateQuotaUsageFromCodex(result.Usage); err != nil {
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
 			return
@@ -164,7 +170,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 	}
 }
 
-func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
+func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
@@ -297,6 +303,11 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 		response, err := publicImageResponse(result)
 		if err != nil {
 			writeImagesError(ctx, http.StatusBadGateway, "invalid_upstream_response", "The upstream response was invalid.")
+			return
+		}
+		if err := persistImageArtifacts(request.Context(), artifacts, artifactRequired, imageArtifactOwner(ctx), result.Images); err != nil {
+			markJournalTerminal(ctx, requestStatusFailed, "")
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
 		if err := validateQuotaUsageFromCodex(result.Usage); err != nil {
@@ -618,6 +629,10 @@ func publicImageResponse(result codex.CodexImageResult) (openai.ImageResponse, e
 		if len(image.Bytes) == 0 || len(image.Bytes) > maxImageFileBytes || len(image.RevisedPrompt) > maxImageResponsePromptBytes {
 			return openai.ImageResponse{}, errors.New("invalid image result")
 		}
+		actualMIME, ok := artifactImageMIME(image.Bytes)
+		if !ok || (image.MIMEType != "" && strings.ToLower(strings.TrimSpace(image.MIMEType)) != actualMIME) {
+			return openai.ImageResponse{}, errors.New("invalid image result")
+		}
 		encodedSize := base64.StdEncoding.EncodedLen(len(image.Bytes))
 		if encodedSize > maxImageResponseJSONBytes-responseBytes {
 			return openai.ImageResponse{}, errors.New("image result is too large")
@@ -655,4 +670,56 @@ func publicImageUsage(usage *codex.CodexUsage) *openai.Usage {
 		}
 	}
 	return public
+}
+func imageArtifactOwner(ctx iris.Context) ArtifactOwner {
+	if ctx == nil {
+		return ArtifactOwner{}
+	}
+	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
+	if !ok || value == nil {
+		return ArtifactOwner{}
+	}
+	return ArtifactOwner{
+		RequestID:      value.request.ID,
+		ConversationID: value.request.ConversationID,
+		APIKeyID:       value.request.APIKeyID,
+	}
+}
+
+func persistImageArtifacts(ctx context.Context, store *ArtifactStore, required bool, owner ArtifactOwner, images []codex.CodexImage) error {
+	if store == nil {
+		if required {
+			return errors.New("encrypted artifact storage is unavailable")
+		}
+		return nil
+	}
+	if err := validateArtifactOwner(owner); err != nil {
+		return err
+	}
+	saved := make([]ArtifactRecord, 0, len(images))
+	for index, image := range images {
+		record, err := store.Save(ctx, owner, index, image.MIMEType, image.Bytes)
+		if err != nil {
+			cleanupImageArtifacts(ctx, store, saved)
+			return fmt.Errorf("persist image artifact %d: %w", index, err)
+		}
+		if record.persisted {
+			saved = append(saved, record)
+		}
+	}
+	return nil
+}
+
+func cleanupImageArtifacts(ctx context.Context, store *ArtifactStore, records []ArtifactRecord) {
+	if len(records) == 0 {
+		return
+	}
+	ids := make([]string, len(records))
+	for index := range records {
+		ids[index] = records[index].ID
+	}
+	claimed, err := store.MarkDeleting(ctx, ids)
+	if err == nil {
+		_ = store.RemoveMarked(ctx, claimed)
+	}
 }

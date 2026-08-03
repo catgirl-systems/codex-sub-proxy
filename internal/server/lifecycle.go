@@ -49,6 +49,7 @@ type AccountRecord struct {
 	AccountID string    `gorm:"column:account_id;not null;size:255;index"`
 	CreatedAt time.Time `gorm:"column:created_at;not null"`
 	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
+	ExpiresAt time.Time `gorm:"column:expires_at;not null;index"`
 }
 
 func (AccountRecord) TableName() string { return "accounts" }
@@ -59,6 +60,7 @@ type ConversationRecord struct {
 	AccountID    string    `gorm:"column:account_id;size:255;index"`
 	CreatedAt    time.Time `gorm:"column:created_at;not null"`
 	UpdatedAt    time.Time `gorm:"column:updated_at;not null"`
+	ExpiresAt    time.Time `gorm:"column:expires_at;not null;index"`
 	RequestCount int64     `gorm:"column:request_count;not null;default:0"`
 }
 
@@ -78,6 +80,7 @@ type RequestRecord struct {
 	StartedAt        time.Time  `gorm:"column:started_at;not null"`
 	UpdatedAt        time.Time  `gorm:"column:updated_at;not null;index"`
 	TerminalAt       *time.Time `gorm:"column:terminal_at;index"`
+	ExpiresAt        time.Time  `gorm:"column:expires_at;not null;index"`
 	TerminalReplayID string     `gorm:"column:terminal_replay_id;size:36"`
 	TerminalConflict bool       `gorm:"column:terminal_conflict;not null;default:false"`
 }
@@ -86,11 +89,13 @@ func (RequestRecord) TableName() string { return "requests" }
 
 // EncryptedPayloadRecord stores one authenticated payload envelope.
 type EncryptedPayloadRecord struct {
-	ID         string    `gorm:"column:id;primaryKey;size:36"`
-	ReplayID   string    `gorm:"column:replay_id;not null;uniqueIndex"`
-	KeyVersion uint32    `gorm:"column:key_version;not null"`
-	Envelope   []byte    `gorm:"column:encrypted_envelope;not null"`
-	CreatedAt  time.Time `gorm:"column:created_at;not null"`
+	ID         string     `gorm:"column:id;primaryKey;size:36"`
+	ReplayID   string     `gorm:"column:replay_id;not null;uniqueIndex"`
+	KeyVersion uint32     `gorm:"column:key_version;not null"`
+	Envelope   []byte     `gorm:"column:encrypted_envelope;not null"`
+	CreatedAt  time.Time  `gorm:"column:created_at;not null"`
+	ExpiresAt  time.Time  `gorm:"column:expires_at;not null;index"`
+	DeletedAt  *time.Time `gorm:"column:deleted_at;index"`
 }
 
 func (EncryptedPayloadRecord) TableName() string { return "encrypted_payloads" }
@@ -130,6 +135,7 @@ type AuditRecord struct {
 	Status    int       `gorm:"column:status;not null;index"`
 	PayloadID string    `gorm:"column:payload_id;size:36;index"`
 	CreatedAt time.Time `gorm:"column:created_at;not null;index"`
+	ExpiresAt time.Time `gorm:"column:expires_at;not null;index"`
 }
 
 func (AuditRecord) TableName() string { return "audit_records" }
@@ -172,6 +178,9 @@ func migrateLifecycle(db *gorm.DB) error {
 		&AuditRecord{},
 	); err != nil {
 		return fmt.Errorf("migrate lifecycle projections: %w", err)
+	}
+	if err := MigrateArtifacts(db); err != nil {
+		return err
 	}
 	return nil
 }
@@ -263,7 +272,6 @@ func validateLifecycleAccepted(value lifecycleAcceptedPayload, request JournalRe
 	}
 	return nil
 }
-
 func validateLifecycleTerminal(value lifecycleTerminalPayload) error {
 	if value.Version != lifecycleEventVersion {
 		return errors.New("terminal lifecycle payload version is unsupported")
@@ -370,7 +378,7 @@ func (j *Journal) materializeRecord(tx *gorm.DB, source JournalRecord, request J
 }
 
 func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepted lifecycleAcceptedPayload) error {
-	conversation := ConversationRecord{ID: accepted.ConversationID, CreatedAt: source.CreatedAt, UpdatedAt: source.CreatedAt}
+	conversation := ConversationRecord{ID: accepted.ConversationID, CreatedAt: source.CreatedAt, UpdatedAt: source.CreatedAt, ExpiresAt: source.CreatedAt.Add(j.metadataTTL)}
 	var existingConversation ConversationRecord
 	err := tx.Where("id = ?", conversation.ID).First(&existingConversation).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -388,6 +396,7 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 			APIKeyID: accepted.APIKeyID, Endpoint: accepted.Endpoint, Model: accepted.Model,
 			Mode: accepted.Mode, Status: requestStatusRunning, AcceptedAt: source.CreatedAt,
 			StartedAt: source.CreatedAt, UpdatedAt: source.CreatedAt,
+			ExpiresAt: source.CreatedAt.Add(j.metadataTTL),
 		}
 		if err := tx.Create(&row).Error; err != nil {
 			return fmt.Errorf("store lifecycle request: %w", err)
@@ -417,6 +426,7 @@ func (j *Journal) ensureEncryptedPayload(tx *gorm.DB, source JournalRecord, plai
 		record := EncryptedPayloadRecord{
 			ID: source.ReplayID, ReplayID: source.ReplayID, KeyVersion: source.KeyVersion,
 			Envelope: append([]byte(nil), source.Payload...), CreatedAt: source.CreatedAt,
+			ExpiresAt: source.CreatedAt.Add(j.payloadTTL),
 		}
 		if err := tx.Create(&record).Error; err != nil {
 			return fmt.Errorf("store encrypted lifecycle payload: %w", err)
@@ -491,11 +501,15 @@ func (j *Journal) ensureTerminal(tx *gorm.DB, source JournalRecord, terminal lif
 			"terminal_at":        now,
 			"terminal_replay_id": source.ReplayID,
 			"updated_at":         now,
+			"expires_at":         now.Add(j.metadataTTL),
 		})
 		if result.Error != nil {
 			return fmt.Errorf("set lifecycle terminal state: %w", result.Error)
 		}
 		if result.RowsAffected == 1 {
+			if err := tx.Model(&ConversationRecord{}).Where("id = ?", row.ConversationID).Updates(map[string]any{"updated_at": now, "expires_at": now.Add(j.metadataTTL)}).Error; err != nil {
+				return fmt.Errorf("update lifecycle conversation expiry: %w", err)
+			}
 			return nil
 		}
 		if err := tx.Where("request_id = ?", source.RequestID).First(&row).Error; err != nil {
@@ -521,7 +535,7 @@ func (j *Journal) ensureTerminal(tx *gorm.DB, source JournalRecord, terminal lif
 	if err != nil {
 		return fmt.Errorf("generate terminal conflict audit ID: %w", err)
 	}
-	audit := AuditRecord{ID: auditID, RequestID: source.RequestID, EventType: "terminal.conflict", Status: 409, PayloadID: source.ReplayID, CreatedAt: source.CreatedAt}
+	audit := AuditRecord{ID: auditID, RequestID: source.RequestID, EventType: "terminal.conflict", Status: 409, PayloadID: source.ReplayID, CreatedAt: source.CreatedAt, ExpiresAt: source.CreatedAt.Add(j.metadataTTL)}
 	if err := tx.Create(&audit).Error; err != nil {
 		return fmt.Errorf("store terminal conflict audit: %w", err)
 	}

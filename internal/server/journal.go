@@ -114,6 +114,8 @@ type Journal struct {
 	queue         chan journalWork
 	replayQueue   chan string
 	drainDeadline time.Duration
+	payloadTTL    time.Duration
+	metadataTTL   time.Duration
 	lifecycleMu   sync.RWMutex
 	accepting     bool
 	closed        chan struct{}
@@ -167,6 +169,10 @@ func newJournal(db *gorm.DB, mode string, queueCapacity int, drainDeadline time.
 }
 
 func newJournalWithKeys(db *gorm.DB, mode string, queueCapacity int, drainDeadline time.Duration, keys envelope.KeySet) (*Journal, error) {
+	return newJournalWithKeysAndTTLs(db, mode, queueCapacity, drainDeadline, 24*time.Hour, 7*24*time.Hour, keys)
+}
+
+func newJournalWithKeysAndTTLs(db *gorm.DB, mode string, queueCapacity int, drainDeadline, payloadTTL, metadataTTL time.Duration, keys envelope.KeySet) (*Journal, error) {
 	if db == nil {
 		return nil, errors.New("journal database is nil")
 	}
@@ -192,11 +198,22 @@ func newJournalWithKeys(db *gorm.DB, mode string, queueCapacity int, drainDeadli
 	if drainDeadline <= 0 {
 		return nil, errors.New("journal drain deadline must be positive")
 	}
+	if payloadTTL == 0 {
+		payloadTTL = 24 * time.Hour
+	}
+	if metadataTTL == 0 {
+		metadataTTL = 7 * 24 * time.Hour
+	}
+	if payloadTTL <= 0 || metadataTTL <= 0 {
+		return nil, errors.New("journal retention durations must be positive")
+	}
 	return &Journal{
 		db:            db,
 		keys:          validatedKeys,
 		mode:          mode,
 		drainDeadline: drainDeadline,
+		payloadTTL:    payloadTTL,
+		metadataTTL:   metadataTTL,
 		accepting:     true,
 		closed:        make(chan struct{}),
 		queue:         make(chan journalWork, queueCapacity),
@@ -1038,11 +1055,12 @@ func (j *Journal) RecordAudit(ctx context.Context, metadata JournalAuditMetadata
 		return fmt.Errorf("encrypt audit detail: %w", err)
 	}
 	if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		payload := EncryptedPayloadRecord{ID: auditID, ReplayID: auditID, KeyVersion: j.keys.Active.Version, Envelope: encoded, CreatedAt: time.Now().UTC()}
+		createdAt := time.Now().UTC()
+		payload := EncryptedPayloadRecord{ID: auditID, ReplayID: auditID, KeyVersion: j.keys.Active.Version, Envelope: encoded, CreatedAt: createdAt, ExpiresAt: createdAt.Add(j.payloadTTL)}
 		if err := tx.Create(&payload).Error; err != nil {
 			return fmt.Errorf("store audit payload: %w", err)
 		}
-		audit := AuditRecord{ID: auditID, RequestID: metadata.RequestID, APIKeyID: metadata.APIKeyID, Endpoint: metadata.Endpoint, EventType: metadata.EventType, Status: metadata.Status, PayloadID: auditID, CreatedAt: payload.CreatedAt}
+		audit := AuditRecord{ID: auditID, RequestID: metadata.RequestID, APIKeyID: metadata.APIKeyID, Endpoint: metadata.Endpoint, EventType: metadata.EventType, Status: metadata.Status, PayloadID: auditID, CreatedAt: createdAt, ExpiresAt: createdAt.Add(j.metadataTTL)}
 		if err := tx.Create(&audit).Error; err != nil {
 			return fmt.Errorf("store audit record: %w", err)
 		}

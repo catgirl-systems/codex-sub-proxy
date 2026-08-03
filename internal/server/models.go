@@ -24,7 +24,7 @@ type modelsResponse struct {
 	Data   []modelObject `json:"data"`
 }
 
-func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore) (*iris.Application, error) {
+func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) (*iris.Application, error) {
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
 	app.Get(modelsEndpoint, func(ctx iris.Context) {
@@ -55,9 +55,9 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 		writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
 	})
 	app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport, journal, quota))
-	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal, quota))
-	app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal, quota))
-	app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal, quota))
+	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal, quota, artifacts, artifactRequired))
+	app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
+	app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
 	if err := app.Build(); err != nil {
 		return nil, err
 	}

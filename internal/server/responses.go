@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,7 @@ const (
 	responsesServerErrorType = "server_error"
 )
 
-func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
+func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setJournalAuditContext(ctx, journal, responsesEndpoint)
@@ -128,7 +129,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			if lease != nil {
 				defer func() { _ = lease.release("request ended") }()
 			}
-			serveResponsesStream(ctx, requestContext, transport, privateRequest, lease)
+			serveResponsesStream(ctx, requestContext, transport, privateRequest, lease, artifacts, artifactRequired)
 			return
 		}
 		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
@@ -159,6 +160,11 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 		if requestContext.Err() != nil {
+			return
+		}
+		if err := persistResponseImageArtifacts(requestContext, artifacts, artifactRequired, imageArtifactOwner(ctx), result); err != nil {
+			markJournalTerminal(ctx, requestStatusFailed, "")
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
 		payload, err := publicResponsePayload(result)
@@ -358,7 +364,7 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 	return &codex.CodexTextConfig{Verbosity: text.Verbosity}
 }
 
-func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, lease *quotaLease) {
+func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
@@ -395,6 +401,11 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		}
 		if event.SequenceNumber > lastSequence {
 			lastSequence = event.SequenceNumber
+		}
+		if isCodexTerminal(event.Type) && event.Response != nil {
+			if err := persistResponseImageArtifacts(requestContext, artifacts, artifactRequired, imageArtifactOwner(ctx), codex.CodexStreamResult{Response: event.Response}); err != nil {
+				return err
+			}
 		}
 		payload, keep, err := publicEventPayload(event)
 		if err != nil {
@@ -924,4 +935,62 @@ func writeResponsesError(ctx iris.Context, status int, typ, code, message string
 		recordJournalRejection(ctx, status, "audit.rejected."+code)
 	}
 	writeJSON(ctx, status, openai.ErrorResponse{Error: openai.Error{Type: typ, Code: code, Message: message}})
+}
+func persistResponseImageArtifacts(ctx context.Context, store *ArtifactStore, required bool, owner ArtifactOwner, result codex.CodexStreamResult) error {
+	if result.Response == nil {
+		return nil
+	}
+	var candidates []struct {
+		index int
+		mime  string
+		data  []byte
+	}
+	for index, item := range result.Response.Output {
+		if item.Type != codex.CodexImageGenerationCall || item.Result == "" {
+			continue
+		}
+		if len(item.Result) > 8<<20 {
+			return errors.New("response image artifact is too large")
+		}
+		data, err := base64.StdEncoding.DecodeString(item.Result)
+		if err != nil {
+			return errors.New("response image artifact is invalid")
+		}
+		if len(data) == 0 || len(data) > maxImageFileBytes {
+			return errors.New("response image artifact size is invalid")
+		}
+		mimeType, ok := artifactImageMIME(data)
+		if !ok {
+			return errors.New("response image artifact MIME is unsupported")
+		}
+		candidates = append(candidates, struct {
+			index int
+			mime  string
+			data  []byte
+		}{index: index, mime: mimeType, data: data})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	if store == nil {
+		if required {
+			return errors.New("encrypted artifact storage is unavailable")
+		}
+		return nil
+	}
+	if err := validateArtifactOwner(owner); err != nil {
+		return err
+	}
+	saved := make([]ArtifactRecord, 0, len(candidates))
+	for _, candidate := range candidates {
+		record, err := store.Save(ctx, owner, candidate.index, candidate.mime, candidate.data)
+		if err != nil {
+			cleanupImageArtifacts(ctx, store, saved)
+			return fmt.Errorf("persist response image artifact %d: %w", candidate.index, err)
+		}
+		if record.persisted {
+			saved = append(saved, record)
+		}
+	}
+	return nil
 }

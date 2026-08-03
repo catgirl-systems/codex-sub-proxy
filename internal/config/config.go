@@ -16,21 +16,30 @@ import (
 )
 
 const (
-	defaultListen               = "127.0.0.1:4000"
-	defaultAdminListen          = "127.0.0.1:4001"
-	defaultSQLitePath           = "~/.local/share/codex-sub-proxy/csp.sqlite3"
-	defaultBusyTimeout          = 5 * time.Second
-	defaultCredentialFile       = "~/.config/codex-sub-proxy/credential.enc"
-	defaultJournalQueueCapacity = 64
-	defaultJournalDrainDeadline = 10 * time.Second
+	defaultListen                 = "127.0.0.1:4000"
+	defaultAdminListen            = "127.0.0.1:4001"
+	defaultSQLitePath             = "~/.local/share/codex-sub-proxy/csp.sqlite3"
+	defaultArtifactRoot           = "~/.local/share/codex-sub-proxy/artifacts"
+	defaultBusyTimeout            = 5 * time.Second
+	defaultCredentialFile         = "~/.config/codex-sub-proxy/credential.enc"
+	defaultJournalQueueCapacity   = 64
+	defaultJournalDrainDeadline   = 10 * time.Second
+	defaultArtifactTTL            = 24 * time.Hour
+	defaultPayloadTTL             = 24 * time.Hour
+	defaultMetadataTTL            = 7 * 24 * time.Hour
+	defaultRetentionSweepInterval = time.Minute
+	defaultRetentionBatchSize     = 64
+	defaultRetentionDrainDeadline = 10 * time.Second
+	maxRetentionDuration          = 365 * 24 * time.Hour
 )
 
 type Config struct {
-	Server   ServerConfig   `toml:"server"`
-	Storage  StorageConfig  `toml:"storage"`
-	Security SecurityConfig `toml:"security"`
-	Codex    CodexConfig    `toml:"codex"`
-	Journal  JournalConfig  `toml:"journal"`
+	Server    ServerConfig    `toml:"server"`
+	Storage   StorageConfig   `toml:"storage"`
+	Security  SecurityConfig  `toml:"security"`
+	Codex     CodexConfig     `toml:"codex"`
+	Journal   JournalConfig   `toml:"journal"`
+	Retention RetentionConfig `toml:"retention"`
 }
 
 type ServerConfig struct {
@@ -39,8 +48,18 @@ type ServerConfig struct {
 }
 
 type StorageConfig struct {
-	SQLitePath  string        `toml:"sqlite_path" validate:"required"`
-	BusyTimeout time.Duration `toml:"busy_timeout" validate:"gt=0,lte=86400000000000"`
+	SQLitePath   string        `toml:"sqlite_path" validate:"required"`
+	ArtifactRoot string        `toml:"artifact_root" validate:"required"`
+	BusyTimeout  time.Duration `toml:"busy_timeout" validate:"gt=0,lte=86400000000000"`
+}
+
+type RetentionConfig struct {
+	ArtifactTTL   time.Duration `toml:"artifact_ttl" validate:"gt=0,lte=31536000000000000"`
+	PayloadTTL    time.Duration `toml:"payload_ttl" validate:"gt=0,lte=31536000000000000"`
+	MetadataTTL   time.Duration `toml:"metadata_ttl" validate:"gt=0,lte=31536000000000000"`
+	SweepInterval time.Duration `toml:"sweep_interval" validate:"gt=0,lte=86400000000000"`
+	BatchSize     int           `toml:"batch_size" validate:"gt=0,lte=4096"`
+	DrainDeadline time.Duration `toml:"drain_deadline" validate:"gt=0,lte=86400000000000"`
 }
 
 // JournalMode selects the append and forward ordering.
@@ -166,8 +185,9 @@ func Default() Config {
 			AdminListen: defaultAdminListen,
 		},
 		Storage: StorageConfig{
-			SQLitePath:  defaultSQLitePath,
-			BusyTimeout: defaultBusyTimeout,
+			SQLitePath:   defaultSQLitePath,
+			ArtifactRoot: defaultArtifactRoot,
+			BusyTimeout:  defaultBusyTimeout,
 		},
 		Security: SecurityConfig{
 			PayloadEncryptionKeyEnv:        "CSP_PAYLOAD_ENCRYPTION_KEY",
@@ -185,6 +205,14 @@ func Default() Config {
 			Mode:          JournalModeDurable,
 			QueueCapacity: defaultJournalQueueCapacity,
 			DrainDeadline: defaultJournalDrainDeadline,
+		},
+		Retention: RetentionConfig{
+			ArtifactTTL:   defaultArtifactTTL,
+			PayloadTTL:    defaultPayloadTTL,
+			MetadataTTL:   defaultMetadataTTL,
+			SweepInterval: defaultRetentionSweepInterval,
+			BatchSize:     defaultRetentionBatchSize,
+			DrainDeadline: defaultRetentionDrainDeadline,
 		},
 	}
 }
@@ -205,10 +233,33 @@ func Load(path string) (Config, error) {
 	if err := applyEnvironment(&cfg); err != nil {
 		return Config{}, err
 	}
+	artifactRoot, err := normalizeArtifactRoot(cfg.Storage.ArtifactRoot)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Storage.ArtifactRoot = artifactRoot
 	if err := configurationValidation.Struct(cfg); err != nil {
 		return Config{}, fmt.Errorf("validate configuration: %w", err)
 	}
 	return cfg, nil
+}
+
+func normalizeArtifactRoot(path string) (string, error) {
+	expanded, err := ExpandPath(path)
+	if err != nil {
+		return "", fmt.Errorf("expand artifact root: %w", err)
+	}
+	if expanded == "" || expanded == ":memory:" || strings.HasPrefix(expanded, "file:") {
+		return "", errors.New("artifact root must be a filesystem directory")
+	}
+	if !filepath.IsAbs(expanded) {
+		return "", errors.New("artifact root must be absolute")
+	}
+	cleaned := filepath.Clean(expanded)
+	if cleaned != expanded {
+		return "", errors.New("artifact root must be clean")
+	}
+	return cleaned, nil
 }
 
 // KeysAvailable checks that all configured key variables are present.
@@ -378,6 +429,7 @@ func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Server.Listen, "CSP_SERVER_LISTEN", "CSP_LISTEN")
 	overrideString(&cfg.Server.AdminListen, "CSP_SERVER_ADMIN_LISTEN", "CSP_ADMIN_LISTEN")
 	overrideString(&cfg.Storage.SQLitePath, "CSP_STORAGE_SQLITE_PATH", "CSP_SQLITE_PATH")
+	overrideString(&cfg.Storage.ArtifactRoot, "CSP_STORAGE_ARTIFACT_ROOT", "CSP_ARTIFACT_ROOT")
 	if err := overrideDuration(&cfg.Storage.BusyTimeout, "CSP_STORAGE_BUSY_TIMEOUT", "CSP_BUSY_TIMEOUT"); err != nil {
 		return err
 	}
@@ -393,6 +445,24 @@ func applyEnvironment(cfg *Config) error {
 		return err
 	}
 	if err := overrideDuration(&cfg.Journal.DrainDeadline, "CSP_JOURNAL_DRAIN_DEADLINE"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Retention.ArtifactTTL, "CSP_RETENTION_ARTIFACT_TTL", "CSP_ARTIFACT_TTL"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Retention.PayloadTTL, "CSP_RETENTION_PAYLOAD_TTL", "CSP_PAYLOAD_TTL"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Retention.MetadataTTL, "CSP_RETENTION_METADATA_TTL", "CSP_METADATA_TTL"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Retention.SweepInterval, "CSP_RETENTION_SWEEP_INTERVAL", "CSP_RETENTION_INTERVAL"); err != nil {
+		return err
+	}
+	if err := overrideInt(&cfg.Retention.BatchSize, "CSP_RETENTION_BATCH_SIZE"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Retention.DrainDeadline, "CSP_RETENTION_DRAIN_DEADLINE"); err != nil {
 		return err
 	}
 	return nil
