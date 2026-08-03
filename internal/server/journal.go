@@ -94,11 +94,12 @@ type JournalRequest struct {
 }
 
 type journalRequestState struct {
-	mu             sync.Mutex
-	request        JournalRequest
-	requestRecord  JournalRecord
-	nextSequence   uint64
-	terminalRecord bool
+	mu              sync.Mutex
+	request         JournalRequest
+	requestRecord   JournalRecord
+	nextSequence    uint64
+	terminalClaimed bool
+	terminalRecord  bool
 }
 
 type journalWork struct {
@@ -253,6 +254,9 @@ func (j *Journal) BeginRequestWithMetadata(ctx context.Context, metadata Journal
 	if ctx == nil {
 		return JournalRequest{}, errors.New("journal request context is nil")
 	}
+	if err := validateJournalEvent("request.input", input); err != nil {
+		return JournalRequest{}, err
+	}
 	if err := j.beginOperation(); err != nil {
 		return JournalRequest{}, err
 	}
@@ -338,6 +342,9 @@ func (j *Journal) newEncryptedRecord(replayID, requestID string, sequence uint64
 	encrypted, err := envelope.Encrypt(plain, envelope.PayloadDomain, j.keys)
 	if err != nil {
 		return JournalRecord{}, fmt.Errorf("encrypt journal payload: %w", err)
+	}
+	if err := validateJournalEnvelope(encrypted); err != nil {
+		return JournalRecord{}, err
 	}
 	record := JournalRecord{
 		ReplayID: replayID, RequestID: requestID, Sequence: sequence, Mode: mode,
@@ -439,6 +446,9 @@ func (j *Journal) RecordUsage(ctx context.Context, request JournalRequest, input
 	return j.forwardInternal(ctx, request, "usage.update", payload)
 }
 
+// RecordTerminal appends one terminal lifecycle event. A successful append claims
+// the request terminal under the request mutex; a failed append releases that
+// claim so a later terminal can still be recorded.
 func (j *Journal) RecordTerminal(ctx context.Context, request JournalRequest, state string, detail []byte) error {
 	if ctx == nil {
 		return errors.New("journal terminal context is nil")
@@ -447,17 +457,50 @@ func (j *Journal) RecordTerminal(ctx context.Context, request JournalRequest, st
 	if err != nil {
 		return err
 	}
-	if err := j.forwardInternal(ctx, request, "request.terminal", payload); err != nil {
+	if err := j.beginOperation(); err != nil {
 		return err
 	}
-	if requestState := j.requestState(request); requestState != nil {
-		requestState.mu.Lock()
-		requestState.terminalRecord = true
-		requestState.mu.Unlock()
+	defer j.endOperation()
+	requestState := j.requestState(request)
+	if requestState == nil {
+		return fmt.Errorf("journal request %q is unknown", request.ID)
 	}
+	requestState.mu.Lock()
+	if requestState.terminalRecord {
+		requestState.mu.Unlock()
+		return nil
+	}
+	requestState.terminalClaimed = true
+	err = j.appendTerminalRecord(ctx, requestState, payload)
+	if err != nil {
+		requestState.terminalClaimed = false
+		requestState.mu.Unlock()
+		return err
+	}
+	requestState.terminalRecord = true
+	requestState.terminalClaimed = false
+	requestState.mu.Unlock()
 	return nil
 }
 
+func (j *Journal) appendTerminalRecord(ctx context.Context, state *journalRequestState, payload []byte) error {
+	replayID, err := newJournalUUID()
+	if err != nil {
+		return fmt.Errorf("generate terminal replay ID: %w", err)
+	}
+	record, err := j.newEncryptedRecord(replayID, state.request.ID, state.nextSequence, state.request.Mode, "request.terminal", payload, true)
+	if err != nil {
+		return err
+	}
+	if err := j.appendRecord(ctx, state, record); err != nil {
+		return err
+	}
+	state.nextSequence++
+	j.enqueueReplay(replayID)
+	return nil
+}
+
+// forwardInternal appends one internal lifecycle event.
 func (j *Journal) forwardInternal(ctx context.Context, request JournalRequest, eventType string, payload []byte) error {
 	if ctx == nil {
 		return errors.New("journal lifecycle context is nil")
@@ -500,18 +543,8 @@ func (j *Journal) CompleteRequestWithState(ctx context.Context, request JournalR
 	if terminalState != requestStatusSucceeded && terminalState != requestStatusFailed && terminalState != requestStatusCanceled {
 		return fmt.Errorf("journal completion state %q is invalid", terminalState)
 	}
-	state := j.requestState(request)
-	if state == nil {
-		return fmt.Errorf("journal request %q is unknown", request.ID)
-	}
-	state.mu.Lock()
-	terminalRecorded := state.terminalRecord
-	state.mu.Unlock()
-	if !terminalRecorded {
-		if err := j.RecordTerminal(ctx, request, terminalState, nil); err != nil {
-			j.deleteRequest(request.ID)
-			return err
-		}
+	if err := j.RecordTerminal(ctx, request, terminalState, nil); err != nil {
+		return err
 	}
 	j.deleteRequest(request.ID)
 	return nil
@@ -875,6 +908,13 @@ func validateJournalEvent(eventType string, payload []byte) error {
 	return nil
 }
 
+func validateJournalEnvelope(payload []byte) error {
+	if len(payload) == 0 || len(payload) > envelope.MaxEnvelopeSize {
+		return errors.New("journal envelope size is invalid")
+	}
+	return nil
+}
+
 func validateJournalRecord(record JournalRecord) error {
 	if !validJournalUUID(record.ReplayID) || !validJournalUUID(record.RequestID) {
 		return errors.New("journal record ID is invalid")
@@ -882,7 +922,10 @@ func validateJournalRecord(record JournalRecord) error {
 	if err := validateJournalMode(record.Mode); err != nil {
 		return err
 	}
-	if err := validateJournalEvent(record.EventType, record.Payload); err != nil {
+	if err := validateJournalEvent(record.EventType, nil); err != nil {
+		return err
+	}
+	if err := validateJournalEnvelope(record.Payload); err != nil {
 		return err
 	}
 	if record.EventVersion != lifecycleEventVersion || record.KeyVersion == 0 {

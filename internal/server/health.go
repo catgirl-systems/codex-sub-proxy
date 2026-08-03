@@ -180,16 +180,6 @@ func markJournalTerminalValue(value *journalRequestValue, state, detail string) 
 	if value == nil || value.journal == nil {
 		return
 	}
-	requestState := value.journal.requestState(value.request)
-	if requestState == nil {
-		return
-	}
-	requestState.mu.Lock()
-	if requestState.terminalRecord {
-		requestState.mu.Unlock()
-		return
-	}
-	requestState.mu.Unlock()
 	if err := value.journal.RecordTerminal(context.WithoutCancel(value.context), value.request, state, []byte(detail)); err != nil {
 		value.journal.recordError(err)
 	}

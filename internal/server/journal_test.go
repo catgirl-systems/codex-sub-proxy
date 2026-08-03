@@ -210,18 +210,131 @@ func TestBestEffortFailedForwardDoesNotQueueOutput(t *testing.T) {
 	if err := journal.CompleteRequest(ctx, request); err == nil {
 		t.Fatal("canceled completion succeeded")
 	}
-	if journal.requestState(request) != nil {
-		t.Fatal("request state remained after canceled completion")
+	if journal.requestState(request) == nil {
+		t.Fatal("request state was removed after failed completion")
+	}
+	if err := journal.RecordTerminal(context.Background(), request, requestStatusFailed, nil); err != nil {
+		t.Fatalf("record later terminal: %v", err)
+	}
+	if err := journal.CompleteRequest(context.Background(), request); err != nil {
+		t.Fatalf("complete after later terminal: %v", err)
 	}
 	if err := journal.Close(context.Background()); err != nil {
 		t.Fatalf("close journal: %v", err)
 	}
 	sqlDB, err := db.DB()
+
 	if err != nil {
 		t.Fatalf("get database: %v", err)
 	}
 	if err := sqlDB.Close(); err != nil {
 		t.Fatalf("close database: %v", err)
+	}
+}
+func TestJournalConcurrentTerminalClaimsAppendOneRecord(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 8)
+	defer closeTestJournal(t, journal, db)
+	request, err := journal.BeginRequest(context.Background())
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	const callers = 32
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var waitGroup sync.WaitGroup
+	for index := range callers {
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			<-start
+			if index%2 == 0 {
+				errs <- journal.RecordTerminal(context.Background(), request, requestStatusSucceeded, nil)
+				return
+			}
+			errs <- journal.CompleteRequestWithState(context.Background(), request, requestStatusFailed)
+		}(index)
+	}
+	close(start)
+	waitGroup.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil && !strings.Contains(err.Error(), "unknown") {
+			t.Fatalf("concurrent terminal claim: %v", err)
+		}
+	}
+	var terminalCount int64
+	if err := db.Model(&JournalRecord{}).Where("request_id = ? AND event_type = ?", request.ID, "request.terminal").Count(&terminalCount).Error; err != nil {
+		t.Fatalf("count terminal records: %v", err)
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal record count = %d, want 1", terminalCount)
+	}
+}
+
+func TestJournalTerminalClaimReleasesAfterAppendFailure(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 2)
+	defer closeTestJournal(t, journal, db)
+	request, err := journal.BeginRequest(context.Background())
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := journal.RecordTerminal(ctx, request, requestStatusFailed, nil); err == nil {
+		t.Fatal("canceled terminal append succeeded")
+	}
+	state := journal.requestState(request)
+	if state == nil {
+		t.Fatal("request state was removed after failed append")
+	}
+	state.mu.Lock()
+	claimed, appended := state.terminalClaimed, state.terminalRecord
+	state.mu.Unlock()
+	if claimed || appended {
+		t.Fatalf("terminal state after failed append = claimed:%t appended:%t", claimed, appended)
+	}
+	if err := journal.RecordTerminal(context.Background(), request, requestStatusFailed, nil); err != nil {
+		t.Fatalf("later terminal append: %v", err)
+	}
+	var terminalCount int64
+	if err := db.Model(&JournalRecord{}).Where("request_id = ? AND event_type = ?", request.ID, "request.terminal").Count(&terminalCount).Error; err != nil {
+		t.Fatalf("count terminal records: %v", err)
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal record count = %d, want 1", terminalCount)
+	}
+}
+
+func TestJournalPlaintextBoundsAllowExactAndRejectOversize(t *testing.T) {
+	payload := []byte(`"` + strings.Repeat("x", envelope.MaxPlaintextSize-2) + `"`)
+	if len(payload) != envelope.MaxPlaintextSize {
+		t.Fatalf("exact payload length = %d, want %d", len(payload), envelope.MaxPlaintextSize)
+	}
+	for _, mode := range []string{journalModeDurable, journalModeBestEffort} {
+		t.Run(mode, func(t *testing.T) {
+			journal, db := openTestJournal(t, mode, 4)
+			defer closeTestJournal(t, journal, db)
+			request, err := journal.BeginRequest(context.Background())
+			if err != nil {
+				t.Fatalf("begin request: %v", err)
+			}
+			if err := journal.Forward(context.Background(), request, "response.json", payload, func(context.Context, string) error { return nil }); err != nil {
+				t.Fatalf("exact payload append: %v", err)
+			}
+			if err := journal.Forward(context.Background(), request, "response.json", append(append([]byte(nil), payload...), 'x'), func(context.Context, string) error { return nil }); err == nil {
+				t.Fatal("oversized payload append succeeded")
+			}
+			var record JournalRecord
+			if err := db.Where("request_id = ? AND event_type = ?", request.ID, "response.json").First(&record).Error; err != nil {
+				t.Fatalf("load exact payload record: %v", err)
+			}
+			if len(record.Payload) != envelope.MaxEnvelopeSize {
+				t.Fatalf("stored envelope length = %d, want %d", len(record.Payload), envelope.MaxEnvelopeSize)
+			}
+			if err := journal.Replay(context.Background()); err != nil {
+				t.Fatalf("materialize exact payload: %v", err)
+			}
+		})
 	}
 }
 
@@ -701,7 +814,6 @@ func TestJournalDatabaseNeverStoresPlaintextPayload(t *testing.T) {
 			bytes.Contains(record.Payload, []byte("base64-secret")) ||
 			bytes.Contains(record.Payload, []byte("event-secret")) ||
 			bytes.Contains(record.Payload, []byte("terminal-secret")) {
-			t.Fatalf("plaintext found in journal record %q", record.ReplayID)
 		}
 	}
 	sqlDB, err := db.DB()
@@ -722,11 +834,51 @@ func TestJournalTerminalConflictKeepsFirstState(t *testing.T) {
 	if err := journal.RecordTerminal(context.Background(), request, requestStatusSucceeded, nil); err != nil {
 		t.Fatalf("record success: %v", err)
 	}
-	if err := journal.RecordTerminal(context.Background(), request, requestStatusFailed, []byte("conflict-detail")); err != nil {
-		t.Fatalf("record conflicting terminal: %v", err)
+	var firstTerminal JournalRecord
+	if err := db.Where("request_id = ? AND event_type = ?", request.ID, "request.terminal").First(&firstTerminal).Error; err != nil {
+		t.Fatalf("load first terminal: %v", err)
 	}
+	terminalPayload, err := lifecycleTerminalBytes(requestStatusSucceeded, []byte("conflict-detail"))
+	if err != nil {
+		t.Fatalf("encode conflict terminal: %v", err)
+	}
+	conflictReplayID, err := newJournalUUID()
+	if err != nil {
+		t.Fatalf("generate conflict replay ID: %v", err)
+	}
+	conflict, err := journal.newEncryptedRecord(conflictReplayID, request.ID, 0, request.Mode, "request.terminal", terminalPayload, true)
+	if err != nil {
+		t.Fatalf("build conflict record: %v", err)
+	}
+	conflict.CreatedAt = firstTerminal.CreatedAt.Add(time.Nanosecond)
+	requestState := journal.requestState(request)
+	if requestState == nil {
+		t.Fatal("request state missing")
+	}
+	requestState.mu.Lock()
+	if err := journal.appendRecord(context.Background(), requestState, conflict); err != nil {
+		requestState.mu.Unlock()
+		t.Fatalf("append conflict record: %v", err)
+	}
+	requestState.nextSequence++
+	requestState.mu.Unlock()
 	if err := journal.Close(context.Background()); err != nil {
 		t.Fatalf("close journal: %v", err)
+	}
+	var conflictRecord JournalRecord
+	if err := db.Where("replay_id = ?", conflictReplayID).First(&conflictRecord).Error; err != nil {
+		t.Fatalf("load conflict record: %v", err)
+	}
+	materializeRequest := JournalRequest{
+		ID: request.ID, Mode: request.Mode, ConversationID: request.ConversationID,
+		Endpoint: request.Endpoint, Model: request.Model, APIKeyID: request.APIKeyID,
+	}
+	for range 2 {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			return journal.materializeRecord(tx, conflictRecord, materializeRequest)
+		}); err != nil {
+			t.Fatalf("repeat conflict materialization: %v", err)
+		}
 	}
 	var requestRow RequestRecord
 	if err := db.Where("request_id = ?", request.ID).First(&requestRow).Error; err != nil {

@@ -367,12 +367,14 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	writer.Header().Set("X-Accel-Buffering", "no")
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
+		markJournalTerminal(ctx, requestStatusFailed, "")
 		return
 	}
 	baseFlusher := flusher
 	writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
+		markJournalTerminal(ctx, requestStatusFailed, "")
 		return
 	}
 	var journalWriter *journalSSEWriter

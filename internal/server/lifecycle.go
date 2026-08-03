@@ -502,12 +502,20 @@ func (j *Journal) ensureTerminal(tx *gorm.DB, source JournalRecord, terminal lif
 			return err
 		}
 	}
-	if row.TerminalReplayID == source.ReplayID || row.Status == terminal.State {
+	if row.TerminalReplayID == source.ReplayID {
 		return nil
 	}
 	result := tx.Model(&RequestRecord{}).Where("request_id = ?", source.RequestID).Update("terminal_conflict", true)
 	if result.Error != nil {
 		return fmt.Errorf("flag lifecycle terminal conflict: %w", result.Error)
+	}
+	var existingAudit AuditRecord
+	err := tx.Where("request_id = ? AND event_type = ? AND payload_id = ?", source.RequestID, "terminal.conflict", source.ReplayID).First(&existingAudit).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("load terminal conflict audit: %w", err)
 	}
 	auditID, err := newJournalUUID()
 	if err != nil {
