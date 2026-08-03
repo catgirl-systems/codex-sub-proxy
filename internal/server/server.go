@@ -4,14 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"gorm.io/gorm"
 	"net"
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
-	"gorm.io/gorm"
 )
 
 const (
@@ -25,6 +25,7 @@ type Config struct {
 	AdminListen          string
 	Database             *gorm.DB
 	APIKeyHMACKey        []byte
+	PayloadKeys          envelope.KeySet
 	ResponsesTransport   *codex.ResponsesTransport
 	ImagesClient         *codex.ImagesClient
 	JournalMode          string
@@ -74,7 +75,11 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if err := quota.RecoverPending(context.Background()); err != nil {
 			return nil, fmt.Errorf("recover quota reservations: %w", err)
 		}
-		journal, err = newJournal(cfg.Database, cfg.JournalMode, cfg.JournalQueueCapacity, cfg.JournalDrainDeadline)
+		if cfg.PayloadKeys.Active.Version == 0 {
+			journal, err = newJournal(cfg.Database, cfg.JournalMode, cfg.JournalQueueCapacity, cfg.JournalDrainDeadline)
+		} else {
+			journal, err = newJournalWithKeys(cfg.Database, cfg.JournalMode, cfg.JournalQueueCapacity, cfg.JournalDrainDeadline, cfg.PayloadKeys)
+		}
 		if err != nil {
 			return nil, err
 		}

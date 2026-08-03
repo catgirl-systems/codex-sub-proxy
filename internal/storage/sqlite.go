@@ -49,6 +49,10 @@ func Open(ctx context.Context, path string, busyTimeout time.Duration) (*gorm.DB
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("set sqlite busy timeout: %w", err)
 	}
+	if _, err := sqlDB.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("enable sqlite foreign keys: %w", err)
+	}
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("ping sqlite database: %w", err)

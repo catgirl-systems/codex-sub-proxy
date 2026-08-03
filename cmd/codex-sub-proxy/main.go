@@ -136,6 +136,7 @@ func run(args []string) error {
 		Database:             db,
 		APIKeyHMACKey:        apiKeyHMACKey,
 		ResponsesTransport:   responsesTransport,
+		PayloadKeys:          payloadKeys,
 		ImagesClient:         imagesClient,
 		JournalMode:          string(cfg.Journal.Mode),
 		JournalQueueCapacity: cfg.Journal.QueueCapacity,

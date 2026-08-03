@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/kataras/iris/v12"
 )
@@ -98,13 +99,22 @@ func (w *journalSSEWriter) forwardFrame(frame []byte) error {
 			eventType = event.Type
 		}
 	}
-	return w.value.journal.Forward(w.context, w.value.request, eventType, frame, func(_ context.Context, _ string) error {
+	err := w.value.journal.Forward(w.context, w.value.request, eventType, frame, func(_ context.Context, _ string) error {
 		_, err := w.writer.Write(frame)
 		if err == nil {
 			w.flusher.Flush()
 		}
 		return err
 	})
+	if err != nil {
+		return err
+	}
+	if eventType == "stream.done" {
+		markJournalTerminalValue(w.value, requestStatusSucceeded, "")
+	} else if eventType == "error" || strings.HasPrefix(eventType, "response.failed") {
+		markJournalTerminalValue(w.value, requestStatusFailed, "")
+	}
+	return nil
 }
 
 func writeJournalSSEFailure(writer http.ResponseWriter, flusher http.Flusher, payload []byte) {

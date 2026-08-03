@@ -128,6 +128,7 @@ type chatNamedToolFunction struct {
 func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
+		setJournalAuditContext(ctx, journal, chatCompletionsEndpoint)
 		request := ctx.Request()
 		requestContext := request.Context()
 		if request.Method != http.MethodPost {
@@ -142,6 +143,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			return
 		}
 		principal, err := authorizer.AuthenticateHeader(requestContext, headers[0])
+		setJournalAuditPrincipal(ctx, principal.ID)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return
@@ -192,7 +194,14 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeAPIKeyError(ctx, err)
 			return
 		}
-		journalRequestID, err := startJournalRequest(ctx, journal)
+		journalInput, err := json.Marshal(publicRequest)
+		if err != nil {
+			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+			Endpoint: chatCompletionsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+		}, journalInput)
 		if err != nil {
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
@@ -269,6 +278,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
+		recordJournalUsage(ctx, usage)
 		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
 			handleJournalResponseError(ctx, err)
 			return
@@ -286,6 +296,9 @@ func writeChatDecodeError(ctx iris.Context, err error) {
 }
 
 func writeChatError(ctx iris.Context, status int, typ, code, message string) {
+	if _, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue); !ok {
+		recordJournalRejection(ctx, status, "audit.rejected."+code)
+	}
 	writeJSON(ctx, status, openai.ErrorResponse{Error: openai.Error{Type: typ, Code: code, Message: message}})
 }
 
@@ -1059,6 +1072,7 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 		if journalWriter == nil || journalWriter.failed == nil {
 			return false
 		}
+		markJournalTerminalValue(journalWriter.value, requestStatusFailed, "")
 		journalWriter.value.journal.recordError(journalWriter.failed)
 		payload, err := json.Marshal(openai.ErrorResponse{Error: openai.Error{Type: responsesServerErrorType, Code: "internal_error", Message: "Internal server error."}})
 		if err == nil {
@@ -1094,6 +1108,9 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 			return
 		}
 		return
+	}
+	if state.mappedUsage != nil {
+		recordJournalUsage(ctx, apikey.QuotaUsage{Tokens: state.mappedUsage.TotalTokens})
 	}
 	if includeUsage {
 		usage := *state.mappedUsage

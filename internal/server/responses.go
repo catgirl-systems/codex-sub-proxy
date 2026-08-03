@@ -31,6 +31,7 @@ const (
 func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
+		setJournalAuditContext(ctx, journal, responsesEndpoint)
 		request := ctx.Request()
 		requestContext := request.Context()
 		if request.Method != http.MethodPost {
@@ -45,6 +46,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 		principal, err := authorizer.AuthenticateHeader(requestContext, headers[0])
+		setJournalAuditPrincipal(ctx, principal.ID)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return
@@ -86,7 +88,15 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeAPIKeyError(ctx, err)
 			return
 		}
-		journalRequestID, err := startJournalRequest(ctx, journal)
+		journalInput, err := json.Marshal(publicRequest)
+		if err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+			ConversationHint: publicRequest.PreviousResponseID,
+		}, journalInput)
 		if err != nil {
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
@@ -169,6 +179,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
+		recordJournalUsage(ctx, usage)
 		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
 			handleJournalResponseError(ctx, err)
 			return
@@ -401,6 +412,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 			if err := lease.reconcile(usage); err != nil {
 				return err
 			}
+			recordJournalUsage(ctx, usage)
 		}
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
 			return err
@@ -417,6 +429,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		return
 	}
 	if journalWriter != nil && journalWriter.failed != nil {
+		markJournalTerminalValue(journalWriter.value, requestStatusFailed, "")
 		journalWriter.value.journal.recordError(journalWriter.failed)
 		writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
 		return
@@ -440,6 +453,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 		}
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
 			if journalWriter != nil && journalWriter.failed != nil {
+				markJournalTerminalValue(journalWriter.value, requestStatusFailed, "")
 				journalWriter.value.journal.recordError(journalWriter.failed)
 				writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
 			}
@@ -452,6 +466,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	}
 	if err := writeResponsesSSERecord(writer, flusher, []byte("[DONE]")); err != nil {
 		if journalWriter != nil && journalWriter.failed != nil {
+			markJournalTerminalValue(journalWriter.value, requestStatusFailed, "")
 			journalWriter.value.journal.recordError(journalWriter.failed)
 			writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
 		}
@@ -903,5 +918,8 @@ func responsesErrorTypeForCategory(category codex.ErrorCategory) string {
 }
 
 func writeResponsesError(ctx iris.Context, status int, typ, code, message string) {
+	if _, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue); !ok {
+		recordJournalRejection(ctx, status, "audit.rejected."+code)
+	}
 	writeJSON(ctx, status, openai.ErrorResponse{Error: openai.Error{Type: typ, Code: code, Message: message}})
 }

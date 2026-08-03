@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/kataras/iris/v12"
 )
 
@@ -108,33 +109,116 @@ func buildHealthApplication(readiness *Readiness) *iris.Application {
 }
 
 const journalRequestValueKey = "csp-journal-request"
+const journalAuditValueKey = "csp-journal-audit"
 
 type journalRequestValue struct {
 	journal *Journal
 	request JournalRequest
+	context context.Context
 }
 
-func startJournalRequest(ctx iris.Context, journal *Journal) (JournalRequest, error) {
+type journalAuditValue struct {
+	journal  *Journal
+	endpoint string
+	apiKeyID string
+	recorded bool
+}
+
+func setJournalAuditContext(ctx iris.Context, journal *Journal, endpoint string) {
+	if journal == nil {
+		return
+	}
+	ctx.Values().Set(journalAuditValueKey, &journalAuditValue{journal: journal, endpoint: endpoint})
+}
+
+func setJournalAuditPrincipal(ctx iris.Context, apiKeyID string) {
+	value, ok := ctx.Values().Get(journalAuditValueKey).(*journalAuditValue)
+	if !ok || value == nil {
+		return
+	}
+	value.apiKeyID = apiKeyID
+}
+
+func recordJournalRejection(ctx iris.Context, status int, eventType string) {
+	value, ok := ctx.Values().Get(journalAuditValueKey).(*journalAuditValue)
+	if !ok || value == nil || value.journal == nil || value.recorded {
+		return
+	}
+	value.recorded = true
+	detail := []byte(`{"version":1}`)
+	if err := value.journal.RecordAudit(ctx.Request().Context(), JournalAuditMetadata{
+		APIKeyID:  value.apiKeyID,
+		Endpoint:  value.endpoint,
+		EventType: eventType,
+		Status:    status,
+	}, detail); err != nil {
+		value.journal.recordWorkerError(err)
+	}
+}
+
+func startJournalRequestWithMetadata(ctx iris.Context, journal *Journal, metadata JournalRequestMetadata, input []byte) (JournalRequest, error) {
 	if journal == nil {
 		return JournalRequest{}, nil
 	}
-	request, err := journal.BeginRequest(ctx.Request().Context())
+	request, err := journal.BeginRequestWithMetadata(ctx.Request().Context(), metadata, input)
 	if err != nil {
 		return JournalRequest{}, err
 	}
-	ctx.Values().Set(journalRequestValueKey, &journalRequestValue{journal: journal, request: request})
+	ctx.Values().Set(journalRequestValueKey, &journalRequestValue{journal: journal, request: request, context: ctx.Request().Context()})
 	return request, nil
+}
+
+func markJournalTerminal(ctx iris.Context, state, detail string) {
+	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
+	if !ok || value == nil || value.journal == nil {
+		return
+	}
+	markJournalTerminalValue(value, state, detail)
+}
+
+func markJournalTerminalValue(value *journalRequestValue, state, detail string) {
+	if value == nil || value.journal == nil {
+		return
+	}
+	requestState := value.journal.requestState(value.request)
+	if requestState == nil {
+		return
+	}
+	requestState.mu.Lock()
+	if requestState.terminalRecord {
+		requestState.mu.Unlock()
+		return
+	}
+	requestState.mu.Unlock()
+	if err := value.journal.RecordTerminal(context.WithoutCancel(value.context), value.request, state, []byte(detail)); err != nil {
+		value.journal.recordError(err)
+	}
 }
 
 func finishJournalRequest(ctx iris.Context, journal *Journal, request JournalRequest) {
 	if journal == nil {
 		return
 	}
-	if err := journal.CompleteRequest(ctx.Request().Context(), request); err != nil {
+	state := requestStatusSucceeded
+	if ctx.Request().Context().Err() != nil {
+		state = requestStatusCanceled
+	} else if status := ctx.ResponseWriter().StatusCode(); status >= http.StatusBadRequest {
+		state = requestStatusFailed
+	}
+	if err := journal.CompleteRequestWithState(context.WithoutCancel(ctx.Request().Context()), request, state); err != nil {
 		journal.recordError(err)
 	}
 }
 
+func recordJournalUsage(ctx iris.Context, usage apikey.QuotaUsage) {
+	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
+	if !ok || value == nil || value.journal == nil {
+		return
+	}
+	if err := value.journal.RecordUsage(ctx.Request().Context(), value.request, 0, usage.Tokens, usage.Tokens, usage.Images); err != nil {
+		value.journal.recordError(err)
+	}
+}
 func writeJournalJSON(ctx iris.Context, status int, eventType string, payload []byte) error {
 	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
 	if !ok || value == nil || value.journal == nil {
@@ -146,7 +230,7 @@ func writeJournalJSON(ctx iris.Context, status int, eventType string, payload []
 		}
 		return err
 	}
-	return value.journal.Forward(ctx.Request().Context(), value.request, eventType, payload, func(_ context.Context, _ string) error {
+	err := value.journal.Forward(ctx.Request().Context(), value.request, eventType, payload, func(_ context.Context, _ string) error {
 		ctx.Header("Content-Type", "application/json")
 		ctx.StatusCode(status)
 		written, err := ctx.ResponseWriter().Write(payload)
@@ -155,6 +239,17 @@ func writeJournalJSON(ctx iris.Context, status int, eventType string, payload []
 		}
 		return err
 	})
+	if err != nil {
+		markJournalTerminal(ctx, requestStatusFailed, "")
+	}
+	if err == nil {
+		if status >= 200 && status < 300 {
+			markJournalTerminal(ctx, requestStatusSucceeded, "")
+		} else if status >= 400 {
+			markJournalTerminal(ctx, requestStatusFailed, "")
+		}
+	}
+	return err
 }
 
 func writeJSON(ctx iris.Context, status int, value any) error {
@@ -174,12 +269,11 @@ func writeJSON(ctx iris.Context, status int, value any) error {
 func handleJournalResponseError(ctx iris.Context, err error) {
 	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
 	if ok && value != nil && value.journal != nil {
-		if value.journal.mode == journalModeDurable && ctx.ResponseWriter().Written() < 0 {
-			value.journal.recordError(err)
-			writeSafeInternalError(ctx)
-			return
-		}
+		markJournalTerminal(ctx, requestStatusFailed, err.Error())
 		value.journal.recordError(err)
+		if value.journal.mode == journalModeDurable && ctx.ResponseWriter().Written() < 0 {
+			writeSafeInternalError(ctx)
+		}
 		return
 	}
 	if ctx.ResponseWriter().Written() < 0 {

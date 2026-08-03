@@ -28,6 +28,7 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
 	app.Get(modelsEndpoint, func(ctx iris.Context) {
+		setJournalAuditContext(ctx, journal, modelsEndpoint)
 		headers := ctx.Request().Header.Values("Authorization")
 		if len(headers) != 1 {
 			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
@@ -35,6 +36,7 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 		}
 		principal, err := authorizer.AuthenticateHeader(ctx.Request().Context(), headers[0])
 		if err == nil {
+			setJournalAuditPrincipal(ctx, principal.ID)
 			err = authorizer.AuthorizePrincipal(ctx.Request().Context(), principal, modelsEndpoint, "")
 		}
 		if err != nil {
@@ -63,6 +65,7 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 }
 
 func writeAPIKeyError(ctx iris.Context, err error) {
+	recordJournalRejection(ctx, http.StatusUnauthorized, "audit.rejected.auth")
 	status := http.StatusInternalServerError
 	message := "Internal server error."
 	typeName := "server_error"

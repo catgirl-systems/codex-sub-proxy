@@ -48,6 +48,7 @@ var (
 func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
+		setJournalAuditContext(ctx, journal, imagesGenerationsEndpoint)
 		setImagesWriteDeadline(ctx)
 		request := ctx.Request()
 		if request.Method != http.MethodPost {
@@ -90,7 +91,14 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeAPIKeyError(ctx, err)
 			return
 		}
-		journalRequestID, err := startJournalRequest(ctx, journal)
+		journalInput, err := json.Marshal(publicRequest)
+		if err != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+			Endpoint: imagesGenerationsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+		}, journalInput)
 		if err != nil {
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
@@ -148,7 +156,9 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
+		recordJournalUsage(ctx, usage)
 		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
+			markJournalTerminal(ctx, requestStatusFailed, "")
 			return
 		}
 	}
@@ -159,6 +169,7 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
 		request := ctx.Request()
+		setJournalAuditContext(ctx, journal, imagesEditsEndpoint)
 		if request.Method != http.MethodPost {
 			writeImagesMethodNotAllowed(ctx)
 			return
@@ -222,7 +233,14 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeAPIKeyError(ctx, err)
 			return
 		}
-		journalRequestID, err := startJournalRequest(ctx, journal)
+		journalInput, err := json.Marshal(publicRequest)
+		if err != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+			Endpoint: imagesEditsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+		}, journalInput)
 		if err != nil {
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
@@ -290,7 +308,9 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
+		recordJournalUsage(ctx, usage)
 		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
+			markJournalTerminal(ctx, requestStatusFailed, "")
 			return
 		}
 	}
@@ -313,6 +333,7 @@ func authenticateImagesRequest(ctx iris.Context, authorizer *apikey.Authorizer) 
 		writeAPIKeyError(ctx, err)
 		return apikey.Principal{}, false
 	}
+	setJournalAuditPrincipal(ctx, principal.ID)
 	return principal, true
 }
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 	"gorm.io/gorm"
 )
 
@@ -20,10 +21,11 @@ const (
 	journalModeBestEffort    = "best-effort"
 	journalRequestEventType  = "request.accepted"
 	maxJournalEventTypeBytes = 128
-	maxJournalPayloadBytes   = 32 << 20
+	maxJournalPayloadBytes   = envelope.MaxPlaintextSize
 	defaultJournalQueueSize  = 64
 	maxJournalQueueSize      = 4096
 	defaultJournalDrain      = 10 * time.Second
+	journalReplayBatchSize   = 64
 )
 
 var (
@@ -31,86 +33,85 @@ var (
 	ErrJournalClosed = errors.New("journal is closed")
 )
 
-// JournalRequestRecord stores the next sequence number for one request.
+// JournalRequestRecord stores the next sequence number and safe metadata for one request.
 type JournalRequestRecord struct {
-	RequestID    string    `gorm:"column:request_id;primaryKey;size:36"`
-	Mode         string    `gorm:"column:mode;not null;size:16"`
-	NextSequence uint64    `gorm:"column:next_sequence;not null"`
-	CreatedAt    time.Time `gorm:"column:created_at;not null"`
+	RequestID      string    `gorm:"column:request_id;primaryKey;size:36"`
+	Mode           string    `gorm:"column:mode;not null;size:16"`
+	NextSequence   uint64    `gorm:"column:next_sequence;not null"`
+	ConversationID string    `gorm:"column:conversation_id;not null;size:36;index"`
+	Endpoint       string    `gorm:"column:endpoint;not null;size:128;index"`
+	Model          string    `gorm:"column:model;not null;size:256;index"`
+	APIKeyID       string    `gorm:"column:api_key_id;size:255;index"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
 }
 
-func (JournalRequestRecord) TableName() string {
-	return "journal_requests"
-}
+func (JournalRequestRecord) TableName() string { return "journal_requests" }
 
-// JournalRecord is one immutable journal record and its delivery state.
+// JournalRecord is one immutable encrypted journal record and its delivery state.
 type JournalRecord struct {
-	ReplayID  string     `gorm:"column:replay_id;primaryKey;size:36"`
-	RequestID string     `gorm:"column:request_id;not null;size:36;index:idx_journal_request_sequence,unique"`
-	Sequence  uint64     `gorm:"column:sequence;not null;index:idx_journal_request_sequence,unique"`
-	Mode      string     `gorm:"column:mode;not null;size:16"`
-	EventType string     `gorm:"column:event_type;not null;size:128"`
-	Payload   []byte     `gorm:"column:payload;not null"`
-	Checksum  []byte     `gorm:"column:checksum;not null;size:32"`
-	CreatedAt time.Time  `gorm:"column:created_at;not null;index:idx_journal_created"`
-	Applied   bool       `gorm:"column:applied;not null;index"`
-	AppliedAt *time.Time `gorm:"column:applied_at"`
+	ReplayID     string     `gorm:"column:replay_id;primaryKey;size:36"`
+	RequestID    string     `gorm:"column:request_id;not null;size:36;index:idx_journal_request_sequence,unique"`
+	Sequence     uint64     `gorm:"column:sequence;not null;index:idx_journal_request_sequence,unique"`
+	Mode         string     `gorm:"column:mode;not null;size:16"`
+	EventType    string     `gorm:"column:event_type;not null;size:128;index"`
+	EventVersion uint16     `gorm:"column:event_version;not null"`
+	KeyVersion   uint32     `gorm:"column:key_version;not null"`
+	Payload      []byte     `gorm:"column:payload;not null"`
+	Checksum     []byte     `gorm:"column:checksum;not null;size:32"`
+	CreatedAt    time.Time  `gorm:"column:created_at;not null;index:idx_journal_created"`
+	Applied      bool       `gorm:"column:applied;not null;index"`
+	AppliedAt    *time.Time `gorm:"column:applied_at"`
 }
 
-func (JournalRecord) TableName() string {
-	return "journal_records"
-}
+func (JournalRecord) TableName() string { return "journal_records" }
 
-// JournalReceipt is the durable projection of one recovered event.
+// JournalReceipt is the durable spool state for one journal record.
 type JournalReceipt struct {
-	ReplayID  string    `gorm:"column:replay_id;primaryKey;size:36"`
-	RequestID string    `gorm:"column:request_id;not null;size:36"`
-	Sequence  uint64    `gorm:"column:sequence;not null"`
-	Mode      string    `gorm:"column:mode;not null;size:16"`
-	EventType string    `gorm:"column:event_type;not null;size:128"`
-	Payload   []byte    `gorm:"column:payload;not null"`
-	Checksum  []byte    `gorm:"column:checksum;not null;size:32"`
-	CreatedAt time.Time `gorm:"column:created_at;not null"`
+	ReplayID       string     `gorm:"column:replay_id;primaryKey;size:36"`
+	RequestID      string     `gorm:"column:request_id;not null;size:36;index"`
+	Sequence       uint64     `gorm:"column:sequence;not null"`
+	Mode           string     `gorm:"column:mode;not null;size:16"`
+	EventType      string     `gorm:"column:event_type;not null;size:128;index"`
+	EventVersion   uint16     `gorm:"column:event_version;not null"`
+	KeyVersion     uint32     `gorm:"column:key_version;not null"`
+	Payload        []byte     `gorm:"column:payload;not null"`
+	Checksum       []byte     `gorm:"column:checksum;not null;size:32"`
+	CreatedAt      time.Time  `gorm:"column:created_at;not null"`
+	Materialized   bool       `gorm:"column:materialized;not null;index"`
+	MaterializedAt *time.Time `gorm:"column:materialized_at"`
 }
 
-func (JournalReceipt) TableName() string {
-	return "journal_receipts"
-}
+func (JournalReceipt) TableName() string { return "journal_receipts" }
 
-// MigrateJournal creates the journal tables and their uniqueness indexes.
-func MigrateJournal(db *gorm.DB) error {
-	if db == nil {
-		return errors.New("journal database is nil")
-	}
-	if err := db.AutoMigrate(&JournalRequestRecord{}, &JournalRecord{}, &JournalReceipt{}); err != nil {
-		return fmt.Errorf("migrate journal: %w", err)
-	}
-	return nil
-}
-
-// JournalRequest identifies one accepted request.
+// JournalRequest identifies one accepted request and its safe searchable metadata.
 type JournalRequest struct {
-	ID   string
-	Mode string
+	ID             string
+	Mode           string
+	ConversationID string
+	Endpoint       string
+	Model          string
+	APIKeyID       string
 }
 
 type journalRequestState struct {
-	mu            sync.Mutex
-	request       JournalRequest
-	requestRecord JournalRecord
-	nextSequence  uint64
-	requestQueued bool
+	mu             sync.Mutex
+	request        JournalRequest
+	requestRecord  JournalRecord
+	nextSequence   uint64
+	terminalRecord bool
 }
 
 type journalWork struct {
 	records []JournalRecord
 }
 
-// Journal appends records and, in best-effort mode, drains one bounded queue.
+// Journal appends encrypted records and owns one bounded materializer worker.
 type Journal struct {
 	db            *gorm.DB
+	keys          envelope.KeySet
 	mode          string
 	queue         chan journalWork
+	replayQueue   chan string
 	drainDeadline time.Duration
 	lifecycleMu   sync.RWMutex
 	accepting     bool
@@ -137,9 +138,40 @@ type Journal struct {
 	errorSink chan<- error
 }
 
+// MigrateJournal creates the journal, receipt, and lifecycle projection tables.
+func MigrateJournal(db *gorm.DB) error {
+	if db == nil {
+		return errors.New("journal database is nil")
+	}
+	if err := db.AutoMigrate(&JournalRequestRecord{}, &JournalRecord{}, &JournalReceipt{}); err != nil {
+		return fmt.Errorf("migrate journal: %w", err)
+	}
+	if err := migrateLifecycle(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// newJournal keeps the old test constructor. Production startup passes keys through newJournalWithKeys.
 func newJournal(db *gorm.DB, mode string, queueCapacity int, drainDeadline time.Duration) (*Journal, error) {
+	key, err := envelope.NewKey(1, bytes.Repeat([]byte{0x6d}, envelope.KeySize))
+	if err != nil {
+		return nil, err
+	}
+	keys, err := envelope.NewKeySet(key)
+	if err != nil {
+		return nil, err
+	}
+	return newJournalWithKeys(db, mode, queueCapacity, drainDeadline, keys)
+}
+
+func newJournalWithKeys(db *gorm.DB, mode string, queueCapacity int, drainDeadline time.Duration, keys envelope.KeySet) (*Journal, error) {
 	if db == nil {
 		return nil, errors.New("journal database is nil")
+	}
+	validatedKeys, err := envelope.NewKeySet(keys.Active, keys.Previous...)
+	if err != nil {
+		return nil, fmt.Errorf("validate journal payload keys: %w", err)
 	}
 	if mode == "" {
 		mode = journalModeDurable
@@ -159,28 +191,27 @@ func newJournal(db *gorm.DB, mode string, queueCapacity int, drainDeadline time.
 	if drainDeadline <= 0 {
 		return nil, errors.New("journal drain deadline must be positive")
 	}
-	journal := &Journal{
+	return &Journal{
 		db:            db,
+		keys:          validatedKeys,
 		mode:          mode,
 		drainDeadline: drainDeadline,
 		accepting:     true,
 		closed:        make(chan struct{}),
+		queue:         make(chan journalWork, queueCapacity),
+		replayQueue:   make(chan string, queueCapacity),
 		requests:      make(map[string]*journalRequestState),
-	}
-	if mode == journalModeBestEffort {
-		journal.queue = make(chan journalWork, queueCapacity)
-	}
-	return journal, nil
+	}, nil
 }
 
-// Start starts the single best-effort journal worker.
+// Start starts the single materializer worker.
 func (j *Journal) Start() error {
 	if j == nil {
 		return errors.New("journal is nil")
 	}
 	j.workerMu.Lock()
 	defer j.workerMu.Unlock()
-	if j.mode == journalModeDurable || j.workerStarted {
+	if j.workerStarted {
 		return nil
 	}
 	j.lifecycleMu.RLock()
@@ -210,12 +241,15 @@ func (j *Journal) beginOperation() error {
 	return nil
 }
 
-func (j *Journal) endOperation() {
-	j.inFlight.Done()
-}
+func (j *Journal) endOperation() { j.inFlight.Done() }
 
 // BeginRequest creates an identity for one accepted request.
 func (j *Journal) BeginRequest(ctx context.Context) (JournalRequest, error) {
+	return j.BeginRequestWithMetadata(ctx, JournalRequestMetadata{Endpoint: "unknown", Model: "unknown"}, nil)
+}
+
+// BeginRequestWithMetadata appends accepted, running, and input lifecycle events.
+func (j *Journal) BeginRequestWithMetadata(ctx context.Context, metadata JournalRequestMetadata, input []byte) (JournalRequest, error) {
 	if ctx == nil {
 		return JournalRequest{}, errors.New("journal request context is nil")
 	}
@@ -223,56 +257,98 @@ func (j *Journal) BeginRequest(ctx context.Context) (JournalRequest, error) {
 		return JournalRequest{}, err
 	}
 	defer j.endOperation()
-
 	requestID, err := newJournalUUID()
 	if err != nil {
 		return JournalRequest{}, fmt.Errorf("generate journal request ID: %w", err)
 	}
-	request := JournalRequest{ID: requestID, Mode: j.mode}
-	requestRecord, err := j.newRequestRecord(request)
+	endpoint := metadata.Endpoint
+	if endpoint == "" {
+		endpoint = "unknown"
+	}
+	model := metadata.Model
+	if model == "" {
+		model = "unknown"
+	}
+	conversationID := deriveConversationID(metadata.ConversationHint)
+	if conversationID == "" {
+		conversationID, err = newJournalUUID()
+		if err != nil {
+			return JournalRequest{}, fmt.Errorf("generate conversation ID: %w", err)
+		}
+	}
+	request := JournalRequest{ID: requestID, Mode: j.mode, ConversationID: conversationID, Endpoint: endpoint, Model: model, APIKeyID: metadata.APIKeyID}
+	acceptedPayload, err := lifecycleAcceptedBytes(request)
 	if err != nil {
 		return JournalRequest{}, err
 	}
-	state := &journalRequestState{
-		request:       request,
-		requestRecord: requestRecord,
-		nextSequence:  1,
-		requestQueued: j.mode == journalModeDurable,
+	requestReplayID, err := newJournalUUID()
+	if err != nil {
+		return JournalRequest{}, fmt.Errorf("generate accepted replay ID: %w", err)
 	}
-	if j.mode == journalModeDurable {
-		if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			row := JournalRequestRecord{
-				RequestID:    request.ID,
-				Mode:         request.Mode,
-				NextSequence: 1,
-				CreatedAt:    requestRecord.CreatedAt,
-			}
-			if err := tx.Create(&row).Error; err != nil {
-				return fmt.Errorf("store journal request: %w", err)
-			}
-			if err := tx.Create(&requestRecord).Error; err != nil {
-				return fmt.Errorf("store journal request record: %w", err)
-			}
-			return nil
-		}); err != nil {
-			return JournalRequest{}, err
+	requestRecord, err := j.newEncryptedRecord(requestReplayID, request.ID, 0, request.Mode, journalRequestEventType, acceptedPayload, true)
+	if err != nil {
+		return JournalRequest{}, err
+	}
+	state := &journalRequestState{request: request, requestRecord: requestRecord, nextSequence: 1}
+	if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		row := JournalRequestRecord{
+			RequestID: request.ID, Mode: request.Mode, NextSequence: 1,
+			ConversationID: request.ConversationID, Endpoint: request.Endpoint,
+			Model: request.Model, APIKeyID: request.APIKeyID, CreatedAt: requestRecord.CreatedAt,
 		}
+		if err := tx.Create(&row).Error; err != nil {
+			return fmt.Errorf("store journal request: %w", err)
+		}
+		if err := validateJournalRecord(requestRecord); err != nil {
+			return err
+		}
+		if err := tx.Create(&requestRecord).Error; err != nil {
+			return fmt.Errorf("store journal request record: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return JournalRequest{}, err
 	}
 	j.requestsMu.Lock()
 	j.requests[request.ID] = state
 	j.requestsMu.Unlock()
+	if len(input) != 0 {
+		if err := j.appendInternal(ctx, state, "request.running", nil); err != nil {
+			j.deleteRequest(request.ID)
+			return JournalRequest{}, err
+		}
+		if err := j.appendInternal(ctx, state, "request.input", input); err != nil {
+			j.deleteRequest(request.ID)
+			return JournalRequest{}, err
+		}
+	}
 	return request, nil
 }
 
-func (j *Journal) newRequestRecord(request JournalRequest) (JournalRecord, error) {
-	replayID, err := newJournalUUID()
-	if err != nil {
-		return JournalRecord{}, fmt.Errorf("generate journal request replay ID: %w", err)
+func (j *Journal) newEncryptedRecord(replayID, requestID string, sequence uint64, mode, eventType string, plain []byte, applied bool) (JournalRecord, error) {
+	if !validJournalUUID(replayID) || !validJournalUUID(requestID) {
+		return JournalRecord{}, errors.New("journal record ID is invalid")
 	}
-	return newJournalRecord(replayID, request.ID, 0, request.Mode, journalRequestEventType, nil, true)
+	if err := validateJournalMode(mode); err != nil {
+		return JournalRecord{}, err
+	}
+	if err := validateJournalEvent(eventType, plain); err != nil {
+		return JournalRecord{}, err
+	}
+	encrypted, err := envelope.Encrypt(plain, envelope.PayloadDomain, j.keys)
+	if err != nil {
+		return JournalRecord{}, fmt.Errorf("encrypt journal payload: %w", err)
+	}
+	record := JournalRecord{
+		ReplayID: replayID, RequestID: requestID, Sequence: sequence, Mode: mode,
+		EventType: eventType, EventVersion: lifecycleEventVersion, KeyVersion: j.keys.Active.Version,
+		Payload: encrypted, CreatedAt: time.Now().UTC(), Applied: applied,
+	}
+	record.Checksum = journalChecksum(record)
+	return record, nil
 }
 
-// Forward appends one public output and invokes its receiver in journal order.
+// Forward appends an encrypted event before invoking its live receiver.
 func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType string, payload []byte, apply func(context.Context, string) error) error {
 	if ctx == nil {
 		return errors.New("journal forward context is nil")
@@ -284,67 +360,37 @@ func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType
 		return err
 	}
 	defer j.endOperation()
-	if err := validateJournalEvent(eventType, payload); err != nil {
-		return err
-	}
 	state := j.requestState(request)
 	if state == nil {
 		return fmt.Errorf("journal request %q is unknown", request.ID)
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-
 	replayID, err := newJournalUUID()
 	if err != nil {
 		return fmt.Errorf("generate journal replay ID: %w", err)
 	}
-	sequence := state.nextSequence
-	record, err := newJournalRecord(replayID, request.ID, sequence, request.Mode, eventType, payload, false)
+	record, err := j.newEncryptedRecord(replayID, request.ID, state.nextSequence, request.Mode, eventType, payload, false)
 	if err != nil {
 		return err
 	}
-	if j.mode == journalModeDurable {
-		if err := j.appendDurable(ctx, state, record); err != nil {
-			return err
-		}
-		applyErr := apply(ctx, replayID)
-		if applyErr != nil {
-			return applyErr
-		}
-		if err := j.markApplied(ctx, replayID); err != nil {
-			return fmt.Errorf("mark journal replay %q applied: %w", replayID, err)
-		}
-		state.nextSequence++
-		return nil
+	if err := j.appendRecord(ctx, state, record); err != nil {
+		return err
 	}
-
-	records := make([]JournalRecord, 0, 2)
-	if !state.requestQueued {
-		records = append(records, state.requestRecord)
-	}
-	records = append(records, record)
-	if applyErr := apply(ctx, replayID); applyErr != nil {
-		return applyErr
-	}
-	if queueErr := j.enqueue(ctx, journalWork{records: records}); queueErr != nil {
-		return queueErr
-	}
-	state.requestQueued = true
 	state.nextSequence++
+	if err := apply(ctx, replayID); err != nil {
+		j.enqueueReplay(replayID)
+		return err
+	}
+	if err := j.markApplied(ctx, replayID); err != nil {
+		j.enqueueReplay(replayID)
+		return fmt.Errorf("mark journal replay %q applied: %w", replayID, err)
+	}
+	j.enqueueReplay(replayID)
 	return nil
 }
 
-func (j *Journal) requestState(request JournalRequest) *journalRequestState {
-	j.requestsMu.Lock()
-	defer j.requestsMu.Unlock()
-	state := j.requests[request.ID]
-	if state == nil || state.request.Mode != request.Mode {
-		return nil
-	}
-	return state
-}
-
-func (j *Journal) appendDurable(ctx context.Context, state *journalRequestState, record JournalRecord) error {
+func (j *Journal) appendRecord(ctx context.Context, state *journalRequestState, record JournalRecord) error {
 	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var requestRow JournalRequestRecord
 		if err := tx.Where("request_id = ?", state.request.ID).First(&requestRow).Error; err != nil {
@@ -352,10 +398,11 @@ func (j *Journal) appendDurable(ctx context.Context, state *journalRequestState,
 		}
 		record.Sequence = requestRow.NextSequence
 		record.Checksum = journalChecksum(record)
-		if err := tx.Model(&JournalRequestRecord{}).
-			Where("request_id = ?", state.request.ID).
-			Update("next_sequence", requestRow.NextSequence+1).Error; err != nil {
+		if err := tx.Model(&JournalRequestRecord{}).Where("request_id = ?", state.request.ID).Update("next_sequence", requestRow.NextSequence+1).Error; err != nil {
 			return fmt.Errorf("advance journal request %q: %w", state.request.ID, err)
+		}
+		if err := validateJournalRecord(record); err != nil {
+			return err
 		}
 		if err := tx.Create(&record).Error; err != nil {
 			return fmt.Errorf("append journal record: %w", err)
@@ -364,11 +411,56 @@ func (j *Journal) appendDurable(ctx context.Context, state *journalRequestState,
 	})
 }
 
-// CompleteRequest records a best-effort request that produced no output.
-func (j *Journal) CompleteRequest(ctx context.Context, request JournalRequest) error {
-	defer j.deleteRequest(request.ID)
+func (j *Journal) appendInternal(ctx context.Context, state *journalRequestState, eventType string, payload []byte) error {
+	replayID, err := newJournalUUID()
+	if err != nil {
+		return fmt.Errorf("generate lifecycle replay ID: %w", err)
+	}
+	record, err := j.newEncryptedRecord(replayID, state.request.ID, state.nextSequence, state.request.Mode, eventType, payload, true)
+	if err != nil {
+		return err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if err := j.appendRecord(ctx, state, record); err != nil {
+		return err
+	}
+	state.nextSequence++
+	j.enqueueReplay(replayID)
+	return nil
+}
+
+// RecordUsage appends one bounded usage update.
+func (j *Journal) RecordUsage(ctx context.Context, request JournalRequest, input, output, total, images int64) error {
+	payload, err := lifecycleUsageBytes(input, output, total, images)
+	if err != nil {
+		return err
+	}
+	return j.forwardInternal(ctx, request, "usage.update", payload)
+}
+
+func (j *Journal) RecordTerminal(ctx context.Context, request JournalRequest, state string, detail []byte) error {
 	if ctx == nil {
-		return errors.New("journal completion context is nil")
+		return errors.New("journal terminal context is nil")
+	}
+	payload, err := lifecycleTerminalBytes(state, detail)
+	if err != nil {
+		return err
+	}
+	if err := j.forwardInternal(ctx, request, "request.terminal", payload); err != nil {
+		return err
+	}
+	if requestState := j.requestState(request); requestState != nil {
+		requestState.mu.Lock()
+		requestState.terminalRecord = true
+		requestState.mu.Unlock()
+	}
+	return nil
+}
+
+func (j *Journal) forwardInternal(ctx context.Context, request JournalRequest, eventType string, payload []byte) error {
+	if ctx == nil {
+		return errors.New("journal lifecycle context is nil")
 	}
 	if err := j.beginOperation(); err != nil {
 		return err
@@ -380,12 +472,48 @@ func (j *Journal) CompleteRequest(ctx context.Context, request JournalRequest) e
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if j.mode == journalModeBestEffort && !state.requestQueued {
-		if err := j.enqueue(ctx, journalWork{records: []JournalRecord{state.requestRecord}}); err != nil {
+	replayID, err := newJournalUUID()
+	if err != nil {
+		return fmt.Errorf("generate lifecycle replay ID: %w", err)
+	}
+	record, err := j.newEncryptedRecord(replayID, request.ID, state.nextSequence, request.Mode, eventType, payload, true)
+	if err != nil {
+		return err
+	}
+	if err := j.appendRecord(ctx, state, record); err != nil {
+		return err
+	}
+	state.nextSequence++
+	j.enqueueReplay(replayID)
+	return nil
+}
+
+// CompleteRequest closes an accepted request as canceled when no terminal exists.
+func (j *Journal) CompleteRequest(ctx context.Context, request JournalRequest) error {
+	return j.CompleteRequestWithState(ctx, request, requestStatusCanceled)
+}
+
+func (j *Journal) CompleteRequestWithState(ctx context.Context, request JournalRequest, terminalState string) error {
+	if ctx == nil {
+		return errors.New("journal completion context is nil")
+	}
+	if terminalState != requestStatusSucceeded && terminalState != requestStatusFailed && terminalState != requestStatusCanceled {
+		return fmt.Errorf("journal completion state %q is invalid", terminalState)
+	}
+	state := j.requestState(request)
+	if state == nil {
+		return fmt.Errorf("journal request %q is unknown", request.ID)
+	}
+	state.mu.Lock()
+	terminalRecorded := state.terminalRecord
+	state.mu.Unlock()
+	if !terminalRecorded {
+		if err := j.RecordTerminal(ctx, request, terminalState, nil); err != nil {
+			j.deleteRequest(request.ID)
 			return err
 		}
-		state.requestQueued = true
 	}
+	j.deleteRequest(request.ID)
 	return nil
 }
 
@@ -395,6 +523,38 @@ func (j *Journal) deleteRequest(requestID string) {
 	j.requestsMu.Unlock()
 }
 
+func (j *Journal) requestState(request JournalRequest) *journalRequestState {
+	j.requestsMu.Lock()
+	defer j.requestsMu.Unlock()
+	state := j.requests[request.ID]
+	if state == nil || state.request.Mode != request.Mode || state.request.ConversationID != request.ConversationID {
+		return nil
+	}
+	return state
+}
+
+func (j *Journal) enqueueReplay(replayID string) {
+	if replayID == "" || j.replayQueue == nil {
+		return
+	}
+	select {
+	case j.replayQueue <- replayID:
+	default:
+		// The source record remains durable. The next append or explicit drain scans it.
+	}
+}
+
+func (j *Journal) discardReplaySignals() {
+	for {
+		select {
+		case <-j.replayQueue:
+		default:
+			return
+		}
+	}
+}
+
+// enqueue is kept for bounded internal work and never used by live forwarding.
 func (j *Journal) enqueue(ctx context.Context, work journalWork) error {
 	if ctx == nil {
 		return errors.New("journal queue context is nil")
@@ -402,33 +562,13 @@ func (j *Journal) enqueue(ctx context.Context, work journalWork) error {
 	if j.queue == nil {
 		return errors.New("journal worker is not running")
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("journal queue backpressure: %w", ctx.Err())
-		default:
-		}
-		j.enqueueMu.Lock()
-		if j.closing {
-			err := j.enqueueErr
-			j.enqueueMu.Unlock()
-			if err == nil {
-				return ErrJournalClosed
-			}
-			return err
-		}
-		select {
-		case j.queue <- work:
-			j.enqueueMu.Unlock()
-			return nil
-		default:
-			j.enqueueMu.Unlock()
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("journal queue backpressure: %w", ctx.Err())
-		case <-j.closed:
-		}
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("journal queue backpressure: %w", ctx.Err())
+	case j.queue <- work:
+		return nil
+	case <-j.closed:
+		return ErrJournalClosed
 	}
 }
 
@@ -436,38 +576,67 @@ func (j *Journal) runWorker(ctx context.Context) {
 	defer close(j.workerDone)
 	for {
 		select {
+		case <-j.replayQueue:
+			if err := j.Replay(ctx); err != nil {
+				j.recordWorkerError(err)
+				j.discardReplaySignals()
+			}
 		case work := <-j.queue:
 			j.writeWork(ctx, work)
 		case <-j.workerStop:
-			for {
-				select {
-				case work := <-j.queue:
-					j.writeWork(ctx, work)
-				default:
-					return
-				}
+			j.drainWorker(ctx)
+			return
+		}
+	}
+}
+
+func (j *Journal) drainWorker(ctx context.Context) {
+	for {
+		select {
+		case work := <-j.queue:
+			j.writeWork(ctx, work)
+		case <-j.replayQueue:
+			if err := j.Replay(ctx); err != nil {
+				j.recordWorkerError(err)
 			}
-		case <-ctx.Done():
+		default:
+			if err := j.Replay(ctx); err != nil {
+				j.recordWorkerError(err)
+			}
 			return
 		}
 	}
 }
 
 func (j *Journal) writeWork(ctx context.Context, work journalWork) {
+	if len(work.records) == 0 {
+		return
+	}
 	err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, record := range work.records {
 			if err := validateJournalRecord(record); err != nil {
 				return err
 			}
 			if err := tx.Create(&record).Error; err != nil {
-				return fmt.Errorf("append best-effort journal record: %w", err)
+				return fmt.Errorf("append journal record: %w", err)
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		j.recordError(err)
+		j.recordWorkerError(err)
 	}
+}
+
+func (j *Journal) recordWorkerError(err error) {
+	if err == nil {
+		return
+	}
+	j.errorMu.Lock()
+	if j.workerErr == nil {
+		j.workerErr = err
+	}
+	j.errorMu.Unlock()
 }
 
 func (j *Journal) recordError(err error) {
@@ -496,34 +665,25 @@ func (j *Journal) setErrorSink(sink chan<- error) {
 	j.errorMu.Unlock()
 }
 
-// Replay applies pending records to the durable receipt projection.
+// Replay materializes stable bounded batches from the durable spool.
 func (j *Journal) Replay(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("journal replay context is nil")
 	}
-	if err := j.beginOperation(); err != nil {
-		return err
-	}
-	defer j.endOperation()
 	for {
-		var record JournalRecord
-		result := j.db.WithContext(ctx).
-			Where("applied = ?", false).
-			Order("created_at asc").
-			Order("replay_id asc").
-			Limit(1).
-			Find(&record)
+		var records []JournalRecord
+		result := j.db.WithContext(ctx).Where("NOT EXISTS (SELECT 1 FROM journal_receipts WHERE journal_receipts.replay_id = journal_records.replay_id AND journal_receipts.materialized = ?)", true).
+			Order("created_at asc").Order("replay_id asc").Limit(journalReplayBatchSize).Find(&records)
 		if result.Error != nil {
 			return fmt.Errorf("load pending journal records: %w", result.Error)
 		}
-		if result.RowsAffected == 0 {
+		if len(records) == 0 {
 			return nil
 		}
-		if err := validateJournalRecord(record); err != nil {
-			return fmt.Errorf("validate journal replay %q: %w", record.ReplayID, err)
-		}
-		if err := j.applyReceipt(ctx, record); err != nil {
-			return fmt.Errorf("apply journal replay %q: %w", record.ReplayID, err)
+		for _, record := range records {
+			if err := j.applyReceipt(ctx, record); err != nil {
+				return fmt.Errorf("apply journal replay %q: %w", record.ReplayID, err)
+			}
 		}
 	}
 }
@@ -534,73 +694,58 @@ func (j *Journal) applyReceipt(ctx context.Context, record JournalRecord) error 
 		if err := tx.Where("replay_id = ?", record.ReplayID).First(&source).Error; err != nil {
 			return fmt.Errorf("load journal source: %w", err)
 		}
-		if source.Applied {
-			return nil
-		}
 		if err := validateJournalRecord(source); err != nil {
 			return err
 		}
-		var receipt JournalReceipt
-		receiptResult := tx.Where("replay_id = ?", source.ReplayID).Limit(1).Find(&receipt)
-		if receiptResult.Error != nil {
-			return fmt.Errorf("load journal receipt: %w", receiptResult.Error)
+		var requestRow JournalRequestRecord
+		if err := tx.Where("request_id = ?", source.RequestID).First(&requestRow).Error; err != nil {
+			return fmt.Errorf("load journal request metadata: %w", err)
 		}
-		if receiptResult.RowsAffected != 0 {
-			if !journalReceiptMatches(receipt, source) {
-				return errors.New("journal receipt does not match source record")
-			}
-		} else {
+		request := JournalRequest{ID: source.RequestID, Mode: source.Mode, ConversationID: requestRow.ConversationID, Endpoint: requestRow.Endpoint, Model: requestRow.Model, APIKeyID: requestRow.APIKeyID}
+		var receipt JournalReceipt
+		receiptResult := tx.Where("replay_id = ?", source.ReplayID).First(&receipt).Error
+		if receiptResult == nil && receipt.Materialized {
+			return nil
+		}
+		if receiptResult != nil && !errors.Is(receiptResult, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("load journal receipt: %w", receiptResult)
+		}
+		if err := j.materializeRecord(tx, source, request); err != nil {
+			return err
+		}
+		if errors.Is(receiptResult, gorm.ErrRecordNotFound) {
 			receipt = JournalReceipt{
-				ReplayID:  source.ReplayID,
-				RequestID: source.RequestID,
-				Sequence:  source.Sequence,
-				Mode:      source.Mode,
-				EventType: source.EventType,
-				Payload:   append([]byte{}, source.Payload...),
-				Checksum:  append([]byte{}, source.Checksum...),
-				CreatedAt: source.CreatedAt,
+				ReplayID: source.ReplayID, RequestID: source.RequestID, Sequence: source.Sequence,
+				Mode: source.Mode, EventType: source.EventType, EventVersion: source.EventVersion,
+				KeyVersion: source.KeyVersion, Payload: append([]byte(nil), source.Payload...),
+				Checksum: append([]byte(nil), source.Checksum...), CreatedAt: source.CreatedAt,
+				Materialized: true,
 			}
+			now := time.Now().UTC()
+			receipt.MaterializedAt = &now
 			if err := tx.Create(&receipt).Error; err != nil {
 				return fmt.Errorf("store journal receipt: %w", err)
 			}
+		} else {
+			now := time.Now().UTC()
+			result := tx.Model(&JournalReceipt{}).Where("replay_id = ?", source.ReplayID).Updates(map[string]any{"materialized": true, "materialized_at": now})
+			if result.Error != nil {
+				return fmt.Errorf("mark journal receipt materialized: %w", result.Error)
+			}
 		}
 		now := time.Now().UTC()
-		result := tx.Model(&JournalRecord{}).
-			Where("replay_id = ? AND applied = ?", source.ReplayID, false).
-			Updates(map[string]any{"applied": true, "applied_at": now})
+		result := tx.Model(&JournalRecord{}).Where("replay_id = ? AND applied = ?", source.ReplayID, false).Updates(map[string]any{"applied": true, "applied_at": now})
 		if result.Error != nil {
 			return fmt.Errorf("mark journal source applied: %w", result.Error)
-		}
-		if result.RowsAffected == 0 {
-			var current JournalRecord
-			if err := tx.Where("replay_id = ?", source.ReplayID).First(&current).Error; err != nil {
-				return err
-			}
-			if !current.Applied {
-				return errors.New("journal source was not marked applied")
-			}
 		}
 		return nil
 	})
 }
 
-func journalReceiptMatches(receipt JournalReceipt, record JournalRecord) bool {
-	return receipt.ReplayID == record.ReplayID &&
-		receipt.RequestID == record.RequestID &&
-		receipt.Sequence == record.Sequence &&
-		receipt.Mode == record.Mode &&
-		receipt.EventType == record.EventType &&
-		bytes.Equal(receipt.Payload, record.Payload) &&
-		bytes.Equal(receipt.Checksum, record.Checksum) &&
-		receipt.CreatedAt.Equal(record.CreatedAt)
-}
-
 func (j *Journal) markApplied(ctx context.Context, replayID string) error {
 	return j.db.WithContext(context.WithoutCancel(ctx)).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UTC()
-		result := tx.Model(&JournalRecord{}).
-			Where("replay_id = ? AND applied = ?", replayID, false).
-			Updates(map[string]any{"applied": true, "applied_at": now})
+		result := tx.Model(&JournalRecord{}).Where("replay_id = ? AND applied = ?", replayID, false).Updates(map[string]any{"applied": true, "applied_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -617,7 +762,7 @@ func (j *Journal) markApplied(ctx context.Context, replayID string) error {
 	})
 }
 
-// Close stops intake and drains accepted best-effort records until ctx ends.
+// Close stops intake and drains accepted records within the configured deadline.
 func (j *Journal) Close(ctx context.Context) error {
 	if j == nil {
 		return nil
@@ -647,22 +792,20 @@ func (j *Journal) Close(ctx context.Context) error {
 	}
 	j.stopWorker(false)
 	j.workerMu.Lock()
-	workerStarted := j.workerStarted
-	workerDone := j.workerDone
+	workerStarted, workerDone := j.workerStarted, j.workerDone
 	j.workerMu.Unlock()
-	if !workerStarted && len(j.queue) != 0 {
-		j.stopEnqueue(nil)
-		return j.closeError(errors.New("journal worker was not started"))
-	}
 	if workerStarted {
 		select {
 		case <-workerDone:
 		case <-drainContext.Done():
-			j.stopEnqueue(drainContext.Err())
 			j.stopWorker(true)
 			j.waitWorker()
+			j.stopEnqueue(drainContext.Err())
 			return j.closeError(drainContext.Err())
 		}
+	} else if err := j.Replay(drainContext); err != nil {
+		j.stopEnqueue(err)
+		return j.closeError(err)
 	}
 	j.stopEnqueue(nil)
 	return j.closeError(nil)
@@ -683,9 +826,7 @@ func (j *Journal) stopEnqueue(cause error) {
 
 func (j *Journal) stopWorker(cancel bool) {
 	j.workerMu.Lock()
-	workerCancel := j.workerCancel
-	workerStarted := j.workerStarted
-	workerStop := j.workerStop
+	workerCancel, workerStarted, workerStop := j.workerCancel, j.workerStarted, j.workerStop
 	j.workerMu.Unlock()
 	if !workerStarted {
 		return
@@ -698,8 +839,7 @@ func (j *Journal) stopWorker(cancel bool) {
 
 func (j *Journal) waitWorker() {
 	j.workerMu.Lock()
-	workerStarted := j.workerStarted
-	workerDone := j.workerDone
+	workerStarted, workerDone := j.workerStarted, j.workerDone
 	j.workerMu.Unlock()
 	if workerStarted {
 		<-workerDone
@@ -716,30 +856,6 @@ func (j *Journal) closeError(cause error) error {
 		return cause
 	}
 	return errors.Join(cause, j.workerErr)
-}
-
-func newJournalRecord(replayID, requestID string, sequence uint64, mode, eventType string, payload []byte, applied bool) (JournalRecord, error) {
-	if !validJournalUUID(replayID) || !validJournalUUID(requestID) {
-		return JournalRecord{}, errors.New("journal record ID is invalid")
-	}
-	if err := validateJournalMode(mode); err != nil {
-		return JournalRecord{}, err
-	}
-	if err := validateJournalEvent(eventType, payload); err != nil {
-		return JournalRecord{}, err
-	}
-	record := JournalRecord{
-		ReplayID:  replayID,
-		RequestID: requestID,
-		Sequence:  sequence,
-		Mode:      mode,
-		EventType: eventType,
-		Payload:   append([]byte{}, payload...),
-		CreatedAt: time.Now().UTC(),
-		Applied:   applied,
-	}
-	record.Checksum = journalChecksum(record)
-	return record, nil
 }
 
 func validateJournalMode(mode string) error {
@@ -769,6 +885,12 @@ func validateJournalRecord(record JournalRecord) error {
 	if err := validateJournalEvent(record.EventType, record.Payload); err != nil {
 		return err
 	}
+	if record.EventVersion != lifecycleEventVersion || record.KeyVersion == 0 {
+		return errors.New("journal record uses an unsupported legacy version")
+	}
+	if len(record.Payload) < 9 || binary.BigEndian.Uint32(record.Payload[5:9]) != record.KeyVersion {
+		return errors.New("journal record envelope version does not match metadata")
+	}
 	if len(record.Checksum) != sha256.Size || !bytes.Equal(record.Checksum, journalChecksum(record)) {
 		return errors.New("journal record checksum is invalid")
 	}
@@ -780,23 +902,30 @@ func validateJournalRecord(record JournalRecord) error {
 
 func journalChecksum(record JournalRecord) []byte {
 	hash := sha256.New()
-	hash.Write([]byte("codex-sub-proxy journal record v1"))
+	_, _ = hash.Write([]byte("codex-sub-proxy journal record v2"))
 	writeBytes := func(value []byte) {
 		var length [8]byte
 		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
 		_, _ = hash.Write(length[:])
 		_, _ = hash.Write(value)
 	}
-	writeString := func(value string) {
-		writeBytes([]byte(value))
-	}
+	writeString := func(value string) { writeBytes([]byte(value)) }
 	writeString(record.ReplayID)
 	writeString(record.RequestID)
 	var sequence [8]byte
 	binary.BigEndian.PutUint64(sequence[:], record.Sequence)
 	_, _ = hash.Write(sequence[:])
+	var version [2]byte
+	binary.BigEndian.PutUint16(version[:], record.EventVersion)
+	_, _ = hash.Write(version[:])
+	var keyVersion [4]byte
+	binary.BigEndian.PutUint32(keyVersion[:], record.KeyVersion)
+	_, _ = hash.Write(keyVersion[:])
 	writeString(record.Mode)
 	writeString(record.EventType)
+	var created [8]byte
+	binary.BigEndian.PutUint64(created[:], uint64(record.CreatedAt.UTC().UnixNano()))
+	_, _ = hash.Write(created[:])
 	writeBytes(record.Payload)
 	return hash.Sum(nil)
 }
@@ -834,4 +963,49 @@ func validJournalUUID(value string) bool {
 		}
 	}
 	return value[14] == '4' && (value[19] == '8' || value[19] == '9' || value[19] == 'a' || value[19] == 'b' || value[19] == 'A' || value[19] == 'B')
+}
+
+// JournalAuditMetadata contains safe fields for a rejection audit.
+type JournalAuditMetadata struct {
+	RequestID string
+	APIKeyID  string
+	Endpoint  string
+	EventType string
+	Status    int
+}
+
+// RecordAudit stores an encrypted detail envelope without creating a request projection.
+func (j *Journal) RecordAudit(ctx context.Context, metadata JournalAuditMetadata, detail []byte) error {
+	if ctx == nil {
+		return errors.New("journal audit context is nil")
+	}
+	if len(detail) > lifecycleMaxDetail {
+		return errors.New("journal audit detail is too large")
+	}
+	if err := j.beginOperation(); err != nil {
+		return err
+	}
+	defer j.endOperation()
+	auditID, err := newJournalUUID()
+	if err != nil {
+		return fmt.Errorf("generate audit ID: %w", err)
+	}
+	encoded, err := envelope.Encrypt(detail, envelope.PayloadDomain, j.keys)
+	if err != nil {
+		return fmt.Errorf("encrypt audit detail: %w", err)
+	}
+	if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		payload := EncryptedPayloadRecord{ID: auditID, ReplayID: auditID, KeyVersion: j.keys.Active.Version, Envelope: encoded, CreatedAt: time.Now().UTC()}
+		if err := tx.Create(&payload).Error; err != nil {
+			return fmt.Errorf("store audit payload: %w", err)
+		}
+		audit := AuditRecord{ID: auditID, RequestID: metadata.RequestID, APIKeyID: metadata.APIKeyID, Endpoint: metadata.Endpoint, EventType: metadata.EventType, Status: metadata.Status, PayloadID: auditID, CreatedAt: payload.CreatedAt}
+		if err := tx.Create(&audit).Error; err != nil {
+			return fmt.Errorf("store audit record: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
 }
