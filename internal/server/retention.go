@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ const (
 	retentionDefaultSweep     = time.Minute
 	retentionDefaultDrain     = 10 * time.Second
 	retentionMaxDeleteBatches = 1024
+	retentionSweepDeadline    = 500 * time.Millisecond
 )
 
 var errConversationHasRunningRequest = errors.New("conversation has a running request")
@@ -223,17 +225,19 @@ func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	sweepCtx, cancel := context.WithTimeout(ctx, retentionSweepDeadline)
+	defer cancel()
 	var errs []error
-	if err := r.sweepPayloads(ctx, now); err != nil {
+	if err := r.sweepPayloads(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.sweepArtifacts(ctx, now); err != nil {
+	if err := r.sweepArtifacts(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.sweepMetadata(ctx, now); err != nil {
+	if err := r.sweepMetadata(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
-	if err := r.sweepStandaloneAudits(ctx, now); err != nil {
+	if err := r.sweepStandaloneAudits(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -546,6 +550,17 @@ func (r *RetentionRunner) markConversationDeleting(ctx context.Context, id strin
 
 // DeleteConversation removes one conversation and all owned content idempotently.
 func (r *RetentionRunner) DeleteConversation(ctx context.Context, id string) error {
+	return r.deleteConversation(ctx, id, AdminPrincipal{})
+}
+
+func (r *RetentionRunner) DeleteConversationAsAdmin(ctx context.Context, id string, actor AdminPrincipal) error {
+	if strings.TrimSpace(actor.ID) == "" || strings.TrimSpace(actor.Name) == "" || !actor.HasScope(AdminScopeMetadata) {
+		return ErrAdminTokenForbidden
+	}
+	return r.deleteConversation(ctx, id, actor)
+}
+
+func (r *RetentionRunner) deleteConversation(ctx context.Context, id string, actor AdminPrincipal) error {
 	if r == nil {
 		return errors.New("retention runner is nil")
 	}
@@ -562,6 +577,9 @@ func (r *RetentionRunner) DeleteConversation(ctx context.Context, id string) err
 		return err
 	}
 	if !marked {
+		if actor.ID != "" {
+			return recordStandaloneAdminAction(ctx, r.db, actor, "conversation.delete", id)
+		}
 		return nil
 	}
 	for range retentionMaxDeleteBatches {
@@ -592,7 +610,7 @@ func (r *RetentionRunner) DeleteConversation(ctx context.Context, id string) err
 		}
 		return errors.New("conversation artifact deletion exceeded bound")
 	}
-	return r.finalizeConversationDelete(ctx, id)
+	return r.finalizeConversationDelete(ctx, id, actor)
 }
 
 func (r *RetentionRunner) claimConversationArtifacts(ctx context.Context, conversationID string) ([]ArtifactRecord, error) {
@@ -616,7 +634,7 @@ func (r *RetentionRunner) claimConversationArtifacts(ctx context.Context, conver
 	return records, nil
 }
 
-func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conversationID string) error {
+func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conversationID string, actor AdminPrincipal) error {
 	for range retentionMaxDeleteBatches {
 		var requests []RequestRecord
 		if err := r.db.WithContext(ctx).Where("conversation_id = ?", conversationID).Order("request_id ASC").Limit(r.batchSize).Find(&requests).Error; err != nil {
@@ -758,6 +776,11 @@ func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conver
 		}
 		if err := tx.Where("conversation_id = ?", conversationID).Delete(&ArtifactRecord{}).Error; err != nil {
 			return fmt.Errorf("delete conversation artifact metadata: %w", err)
+		}
+		if actor.ID != "" {
+			if err := writeAdminAudit(tx, actor, "conversation.delete", conversationID, adminAuditMetadata{Fields: []string{"metadata", "content", "artifacts"}}, time.Now().UTC()); err != nil {
+				return fmt.Errorf("store conversation deletion audit: %w", err)
+			}
 		}
 		if err := tx.Where("id = ?", conversationID).Delete(&ConversationRecord{}).Error; err != nil {
 			return fmt.Errorf("delete conversation metadata: %w", err)

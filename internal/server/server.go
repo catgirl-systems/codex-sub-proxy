@@ -131,6 +131,17 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			}
 		}
 	}
+	if cfg.Database != nil && retention == nil {
+		var retentionErr error
+		retention, retentionErr = NewRetentionRunner(cfg.Database, cfg.ArtifactStore, cfg.Retention)
+		if retentionErr != nil {
+			closeStarted()
+			return nil, fmt.Errorf("build retention for admin lifecycle: %w", retentionErr)
+		}
+		if readiness != nil {
+			readiness.SetRetentionSource(retention.Health)
+		}
+	}
 	var adminStore *AdminTokenStore
 	if cfg.Database != nil {
 		if err := MigrateAdminTokens(cfg.Database); err == nil {
@@ -150,7 +161,9 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		closeStarted()
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
-	adminHandler, err := newAdminApplication(readiness, adminStore, apiKeyStore)
+	adminHandler, err := newAdminApplicationWithLifecycle(readiness, adminStore, apiKeyStore, adminLifecycleDependencies{
+		db: cfg.Database, keys: cfg.PayloadKeys, artifacts: cfg.ArtifactStore, retention: retention,
+	})
 	if err != nil {
 		closeStarted()
 		return nil, fmt.Errorf("build admin application: %w", err)

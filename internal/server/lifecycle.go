@@ -84,6 +84,7 @@ type RequestRecord struct {
 	ExpiresAt        time.Time  `gorm:"column:expires_at;not null;index"`
 	TerminalReplayID string     `gorm:"column:terminal_replay_id;size:36"`
 	TerminalConflict bool       `gorm:"column:terminal_conflict;not null;default:false"`
+	DeletingAt       *time.Time `gorm:"column:deleting_at;index"`
 }
 
 func (RequestRecord) TableName() string { return "requests" }
@@ -422,6 +423,8 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 		}
 	} else if err != nil {
 		return fmt.Errorf("load lifecycle request: %w", err)
+	} else if row.DeletingAt != nil {
+		return errors.New("lifecycle request is deleting")
 	} else if row.ReplayID != source.ReplayID || row.ConversationID != accepted.ConversationID || row.Endpoint != accepted.Endpoint || row.Model != accepted.Model || row.APIKeyID != accepted.APIKeyID || row.Mode != accepted.Mode {
 		return errors.New("lifecycle request metadata conflicts")
 	}
@@ -445,6 +448,9 @@ func (j *Journal) ensureLifecycleOwner(tx *gorm.DB, request JournalRequest) erro
 			return errors.New("lifecycle request is missing")
 		}
 		return fmt.Errorf("load lifecycle request: %w", err)
+	}
+	if row.DeletingAt != nil {
+		return errors.New("lifecycle request is deleting")
 	}
 	if row.ConversationID != request.ConversationID {
 		return errors.New("lifecycle request conversation conflicts")

@@ -420,6 +420,14 @@ func (j *Journal) appendRecord(ctx context.Context, state *journalRequestState, 
 		if err := tx.Where("request_id = ?", state.request.ID).First(&requestRow).Error; err != nil {
 			return fmt.Errorf("load journal request %q: %w", state.request.ID, err)
 		}
+		var lifecycle RequestRecord
+		lifecycleErr := tx.Select("deleting_at").Where("request_id = ?", state.request.ID).First(&lifecycle).Error
+		if lifecycleErr == nil && lifecycle.DeletingAt != nil {
+			return errors.New("journal request is deleting")
+		}
+		if lifecycleErr != nil && !errors.Is(lifecycleErr, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("check lifecycle request deletion: %w", lifecycleErr)
+		}
 		record.Sequence = requestRow.NextSequence
 		record.Checksum = journalChecksum(record)
 		if err := tx.Model(&JournalRequestRecord{}).Where("request_id = ?", state.request.ID).Update("next_sequence", requestRow.NextSequence+1).Error; err != nil {

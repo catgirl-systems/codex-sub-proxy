@@ -10,6 +10,7 @@ import (
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/kataras/iris/v12"
+	"gorm.io/gorm"
 )
 
 const (
@@ -57,6 +58,22 @@ func setAdminPrincipal(ctx iris.Context, principal AdminPrincipal) {
 }
 
 func newAdminApplication(readiness *Readiness, store *AdminTokenStore, apiKeyStore *apikey.Store) (*iris.Application, error) {
+	var db *gorm.DB
+	if store != nil {
+		db = store.db
+	}
+	var retention *RetentionRunner
+	if db != nil {
+		var err error
+		retention, err = NewRetentionRunner(db, nil, RetentionConfig{})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return newAdminApplicationWithLifecycle(readiness, store, apiKeyStore, adminLifecycleDependencies{db: db, retention: retention})
+}
+
+func newAdminApplicationWithLifecycle(readiness *Readiness, store *AdminTokenStore, apiKeyStore *apikey.Store, lifecycle adminLifecycleDependencies) (*iris.Application, error) {
 	app := buildAdminHealthApplication(readiness)
 	app.Post(adminTokensEndpoint, func(ctx iris.Context) {
 		principal, ok := authenticateAdminRequest(ctx, store)
@@ -127,6 +144,7 @@ func newAdminApplication(readiness *Readiness, store *AdminTokenStore, apiKeySto
 		writeJSON(ctx, http.StatusOK, safeAdminTokenMetadata(record))
 	})
 	registerAdminAPIKeyRoutes(app, store, apiKeyStore)
+	registerAdminLifecycleRoutes(app, store, lifecycle)
 	if err := app.Build(); err != nil {
 		return nil, err
 	}

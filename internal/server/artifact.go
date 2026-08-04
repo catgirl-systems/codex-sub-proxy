@@ -637,6 +637,9 @@ func checkArtifactOwnerTx(tx *gorm.DB, owner ArtifactOwner) error {
 	if request.ConversationID != owner.ConversationID || request.APIKeyID != owner.APIKeyID {
 		return errors.New("artifact owner request does not match")
 	}
+	if request.DeletingAt != nil {
+		return errors.New("artifact owner request is deleting")
+	}
 	if request.TerminalAt != nil {
 		return errors.New("artifact owner request is terminal")
 	}
