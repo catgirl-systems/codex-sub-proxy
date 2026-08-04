@@ -783,8 +783,8 @@ func (j *Journal) Replay(ctx context.Context) error {
 }
 
 func (j *Journal) applyReceipt(ctx context.Context, record JournalRecord) error {
-	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var source JournalRecord
+	var source JournalRecord
+	if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("replay_id = ?", record.ReplayID).First(&source).Error; err != nil {
 			return fmt.Errorf("load journal source: %w", err)
 		}
@@ -833,6 +833,21 @@ func (j *Journal) applyReceipt(ctx context.Context, record JournalRecord) error 
 			return fmt.Errorf("mark journal source applied: %w", result.Error)
 		}
 		return nil
+	}); err != nil {
+		return err
+	}
+	if source.EventType != "usage.update" {
+		return nil
+	}
+	var requestRow RequestRecord
+	if err := j.db.WithContext(ctx).Select("terminal_at").Where("request_id = ?", source.RequestID).First(&requestRow).Error; err != nil {
+		return fmt.Errorf("load terminal request after usage: %w", err)
+	}
+	if requestRow.TerminalAt == nil {
+		return nil
+	}
+	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return j.reconcileUsagePricing(tx, source.RequestID, *requestRow.TerminalAt)
 	})
 }
 

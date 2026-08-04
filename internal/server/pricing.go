@@ -117,6 +117,18 @@ func InitializePricing(db *gorm.DB, pricing config.PricingConfig) (*PricingStore
 		return nil, err
 	}
 	err := db.Transaction(func(tx *gorm.DB) error {
+		if conflict, err := storedPricingEffectiveConflict(tx); err != nil {
+			return err
+		} else if conflict {
+			store.available = false
+			store.err = fmt.Errorf("%w: stored pricing versions share an effective time", errPricingVersionConflict)
+		}
+		if conflict, err := storedSubscriptionEffectiveConflict(tx); err != nil {
+			return err
+		} else if conflict {
+			store.available = false
+			store.err = fmt.Errorf("%w: stored subscription allocation versions share an effective time", errPricingVersionConflict)
+		}
 		for index := range pricing.Versions {
 			version := pricing.Versions[index]
 			if err := insertPricingVersion(tx, version); err != nil {
@@ -149,11 +161,42 @@ func InitializePricing(db *gorm.DB, pricing config.PricingConfig) (*PricingStore
 
 var errPricingVersionConflict = errors.New("immutable pricing version input conflicts")
 
+func storedPricingEffectiveConflict(tx *gorm.DB) (bool, error) {
+	var rows []struct {
+		EffectiveAt time.Time
+	}
+	if err := tx.Table("pricing_versions").
+		Select("effective_at").
+		Group("effective_at").
+		Having("COUNT(*) > 1").
+		Limit(1).
+		Find(&rows).Error; err != nil {
+		return false, fmt.Errorf("check stored pricing effective times: %w", err)
+	}
+	return len(rows) != 0, nil
+}
+
+func storedSubscriptionEffectiveConflict(tx *gorm.DB) (bool, error) {
+	var rows []struct {
+		EffectiveAt time.Time
+	}
+	if err := tx.Table("subscription_allocation_versions").
+		Select("effective_at").
+		Group("effective_at").
+		Having("COUNT(*) > 1").
+		Limit(1).
+		Find(&rows).Error; err != nil {
+		return false, fmt.Errorf("check stored subscription effective times: %w", err)
+	}
+	return len(rows) != 0, nil
+}
+
 func validatePricingInputs(pricing *config.PricingConfig) error {
 	if pricing == nil {
 		return errors.New("pricing configuration is nil")
 	}
 	seenPricing := make(map[string]struct{}, len(pricing.Versions))
+	seenPricingEffective := make(map[int64]struct{}, len(pricing.Versions))
 	for index := range pricing.Versions {
 		version := &pricing.Versions[index]
 		if err := validateConfigPricingVersion(version); err != nil {
@@ -163,8 +206,14 @@ func validatePricingInputs(pricing *config.PricingConfig) error {
 			return fmt.Errorf("duplicate pricing version ID %q", version.ID)
 		}
 		seenPricing[version.ID] = struct{}{}
+		effective := version.EffectiveAt.UTC().UnixNano()
+		if _, ok := seenPricingEffective[effective]; ok {
+			return fmt.Errorf("duplicate pricing effective time %s", version.EffectiveAt.Format(time.RFC3339Nano))
+		}
+		seenPricingEffective[effective] = struct{}{}
 	}
 	seenAllocation := make(map[string]struct{}, len(pricing.SubscriptionAllocationVersions))
+	seenAllocationEffective := make(map[int64]struct{}, len(pricing.SubscriptionAllocationVersions))
 	for index := range pricing.SubscriptionAllocationVersions {
 		version := &pricing.SubscriptionAllocationVersions[index]
 		if err := validateConfigSubscriptionVersion(version); err != nil {
@@ -174,6 +223,11 @@ func validatePricingInputs(pricing *config.PricingConfig) error {
 			return fmt.Errorf("duplicate subscription allocation version ID %q", version.ID)
 		}
 		seenAllocation[version.ID] = struct{}{}
+		effective := version.EffectiveAt.UTC().UnixNano()
+		if _, ok := seenAllocationEffective[effective]; ok {
+			return fmt.Errorf("duplicate subscription allocation effective time %s", version.EffectiveAt.Format(time.RFC3339Nano))
+		}
+		seenAllocationEffective[effective] = struct{}{}
 	}
 	return nil
 }
@@ -191,18 +245,6 @@ func validateConfigPricingVersion(version *config.PricingVersionConfig) error {
 	seen := make(map[string]struct{}, len(version.Models))
 	for index := range version.Models {
 		model := &version.Models[index]
-		if model.InputMicrounitsPer1M != nil {
-			model.InputMicrounitsPerMillion = *model.InputMicrounitsPer1M
-		}
-		if model.CachedInputMicrounitsPer1M != nil {
-			model.CachedInputMicrounitsPerMillion = *model.CachedInputMicrounitsPer1M
-		}
-		if model.OutputMicrounitsPer1M != nil {
-			model.OutputMicrounitsPerMillion = *model.OutputMicrounitsPer1M
-		}
-		if model.ReasoningMicrounitsPer1M != nil {
-			model.ReasoningMicrounitsPerMillion = *model.ReasoningMicrounitsPer1M
-		}
 		if model.ModelID == "" || model.ModelID != strings.TrimSpace(model.ModelID) || len(model.ModelID) > 256 {
 			return errors.New("model ID is invalid")
 		}
@@ -248,6 +290,14 @@ func insertPricingVersion(tx *gorm.DB, input config.PricingVersionConfig) error 
 	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("load pricing version: %w", result.Error)
 	}
+	var sameInstant PricingVersion
+	result = tx.Where("effective_at = ? AND id <> ?", input.EffectiveAt, input.ID).First(&sameInstant)
+	if result.Error == nil {
+		return fmt.Errorf("%w: pricing version %q shares effective time with %q", errPricingVersionConflict, input.ID, sameInstant.ID)
+	}
+	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check pricing effective time: %w", result.Error)
+	}
 	now := time.Now().UTC()
 	row := PricingVersion{ID: input.ID, EffectiveAt: input.EffectiveAt, Currency: input.Currency, InputChecksum: checksum, CreatedAt: now}
 	if err := tx.Create(&row).Error; err != nil {
@@ -286,6 +336,14 @@ func insertSubscriptionVersion(tx *gorm.DB, input config.SubscriptionAllocationV
 	}
 	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("load subscription allocation version: %w", result.Error)
+	}
+	var sameInstant SubscriptionAllocationVersion
+	result = tx.Where("effective_at = ? AND id <> ?", input.EffectiveAt, input.ID).First(&sameInstant)
+	if result.Error == nil {
+		return fmt.Errorf("%w: subscription allocation version %q shares effective time with %q", errPricingVersionConflict, input.ID, sameInstant.ID)
+	}
+	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check subscription allocation effective time: %w", result.Error)
 	}
 	row := SubscriptionAllocationVersion{ID: input.ID, EffectiveAt: input.EffectiveAt, Currency: input.Currency, MonthlyCostMicrounits: input.MonthlyCostMicrounits, AllocationBasis: input.AllocationBasis, InputChecksum: checksum, CreatedAt: time.Now().UTC()}
 	if err := tx.Create(&row).Error; err != nil {

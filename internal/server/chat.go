@@ -1022,8 +1022,10 @@ func journalUsageFromChatUsage(usage chatCompletionUsage) JournalUsage {
 		InputTokens:            usage.PromptTokens,
 		CachedInputTokens:      usage.PromptTokensDetails.CachedTokens,
 		CachedInputTokensKnown: usage.CachedTokensKnown,
+		OutputTokens:           usage.CompletionTokens,
 		ReasoningTokens:        usage.CompletionTokensDetails.ReasoningTokens,
 		ReasoningTokensKnown:   usage.ReasoningTokensKnown,
+		TotalTokens:            usage.TotalTokens,
 	}
 	return result
 }

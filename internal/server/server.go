@@ -93,6 +93,21 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if pricingErr != nil {
 			return nil, fmt.Errorf("initialize pricing: %w", pricingErr)
 		}
+		if pricing.Available() {
+			deadline := cfg.JournalDrainDeadline
+			if deadline <= 0 {
+				deadline = cfg.Retention.DrainDeadline
+			}
+			if deadline <= 0 {
+				deadline = 10 * time.Second
+			}
+			reconcileContext, cancel := context.WithTimeout(context.Background(), deadline)
+			if err := reconcileTerminalUsagePricing(reconcileContext, cfg.Database, pricing); err != nil {
+				pricing.available = false
+				pricing.err = fmt.Errorf("startup usage pricing reconciliation: %w", err)
+			}
+			cancel()
+		}
 		if readiness != nil {
 			readiness.SetAnalyticsSource(func() bool {
 				return pricing.Available()

@@ -104,3 +104,44 @@ func TestPricingStoreEffectiveBoundaryAndConflict(t *testing.T) {
 		t.Fatalf("missing model resolution = found=%v err=%v", found, err)
 	}
 }
+func TestPricingStoreRejectsDuplicateEffectiveVersions(t *testing.T) {
+	db, err := storage.Open(context.Background(), t.TempDir()+"/pricing-duplicate.sqlite", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	effective := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	base := config.PricingConfig{
+		Versions:                       []config.PricingVersionConfig{{ID: "v1", EffectiveAt: effective, Currency: "USD", Models: []config.ModelPriceConfig{{ModelID: "model-a", InputMicrounitsPerMillion: 1}}}},
+		SubscriptionAllocationVersions: []config.SubscriptionAllocationVersionConfig{{ID: "a1", EffectiveAt: effective, Currency: "USD", MonthlyCostMicrounits: 10, AllocationBasis: pricingAllocationBasis}},
+	}
+	store, err := InitializePricing(db, base)
+	if err != nil || !store.Available() {
+		t.Fatalf("initialize base pricing: %v", err)
+	}
+	idempotent, err := InitializePricing(db, base)
+	if err != nil || !idempotent.Available() {
+		t.Fatalf("idempotent pricing reopen: %v", err)
+	}
+	conflicted, err := InitializePricing(db, config.PricingConfig{
+		Versions:                       []config.PricingVersionConfig{{ID: "v2", EffectiveAt: effective, Currency: "USD", Models: []config.ModelPriceConfig{{ModelID: "model-a", InputMicrounitsPerMillion: 2}}}},
+		SubscriptionAllocationVersions: []config.SubscriptionAllocationVersionConfig{{ID: "a2", EffectiveAt: effective, Currency: "USD", MonthlyCostMicrounits: 20, AllocationBasis: pricingAllocationBasis}},
+	})
+	if err != nil || conflicted.Available() || conflicted.Err() == nil {
+		t.Fatalf("duplicate effective reopen was available: store=%+v err=%v", conflicted, err)
+	}
+	var pricingCount, allocationCount int64
+	if err := db.Model(&PricingVersion{}).Count(&pricingCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&SubscriptionAllocationVersion{}).Count(&allocationCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if pricingCount != 1 || allocationCount != 1 {
+		t.Fatalf("duplicate effective rows persisted: pricing=%d allocation=%d", pricingCount, allocationCount)
+	}
+}

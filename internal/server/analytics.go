@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/kataras/iris/v12"
@@ -11,8 +12,8 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -21,7 +22,19 @@ const (
 	analyticsMaxLimit      = 100
 	analyticsMaxCursor     = 256
 	analyticsMaxRange      = 366 * 24 * time.Hour
+	analyticsMaxValue      = 256
 )
+
+var analyticsEndpointParameters = map[string]map[string]struct{}{
+	"overview": {"from": {}, "to": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"models":   {"from": {}, "to": {}, "limit": {}, "cursor": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"keys":     {"from": {}, "to": {}, "limit": {}, "cursor": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"errors":   {"from": {}, "to": {}, "limit": {}, "cursor": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"quotas":   {"from": {}, "to": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"latency":  {"from": {}, "to": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"usage":    {"from": {}, "to": {}, "limit": {}, "cursor": {}, "interval": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+	"costs":    {"from": {}, "to": {}, "limit": {}, "cursor": {}, "interval": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}},
+}
 
 type analyticsFilter struct {
 	From           time.Time
@@ -237,11 +250,17 @@ func analyticsAuditFields(endpoint string) []string {
 }
 
 func parseAnalyticsFilter(ctx iris.Context, endpoint string) (analyticsFilter, error) {
+	parameters, ok := analyticsEndpointParameters[endpoint]
+	if !ok {
+		return analyticsFilter{}, errors.New("analytics endpoint is invalid")
+	}
 	query := ctx.Request().URL.Query()
-	allowed := map[string]struct{}{"from": {}, "to": {}, "limit": {}, "cursor": {}, "interval": {}, "requested_model": {}, "resolved_model": {}, "model": {}, "api_key_id": {}, "endpoint": {}, "state": {}, "error_class": {}}
-	for key := range query {
-		if _, ok := allowed[key]; !ok {
-			return analyticsFilter{}, errors.New("unknown analytics query parameter")
+	for key, values := range query {
+		if _, ok := parameters[key]; !ok || len(values) != 1 || values[0] == "" {
+			return analyticsFilter{}, errors.New("invalid analytics query parameter")
+		}
+		if !utf8.ValidString(values[0]) || len(values[0]) > analyticsMaxValue {
+			return analyticsFilter{}, errors.New("analytics query value is invalid")
 		}
 	}
 	from, err := parseAnalyticsTime(query.Get("from"))
@@ -252,12 +271,19 @@ func parseAnalyticsFilter(ctx iris.Context, endpoint string) (analyticsFilter, e
 	if err != nil || !to.After(from) || to.Sub(from) > analyticsMaxRange {
 		return analyticsFilter{}, errors.New("analytics range is invalid")
 	}
-	filter := analyticsFilter{From: from, To: to, Limit: analyticsDefaultLimit, Interval: query.Get("interval"), Cursor: query.Get("cursor"), RequestedModel: query.Get("requested_model"), ResolvedModel: query.Get("resolved_model"), Model: query.Get("model"), APIKeyID: query.Get("api_key_id"), Endpoint: query.Get("endpoint"), State: query.Get("state"), ErrorClass: query.Get("error_class")}
-	if filter.Interval == "" {
-		filter.Interval = "day"
-	}
-	if filter.Interval != "hour" && filter.Interval != "day" && filter.Interval != "month" {
-		return analyticsFilter{}, errors.New("analytics interval is invalid")
+	filter := analyticsFilter{
+		From:           from,
+		To:             to,
+		Limit:          analyticsDefaultLimit,
+		Cursor:         query.Get("cursor"),
+		RequestedModel: query.Get("requested_model"),
+		ResolvedModel:  query.Get("resolved_model"),
+		Model:          query.Get("model"),
+		APIKeyID:       query.Get("api_key_id"),
+		Endpoint:       query.Get("endpoint"),
+		State:          query.Get("state"),
+		ErrorClass:     query.Get("error_class"),
+		Interval:       query.Get("interval"),
 	}
 	if raw := query.Get("limit"); raw != "" {
 		filter.Limit, err = strconv.Atoi(raw)
@@ -268,18 +294,77 @@ func parseAnalyticsFilter(ctx iris.Context, endpoint string) (analyticsFilter, e
 	if filter.Limit <= 0 || filter.Limit > analyticsMaxLimit {
 		return analyticsFilter{}, errors.New("analytics limit is invalid")
 	}
+	if filter.Interval == "" && (endpoint == "usage" || endpoint == "costs") {
+		filter.Interval = "day"
+	}
+	if filter.Interval != "" && filter.Interval != "hour" && filter.Interval != "day" && filter.Interval != "month" {
+		return analyticsFilter{}, errors.New("analytics interval is invalid")
+	}
 	if len(filter.Cursor) > analyticsMaxCursor {
 		return analyticsFilter{}, errors.New("analytics cursor is too large")
 	}
 	if filter.Cursor != "" {
-		if _, err := base64.RawURLEncoding.DecodeString(filter.Cursor); err != nil {
-			return analyticsFilter{}, errors.New("analytics cursor is invalid")
+		if err := validateAnalyticsCursor(endpoint, filter.Cursor); err != nil {
+			return analyticsFilter{}, err
 		}
 	}
-	if endpoint == "latency" || endpoint == "quotas" || endpoint == "overview" {
-		filter.Interval = ""
-	}
 	return filter, nil
+}
+
+type analyticsCursorPayload struct {
+	Endpoint string   `json:"endpoint"`
+	Values   []string `json:"values"`
+}
+
+func cursorValueLimits(endpoint string) ([]int, bool) {
+	switch endpoint {
+	case "models":
+		return []int{analyticsMaxValue, analyticsMaxValue}, true
+	case "keys":
+		return []int{analyticsMaxValue}, true
+	case "errors":
+		return []int{128, 128}, true
+	case "usage", "costs":
+		return []int{32}, true
+	default:
+		return nil, false
+	}
+}
+
+func validateAnalyticsCursor(endpoint, encoded string) error {
+	_, err := decodeAnalyticsCursor(encoded, endpoint)
+	return err
+}
+
+func decodeAnalyticsCursor(encoded, endpoint string) ([]string, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || base64.RawURLEncoding.EncodeToString(decoded) != encoded || !utf8.Valid(decoded) {
+		return nil, errors.New("analytics cursor is invalid")
+	}
+	var payload analyticsCursorPayload
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		return nil, errors.New("analytics cursor is invalid")
+	}
+	limits, ok := cursorValueLimits(endpoint)
+	if !ok || payload.Endpoint != endpoint || len(payload.Values) != len(limits) {
+		return nil, errors.New("analytics cursor is invalid")
+	}
+	for index, value := range payload.Values {
+		if !utf8.ValidString(value) || len(value) > limits[index] {
+			return nil, errors.New("analytics cursor is invalid")
+		}
+		if (endpoint == "usage" || endpoint == "costs") && index == 0 {
+			parsed, parseErr := time.Parse(time.RFC3339Nano, value)
+			if parseErr != nil || parsed.Location() != time.UTC || parsed.Format(time.RFC3339Nano) != value {
+				return nil, errors.New("analytics cursor is invalid")
+			}
+		}
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil || base64.RawURLEncoding.EncodeToString(canonical) != encoded {
+		return nil, errors.New("analytics cursor is invalid")
+	}
+	return payload.Values, nil
 }
 
 func parseAnalyticsTime(value string) (time.Time, error) {
@@ -340,23 +425,26 @@ func analyticsWhere(query *gorm.DB, filter analyticsFilter, alias string) *gorm.
 	if filter.State != "" {
 		query = query.Where(alias+".status = ?", filter.State)
 	}
+	requested := "COALESCE(NULLIF(" + alias + ".requested_model, ''), " + alias + ".model)"
+	resolved := "COALESCE(" + alias + ".resolved_model, '')"
+	combined := "COALESCE(NULLIF(" + alias + ".resolved_model, ''), " + requested + ")"
 	if filter.RequestedModel != "" {
-		query = query.Where("COALESCE(NULLIF("+alias+".requested_model, ''), "+alias+".model) = ?", filter.RequestedModel)
+		query = query.Where(requested+" = ?", filter.RequestedModel)
 	}
 	if filter.ResolvedModel != "" {
-		query = query.Where(alias+".resolved_model = ?", filter.ResolvedModel)
+		query = query.Where(resolved+" = ?", filter.ResolvedModel)
 	}
 	if filter.Model != "" {
-		query = query.Where("(COALESCE(NULLIF("+alias+".resolved_model, ''), COALESCE(NULLIF("+alias+".requested_model, ''), "+alias+".model)) = ?)", filter.Model)
+		query = query.Where(combined+" = ?", filter.Model)
 	}
 	if filter.ErrorClass != "" {
-		query = query.Where(alias+".error_class = ?", filter.ErrorClass)
+		query = query.Where("COALESCE("+alias+".error_class, '') = ?", filter.ErrorClass)
 	}
 	return query
 }
 
 func analyticsUsageJoin(filter analyticsFilter) (string, []any) {
-	return "LEFT JOIN (SELECT ux.request_id, SUM(ux.input_tokens) AS input_tokens, SUM(ux.cached_input_tokens) AS cached_input_tokens, SUM(ux.output_tokens) AS output_tokens, SUM(ux.reasoning_tokens) AS reasoning_tokens, SUM(ux.total_tokens) AS total_tokens, SUM(ux.image_count) AS image_count, SUM(ux.estimated_public_cost_microunits) AS estimated_cost, SUM(ux.allocated_subscription_cost_microunits) AS allocated_cost FROM usage AS ux JOIN requests AS ur ON ur.request_id = ux.request_id WHERE ur.accepted_at >= ? AND ur.accepted_at < ? GROUP BY ux.request_id) AS u ON u.request_id = r.request_id", []any{filter.From, filter.To}
+	return "LEFT JOIN (SELECT ux.request_id, SUM(ux.input_tokens) AS input_tokens, SUM(ux.cached_input_tokens) AS cached_input_tokens, SUM(ux.output_tokens) AS output_tokens, SUM(ux.reasoning_tokens) AS reasoning_tokens, SUM(ux.total_tokens) AS total_tokens, SUM(ux.image_count) AS image_count, SUM(ux.estimated_public_cost_microunits) AS estimated_cost, SUM(ux.allocated_subscription_cost_microunits) AS allocated_cost, SUM(ux.estimated_public_cost_microunits) AS quota_cost FROM usage AS ux JOIN requests AS ur ON ur.request_id = ux.request_id WHERE ur.accepted_at >= ? AND ur.accepted_at < ? GROUP BY ux.request_id) AS u ON u.request_id = r.request_id", []any{filter.From, filter.To}
 }
 
 func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewResponse, error) {
@@ -375,11 +463,13 @@ func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewRe
 		Images    sql.NullInt64 `gorm:"column:image_count"`
 		Estimated sql.NullInt64 `gorm:"column:estimated_cost"`
 		Allocated sql.NullInt64 `gorm:"column:allocated_cost"`
+		Quota     sql.NullInt64 `gorm:"column:quota_cost"`
 	}
 	join, args := analyticsUsageJoin(filter)
 	query := tx.Table("requests AS r").Joins(join, args...)
 	query = analyticsWhere(query, filter, "r")
-	if err := query.Select("COUNT(*) AS count, SUM(CASE WHEN r.status = 'running' THEN 1 ELSE 0 END) AS running, SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded, SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN r.status = 'canceled' THEN 1 ELSE 0 END) AS canceled, SUM(CASE WHEN r.status NOT IN ('running','succeeded','failed','canceled') THEN 1 ELSE 0 END) AS other, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost").Scan(&aggregate).Error; err != nil {
+	selectSQL := "COUNT(*) AS count, SUM(CASE WHEN r.status = 'running' THEN 1 ELSE 0 END) AS running, SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded, SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN r.status = 'canceled' THEN 1 ELSE 0 END) AS canceled, SUM(CASE WHEN r.status NOT IN ('running','succeeded','failed','canceled') THEN 1 ELSE 0 END) AS other, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost, SUM(u.quota_cost) AS quota_cost"
+	if err := query.Select(selectSQL).Scan(&aggregate).Error; err != nil {
 		return analyticsOverviewResponse{}, fmt.Errorf("load analytics overview: %w", err)
 	}
 	states, err := analyticsStates(tx, filter)
@@ -391,34 +481,26 @@ func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewRe
 		return analyticsOverviewResponse{}, err
 	}
 	var activeKeys int64
-	keyQuery := tx.Model(&RequestRecord{}).Where("accepted_at >= ? AND accepted_at < ? AND api_key_id <> ''", filter.From, filter.To)
-	if err := keyQuery.Distinct("api_key_id").Count(&activeKeys).Error; err != nil {
+	keyQuery := analyticsWhere(tx.Table("requests AS r"), filter, "r").Where("COALESCE(r.api_key_id, '') <> ''")
+	if err := keyQuery.Distinct("r.api_key_id").Count(&activeKeys).Error; err != nil {
 		return analyticsOverviewResponse{}, fmt.Errorf("count analytics keys: %w", err)
 	}
 	allocated := nullIntPtr(aggregate.Allocated)
-	if filter.From.Day() == 1 && filter.From.Hour() == 0 && filter.From.Minute() == 0 && filter.From.Second() == 0 && filter.From.Nanosecond() == 0 && filter.To.Day() == 1 && filter.To.Hour() == 0 && filter.To.Minute() == 0 && filter.To.Second() == 0 && filter.To.Nanosecond() == 0 {
-		buckets, allocationErr := analyticsAllocationBuckets(tx, filter)
-		if allocationErr != nil {
-			return analyticsOverviewResponse{}, allocationErr
-		}
-		var allocatedTotal int64
-		var hasAllocation bool
-		for _, bucket := range buckets {
-			if !hasAllocation {
-				hasAllocation = true
-			}
-			if allocatedTotal > math.MaxInt64-bucket.amount {
-				return analyticsOverviewResponse{}, errors.New("analytics allocation total overflows int64")
-			}
-			allocatedTotal += bucket.amount
-		}
-		if hasAllocation {
-			allocated = &allocatedTotal
-		}
+	buckets, allocationErr := analyticsAllocationBuckets(tx, filter)
+	if allocationErr != nil {
+		return analyticsOverviewResponse{}, allocationErr
 	}
-	var quotaCost sql.NullInt64
-	if err := tx.Table("quota_buckets").Where("period_start >= ? AND period_start < ?", filter.From, filter.To).Select("SUM(accounted_cost_microunits) AS quota_cost").Scan(&quotaCost).Error; err != nil {
-		return analyticsOverviewResponse{}, fmt.Errorf("load quota accounted cost: %w", err)
+	var allocatedTotal int64
+	var hasAllocation bool
+	for _, bucket := range buckets {
+		hasAllocation = true
+		if allocatedTotal > math.MaxInt64-bucket.amount {
+			return analyticsOverviewResponse{}, errors.New("analytics allocation total overflows int64")
+		}
+		allocatedTotal += bucket.amount
+	}
+	if hasAllocation {
+		allocated = &allocatedTotal
 	}
 	return analyticsOverviewResponse{
 		From: filter.From,
@@ -435,7 +517,7 @@ func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewRe
 		Costs: analyticsCostTotals{
 			EstimatedPublicCostMicrounits:       nullIntPtr(aggregate.Estimated),
 			AllocatedSubscriptionCostMicrounits: allocated,
-			QuotaAccountedCostMicrounits:        nullIntPtr(quotaCost),
+			QuotaAccountedCostMicrounits:        nullIntPtr(aggregate.Quota),
 			RoundingBasis:                       pricingRoundingBasis,
 			AllocationBasis:                     pricingAllocationBasis,
 		},
@@ -456,17 +538,17 @@ func analyticsModels(tx *gorm.DB, filter analyticsFilter) (analyticsResponse, er
 	var rows []analyticsModelRow
 	join, args := analyticsUsageJoin(filter)
 	query := tx.Table("requests AS r").Joins(join, args...)
+	requestedExpression := "COALESCE(NULLIF(r.requested_model, ''), r.model)"
+	resolvedExpression := "COALESCE(r.resolved_model, '')"
 	if filter.Cursor != "" {
-		if cursor, ok := decodeAnalyticsCursor(filter.Cursor); ok {
-			parts := strings.SplitN(cursor, "\x00", 2)
-			if len(parts) == 2 {
-				requestedExpression := "COALESCE(NULLIF(r.requested_model, ''), r.model)"
-				query = query.Where("("+requestedExpression+" > ? OR ("+requestedExpression+" = ? AND r.resolved_model > ?))", parts[0], parts[0], parts[1])
-			}
+		values, err := decodeAnalyticsCursor(filter.Cursor, "models")
+		if err != nil {
+			return analyticsResponse{}, err
 		}
+		query = query.Where("("+requestedExpression+" > ? OR ("+requestedExpression+" = ? AND "+resolvedExpression+" > ?))", values[0], values[0], values[1])
 	}
 	query = analyticsWhere(query, filter, "r")
-	query = query.Select("COALESCE(NULLIF(r.requested_model, ''), r.model) AS requested_model, r.resolved_model AS resolved_model, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost").Group("requested_model, resolved_model").Order("requested_model ASC, resolved_model ASC").Limit(filter.Limit + 1)
+	query = query.Select(requestedExpression + " AS requested_model, " + resolvedExpression + " AS resolved_model, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost").Group(requestedExpression + ", " + resolvedExpression).Order(requestedExpression + " ASC, " + resolvedExpression + " ASC").Limit(filter.Limit + 1)
 	if err := query.Find(&rows).Error; err != nil {
 		return analyticsResponse{}, fmt.Errorf("load analytics models: %w", err)
 	}
@@ -481,26 +563,29 @@ func trimAnalyticsModelRows(rows *[]analyticsModelRow, limit int) string {
 	page := (*rows)[:limit]
 	last := page[len(page)-1]
 	*rows = page
-	return encodeAnalyticsCursor(last.RequestedModel + "\x00" + last.ResolvedModel)
+	return encodeAnalyticsCursor("models", last.RequestedModel, last.ResolvedModel)
 }
 
 func analyticsKeys(tx *gorm.DB, filter analyticsFilter) (analyticsResponse, error) {
 	var rows []analyticsKeyRow
 	join, args := analyticsUsageJoin(filter)
 	query := tx.Table("requests AS r").Joins(join, args...)
+	keyExpression := "COALESCE(r.api_key_id, '')"
 	query = analyticsWhere(query, filter, "r")
 	if filter.Cursor != "" {
-		if cursor, ok := decodeAnalyticsCursor(filter.Cursor); ok {
-			query = query.Where("r.api_key_id > ?", cursor)
+		values, err := decodeAnalyticsCursor(filter.Cursor, "keys")
+		if err != nil {
+			return analyticsResponse{}, err
 		}
+		query = query.Where(keyExpression+" > ?", values[0])
 	}
-	query = query.Select("r.api_key_id AS api_key_id, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost").Group("r.api_key_id").Order("r.api_key_id ASC").Limit(filter.Limit + 1)
+	query = query.Select(keyExpression + " AS api_key_id, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost").Group(keyExpression).Order(keyExpression + " ASC").Limit(filter.Limit + 1)
 	if err := query.Find(&rows).Error; err != nil {
 		return analyticsResponse{}, fmt.Errorf("load analytics keys: %w", err)
 	}
 	next := ""
 	if len(rows) > filter.Limit {
-		next = encodeAnalyticsCursor(rows[filter.Limit-1].APIKeyID)
+		next = encodeAnalyticsCursor("keys", rows[filter.Limit-1].APIKeyID)
 		rows = rows[:filter.Limit]
 	}
 	return analyticsResponse{Data: rows, NextCursor: next}, nil
@@ -508,22 +593,28 @@ func analyticsKeys(tx *gorm.DB, filter analyticsFilter) (analyticsResponse, erro
 
 func analyticsErrors(tx *gorm.DB, filter analyticsFilter) (analyticsResponse, error) {
 	var rows []analyticsErrorRow
-	query := analyticsWhere(tx.Model(&RequestRecord{}), filter, "requests")
+	query := analyticsWhere(tx.Table("requests AS r"), filter, "r")
+	classExpression := "COALESCE(r.error_class, '')"
+	codeExpression := "COALESCE(r.error_code, '')"
 	if filter.Cursor != "" {
-		if cursor, ok := decodeAnalyticsCursor(filter.Cursor); ok {
-			parts := strings.SplitN(cursor, "\x00", 2)
-			if len(parts) == 2 {
-				query = query.Where("(error_class > ? OR (error_class = ? AND error_code > ?))", parts[0], parts[0], parts[1])
-			}
+		values, err := decodeAnalyticsCursor(filter.Cursor, "errors")
+		if err != nil {
+			return analyticsResponse{}, err
 		}
+		query = query.Where("("+classExpression+" > ? OR ("+classExpression+" = ? AND "+codeExpression+" > ?))", values[0], values[0], values[1])
 	}
-	query = query.Where("(error_code <> '' OR error_class <> '')").Select("error_code, error_class, COUNT(*) AS request_count").Group("error_code, error_class").Order("error_class ASC, error_code ASC").Limit(filter.Limit + 1)
+	query = query.Where("(" + codeExpression + " <> '' OR " + classExpression + " <> '')").
+		Select(codeExpression + " AS error_code, " + classExpression + " AS error_class, COUNT(*) AS request_count").
+		Group(classExpression + ", " + codeExpression).
+		Order(classExpression + " ASC, " + codeExpression + " ASC").
+		Limit(filter.Limit + 1)
 	if err := query.Find(&rows).Error; err != nil {
 		return analyticsResponse{}, fmt.Errorf("load analytics errors: %w", err)
 	}
 	next := ""
 	if len(rows) > filter.Limit {
-		next = encodeAnalyticsCursor(rows[filter.Limit-1].ErrorClass + "\x00" + rows[filter.Limit-1].ErrorCode)
+		last := rows[filter.Limit-1]
+		next = encodeAnalyticsCursor("errors", last.ErrorClass, last.ErrorCode)
 		rows = rows[:filter.Limit]
 	}
 	return analyticsResponse{Data: rows, NextCursor: next}, nil
@@ -531,22 +622,13 @@ func analyticsErrors(tx *gorm.DB, filter analyticsFilter) (analyticsResponse, er
 
 func analyticsLatency(tx *gorm.DB, filter analyticsFilter) (analyticsLatencyStats, error) {
 	var result analyticsLatencyStats
-	where := "accepted_at >= ? AND accepted_at < ? AND terminal_at IS NOT NULL"
-	args := []any{filter.From, filter.To}
-	if filter.APIKeyID != "" {
-		where += " AND api_key_id = ?"
-		args = append(args, filter.APIKeyID)
-	}
-	if filter.Endpoint != "" {
-		where += " AND endpoint = ?"
-		args = append(args, filter.Endpoint)
-	}
-	if filter.State != "" {
-		where += " AND status = ?"
-		args = append(args, filter.State)
-	}
-	query := `WITH durations AS (SELECT CAST((julianday(terminal_at) - julianday(accepted_at)) * 86400000 AS INTEGER) AS duration_ms FROM requests WHERE ` + where + `), ranked AS (SELECT duration_ms, ROW_NUMBER() OVER (ORDER BY duration_ms ASC) AS row_number, COUNT(*) OVER () AS total FROM durations) SELECT COALESCE(MAX(total),0) AS count, COALESCE(MIN(duration_ms),0) AS min_ms, COALESCE(MAX(duration_ms),0) AS max_ms, COALESCE(MAX(CASE WHEN row_number = (total + 1) / 2 THEN duration_ms END),0) AS p50_ms, COALESCE(MAX(CASE WHEN row_number = (total * 95 + 99) / 100 THEN duration_ms END),0) AS p95_ms, COALESCE(MAX(CASE WHEN row_number = (total * 99 + 99) / 100 THEN duration_ms END),0) AS p99_ms FROM ranked`
-	if err := tx.Raw(query, args...).Scan(&result).Error; err != nil {
+	durations := analyticsWhere(tx.Table("requests AS r"), filter, "r").
+		Where("r.terminal_at IS NOT NULL").
+		Select("CAST((julianday(r.terminal_at) - julianday(r.accepted_at)) * 86400000 AS INTEGER) AS duration_ms")
+	ranked := tx.Table("(?) AS durations", durations).
+		Select("duration_ms, ROW_NUMBER() OVER (ORDER BY duration_ms ASC) AS row_number, COUNT(*) OVER () AS total")
+	query := tx.Table("(?) AS ranked", ranked).Select("COALESCE(MAX(total),0) AS count, COALESCE(MIN(duration_ms),0) AS min_ms, COALESCE(MAX(duration_ms),0) AS max_ms, COALESCE(MAX(CASE WHEN row_number = (total + 1) / 2 THEN duration_ms END),0) AS p50_ms, COALESCE(MAX(CASE WHEN row_number = (total * 95 + 99) / 100 THEN duration_ms END),0) AS p95_ms, COALESCE(MAX(CASE WHEN row_number = (total * 99 + 99) / 100 THEN duration_ms END),0) AS p99_ms")
+	if err := query.Scan(&result).Error; err != nil {
 		return analyticsLatencyStats{}, fmt.Errorf("load analytics latency: %w", err)
 	}
 	return result, nil
@@ -555,14 +637,42 @@ func analyticsLatency(tx *gorm.DB, filter analyticsFilter) (analyticsLatencyStat
 func analyticsQuotas(tx *gorm.DB, filter analyticsFilter) (analyticsQuotaResponse, error) {
 	var result analyticsQuotaResponse
 	result.From, result.To = filter.From, filter.To
-	var bucket struct{ ReservedRequests, AccountedRequests, ReservedTokens, AccountedTokens, ReservedImages, AccountedImages, ReservedCost, AccountedCost int64 }
-	if err := tx.Table("quota_buckets").Where("period_start >= ? AND period_start < ?", filter.From, filter.To).Select("COALESCE(SUM(reserved_requests),0) AS reserved_requests, COALESCE(SUM(actual_requests),0) AS accounted_requests, COALESCE(SUM(reserved_tokens),0) AS reserved_tokens, COALESCE(SUM(actual_tokens),0) AS accounted_tokens, COALESCE(SUM(reserved_images),0) AS reserved_images, COALESCE(SUM(actual_images),0) AS accounted_images, COALESCE(SUM(reserved_cost_microunits),0) AS reserved_cost, COALESCE(SUM(actual_cost_microunits),0) AS accounted_cost").Scan(&bucket).Error; err != nil {
-		return analyticsQuotaResponse{}, fmt.Errorf("load quota aggregates: %w", err)
+	var accounted struct {
+		Requests int64         `gorm:"column:request_count"`
+		Tokens   sql.NullInt64 `gorm:"column:tokens"`
+		Images   sql.NullInt64 `gorm:"column:images"`
+		Cost     sql.NullInt64 `gorm:"column:cost"`
 	}
-	if err := tx.Table("quota_reservations").Where("created_at >= ? AND created_at < ? AND status = ?", filter.From, filter.To, "pending").Count(&result.PendingRequests).Error; err != nil {
-		return analyticsQuotaResponse{}, fmt.Errorf("load pending quota aggregates: %w", err)
+	usage := tx.Table("requests AS r").
+		Joins("JOIN (SELECT request_id, SUM(total_tokens) AS tokens, SUM(image_count) AS images, SUM(estimated_public_cost_microunits) AS cost FROM usage GROUP BY request_id) AS u ON u.request_id = r.request_id")
+	usage = analyticsWhere(usage, filter, "r")
+	if err := usage.Select("COUNT(*) AS request_count, SUM(u.tokens) AS tokens, SUM(u.images) AS images, SUM(u.cost) AS cost").Scan(&accounted).Error; err != nil {
+		return analyticsQuotaResponse{}, fmt.Errorf("load durable quota usage: %w", err)
 	}
-	result.ReservedRequests, result.QuotaAccountedRequests, result.ReservedTokens, result.QuotaAccountedTokens, result.ReservedImages, result.QuotaAccountedImages, result.ReservedCostMicrounits, result.QuotaAccountedCostMicrounits = bucket.ReservedRequests, bucket.AccountedRequests, bucket.ReservedTokens, bucket.AccountedTokens, bucket.ReservedImages, bucket.AccountedImages, bucket.ReservedCost, bucket.AccountedCost
+	var pending struct {
+		Requests int64 `gorm:"column:requests"`
+		Tokens   int64 `gorm:"column:tokens"`
+		Images   int64 `gorm:"column:images"`
+		Cost     int64 `gorm:"column:cost"`
+	}
+	pendingBase := func() *gorm.DB {
+		return analyticsWhere(tx.Table("quota_reservations AS q").Joins("JOIN requests AS r ON r.request_id = q.request_id"), filter, "r").
+			Where("q.status = ?", "pending")
+	}
+	if err := pendingBase().Select("COALESCE(SUM(q.requested_requests),0) AS requests, COALESCE(SUM(q.requested_tokens),0) AS tokens, COALESCE(SUM(q.requested_images),0) AS images, COALESCE(SUM(q.requested_cost_microunits),0) AS cost").Scan(&pending).Error; err != nil {
+		return analyticsQuotaResponse{}, fmt.Errorf("load pending quota reservations: %w", err)
+	}
+	if err := pendingBase().Select("COUNT(*)").Scan(&result.PendingRequests).Error; err != nil {
+		return analyticsQuotaResponse{}, fmt.Errorf("count pending quota reservations: %w", err)
+	}
+	result.ReservedRequests = pending.Requests
+	result.ReservedTokens = pending.Tokens
+	result.ReservedImages = pending.Images
+	result.ReservedCostMicrounits = pending.Cost
+	result.QuotaAccountedRequests = accounted.Requests
+	result.QuotaAccountedTokens = nullInt(accounted.Tokens)
+	result.QuotaAccountedImages = nullInt(accounted.Images)
+	result.QuotaAccountedCostMicrounits = nullInt(accounted.Cost)
 	return result, nil
 }
 
@@ -579,11 +689,14 @@ func analyticsBuckets(tx *gorm.DB, filter analyticsFilter, costs bool) (analytic
 	query := tx.Table("requests AS r").Joins(join, args...)
 	query = analyticsWhere(query, filter, "r")
 	if filter.Cursor != "" {
-		if cursor, ok := decodeAnalyticsCursor(filter.Cursor); ok {
-			query = query.Where(bucketExpression+" > ?", cursor)
+		values, err := decodeAnalyticsCursor(filter.Cursor, map[bool]string{true: "costs", false: "usage"}[costs])
+		if err != nil {
+			return analyticsResponse{}, err
 		}
+		query = query.Where(bucketExpression+" > ?", values[0])
 	}
-	query = query.Select(bucketExpression + " AS bucket, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost").Group("bucket").Order("bucket ASC").Limit(filter.Limit + 1)
+	selectSQL := bucketExpression + " AS bucket, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost, SUM(u.quota_cost) AS quota_accounted_cost"
+	query = query.Select(selectSQL).Group("bucket").Order("bucket ASC").Limit(filter.Limit + 1)
 	if err := query.Find(&rows).Error; err != nil {
 		return analyticsResponse{}, fmt.Errorf("load analytics buckets: %w", err)
 	}
@@ -607,12 +720,13 @@ func analyticsBuckets(tx *gorm.DB, filter analyticsFilter, costs bool) (analytic
 	}
 	next := ""
 	if len(rows) > filter.Limit {
-		next = encodeAnalyticsCursor(rows[filter.Limit-1].Bucket)
+		next = encodeAnalyticsCursor(map[bool]string{true: "costs", false: "usage"}[costs], rows[filter.Limit-1].Bucket)
 		rows = rows[:filter.Limit]
 	}
 	if !costs {
 		for index := range rows {
 			rows[index].AllocatedCost = nil
+			rows[index].QuotaAccountedCost = nil
 			rows[index].Currency = ""
 			rows[index].AllocationVersionID = ""
 			rows[index].AllocationBasis = ""
@@ -631,15 +745,20 @@ type analyticsAllocationBucket struct {
 }
 
 func analyticsAllocationBuckets(tx *gorm.DB, filter analyticsFilter) (map[string]analyticsAllocationBucket, error) {
-	// A partial calendar range cannot expose a complete monthly allocation.
-	if filter.From.Day() != 1 || filter.From.Hour() != 0 || filter.From.Minute() != 0 || filter.From.Second() != 0 || filter.From.Nanosecond() != 0 {
+	from, to := filter.From.UTC(), filter.To.UTC()
+	if !tx.Migrator().HasTable("subscription_allocation_versions") {
 		return map[string]analyticsAllocationBucket{}, nil
 	}
-	if filter.To.Day() != 1 || filter.To.Hour() != 0 || filter.To.Minute() != 0 || filter.To.Second() != 0 || filter.To.Nanosecond() != 0 {
-		return map[string]analyticsAllocationBucket{}, nil
+	var matchingIDs []string
+	if err := analyticsWhere(tx.Table("requests AS r"), filter, "r").Pluck("r.request_id", &matchingIDs).Error; err != nil {
+		return nil, fmt.Errorf("load allocation filter requests: %w", err)
+	}
+	requestSet := make(map[string]struct{}, len(matchingIDs))
+	for _, requestID := range matchingIDs {
+		requestSet[requestID] = struct{}{}
 	}
 	totals := make(map[string]analyticsAllocationBucket)
-	for month := time.Date(filter.From.Year(), filter.From.Month(), 1, 0, 0, 0, 0, time.UTC); month.Before(filter.To); month = month.AddDate(0, 1, 0) {
+	for month := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, time.UTC); month.Before(to); month = month.AddDate(0, 1, 0) {
 		allocation, inputs, available, err := queryMonthlyAllocation(tx, month, time.Now().UTC())
 		if err != nil {
 			return nil, err
@@ -652,6 +771,9 @@ func analyticsAllocationBuckets(tx *gorm.DB, filter analyticsFilter) (map[string
 			amountByRequest[row.RequestID] = row.Microunits
 		}
 		for _, input := range inputs {
+			if _, ok := requestSet[input.RequestID]; !ok {
+				continue
+			}
 			amount, ok := amountByRequest[input.RequestID]
 			if !ok {
 				continue
@@ -697,12 +819,12 @@ func nullIntPtr(value sql.NullInt64) *int64 {
 	result := value.Int64
 	return &result
 }
-func encodeAnalyticsCursor(value string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(value))
-}
-func decodeAnalyticsCursor(value string) (string, bool) {
-	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	return string(decoded), err == nil
+func encodeAnalyticsCursor(endpoint string, values ...string) string {
+	payload, err := json.Marshal(analyticsCursorPayload{Endpoint: endpoint, Values: values})
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(payload)
 }
 
 var _ = analyticsResponse{}

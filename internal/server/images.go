@@ -164,7 +164,6 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			return
 		}
 		journalUsage := journalUsageFromCodex(result.Usage, len(result.Images))
-		journalUsage.ResolvedModel = publicRequest.Model
 		recordJournalUsageDetails(ctx, journalUsage)
 		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
 			markJournalTerminal(ctx, requestStatusFailed, "")
@@ -324,7 +323,6 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			return
 		}
 		journalUsage := journalUsageFromCodex(result.Usage, len(result.Images))
-		journalUsage.ResolvedModel = publicRequest.Model
 		recordJournalUsageDetails(ctx, journalUsage)
 		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
 			markJournalTerminal(ctx, requestStatusFailed, "")

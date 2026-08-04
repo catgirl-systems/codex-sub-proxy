@@ -1,10 +1,12 @@
 package config
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -66,10 +68,6 @@ type ModelPriceConfig struct {
 	OutputMicrounitsPerMillion      int64  `toml:"output_microunits_per_million" json:"output_microunits_per_million"`
 	ReasoningMicrounitsPerMillion   int64  `toml:"reasoning_microunits_per_million" json:"reasoning_microunits_per_million"`
 	ImageMicrounitsPerImage         int64  `toml:"image_microunits_per_image" json:"image_microunits_per_image"`
-	InputMicrounitsPer1M            *int64 `toml:"input_microunits_per_1m" json:"input_microunits_per_1m,omitempty"`
-	CachedInputMicrounitsPer1M      *int64 `toml:"cached_input_microunits_per_1m" json:"cached_input_microunits_per_1m,omitempty"`
-	OutputMicrounitsPer1M           *int64 `toml:"output_microunits_per_1m" json:"output_microunits_per_1m,omitempty"`
-	ReasoningMicrounitsPer1M        *int64 `toml:"reasoning_microunits_per_1m" json:"reasoning_microunits_per_1m,omitempty"`
 }
 
 // SubscriptionAllocationVersionConfig defines one monthly allocation input.
@@ -266,8 +264,12 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("read config %q: %w", path, err)
 		}
 		if err == nil && len(strings.TrimSpace(string(contents))) > 0 {
-			if _, err := toml.Decode(string(contents), &cfg); err != nil {
+			metadata, err := toml.Decode(string(contents), &cfg)
+			if err != nil {
 				return Config{}, fmt.Errorf("decode config %q: %w", path, err)
+			}
+			if undecoded := metadata.Undecoded(); len(undecoded) != 0 {
+				return Config{}, fmt.Errorf("decode config %q: unknown key %q", path, undecoded[0].String())
 			}
 		}
 	}
@@ -304,6 +306,7 @@ func validatePricingConfig(pricing *PricingConfig) error {
 		return errors.New("pricing configuration has too many versions")
 	}
 	pricingIDs := make(map[string]struct{}, len(pricing.Versions))
+	pricingEffective := make(map[int64]struct{}, len(pricing.Versions))
 	for index := range pricing.Versions {
 		version := &pricing.Versions[index]
 		if err := validatePricingVersion(version); err != nil {
@@ -313,8 +316,14 @@ func validatePricingConfig(pricing *PricingConfig) error {
 			return fmt.Errorf("duplicate pricing version ID %q", version.ID)
 		}
 		pricingIDs[version.ID] = struct{}{}
+		effective := version.EffectiveAt.UTC().UnixNano()
+		if _, exists := pricingEffective[effective]; exists {
+			return fmt.Errorf("duplicate pricing effective time %s", version.EffectiveAt.Format(time.RFC3339Nano))
+		}
+		pricingEffective[effective] = struct{}{}
 	}
 	allocationIDs := make(map[string]struct{}, len(pricing.SubscriptionAllocationVersions))
+	allocationEffective := make(map[int64]struct{}, len(pricing.SubscriptionAllocationVersions))
 	for index := range pricing.SubscriptionAllocationVersions {
 		version := &pricing.SubscriptionAllocationVersions[index]
 		if err := validateSubscriptionAllocationVersion(version); err != nil {
@@ -324,6 +333,11 @@ func validatePricingConfig(pricing *PricingConfig) error {
 			return fmt.Errorf("duplicate subscription allocation version ID %q", version.ID)
 		}
 		allocationIDs[version.ID] = struct{}{}
+		effective := version.EffectiveAt.UTC().UnixNano()
+		if _, exists := allocationEffective[effective]; exists {
+			return fmt.Errorf("duplicate subscription allocation effective time %s", version.EffectiveAt.Format(time.RFC3339Nano))
+		}
+		allocationEffective[effective] = struct{}{}
 	}
 	return nil
 }
@@ -344,7 +358,7 @@ func validatePricingVersion(version *PricingVersionConfig) error {
 	seen := make(map[string]struct{}, len(version.Models))
 	for index := range version.Models {
 		model := &version.Models[index]
-		if err := normalizeModelPrice(model); err != nil {
+		if err := validateModelPrice(model); err != nil {
 			return fmt.Errorf("model price %d: %w", index, err)
 		}
 		if strings.TrimSpace(model.ModelID) == "" || model.ModelID != strings.TrimSpace(model.ModelID) || len(model.ModelID) > 256 {
@@ -370,30 +384,21 @@ func validatePricingVersion(version *PricingVersionConfig) error {
 	return nil
 }
 
-func normalizeModelPrice(model *ModelPriceConfig) error {
+func validateModelPrice(model *ModelPriceConfig) error {
 	if model == nil {
 		return errors.New("model price is nil")
 	}
-	aliases := []*int64{
-		model.InputMicrounitsPer1M,
-		model.CachedInputMicrounitsPer1M,
-		model.OutputMicrounitsPer1M,
-		model.ReasoningMicrounitsPer1M,
+	rates := []int64{
+		model.InputMicrounitsPerMillion,
+		model.CachedInputMicrounitsPerMillion,
+		model.OutputMicrounitsPerMillion,
+		model.ReasoningMicrounitsPerMillion,
+		model.ImageMicrounitsPerImage,
 	}
-	targets := []*int64{
-		&model.InputMicrounitsPerMillion,
-		&model.CachedInputMicrounitsPerMillion,
-		&model.OutputMicrounitsPerMillion,
-		&model.ReasoningMicrounitsPerMillion,
-	}
-	for index, alias := range aliases {
-		if alias == nil {
-			continue
+	for _, rate := range rates {
+		if rate < 0 {
+			return errors.New("rates must not be negative")
 		}
-		if *targets[index] != 0 && *targets[index] != *alias {
-			return errors.New("rate aliases have different values")
-		}
-		*targets[index] = *alias
 	}
 	return nil
 }
@@ -694,14 +699,14 @@ func applyPricingEnvironment(pricing *PricingConfig) error {
 	}
 	if value, ok := os.LookupEnv("CSP_PRICING_VERSIONS_JSON"); ok {
 		var versions []PricingVersionConfig
-		if err := json.Unmarshal([]byte(value), &versions); err != nil {
+		if err := decodeJSONStrict(value, &versions); err != nil {
 			return fmt.Errorf("parse CSP_PRICING_VERSIONS_JSON: %w", err)
 		}
 		pricing.Versions = versions
 	}
 	if value, ok := os.LookupEnv("CSP_SUBSCRIPTION_ALLOCATION_VERSIONS_JSON"); ok {
 		var versions []SubscriptionAllocationVersionConfig
-		if err := json.Unmarshal([]byte(value), &versions); err != nil {
+		if err := decodeJSONStrict(value, &versions); err != nil {
 			return fmt.Errorf("parse CSP_SUBSCRIPTION_ALLOCATION_VERSIONS_JSON: %w", err)
 		}
 		pricing.SubscriptionAllocationVersions = versions
@@ -761,7 +766,7 @@ func pricingVersionFromEnvironment(pricing PricingConfig) (PricingVersionConfig,
 	}
 	if value, ok := os.LookupEnv("CSP_PRICING_MODELS_JSON"); ok {
 		var models []ModelPriceConfig
-		if err := json.Unmarshal([]byte(value), &models); err != nil {
+		if err := decodeJSONStrict(value, &models); err != nil {
 			return PricingVersionConfig{}, fmt.Errorf("parse CSP_PRICING_MODELS_JSON: %w", err)
 		}
 		version.Models = models
@@ -807,6 +812,22 @@ func subscriptionVersionFromEnvironment(pricing PricingConfig) (SubscriptionAllo
 		version.MonthlyCostMicrounits = cost
 	}
 	return version, nil
+}
+
+func decodeJSONStrict(value string, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader([]byte(value)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func parseUTCInstant(value string) (time.Time, error) {

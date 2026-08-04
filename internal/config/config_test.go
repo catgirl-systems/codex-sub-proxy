@@ -418,3 +418,36 @@ func TestDataKeysAvailabilityDoesNotRequireAdminHMAC(t *testing.T) {
 		t.Fatal("data keys reported unavailable without admin HMAC")
 	}
 }
+func TestPricingConfigRejectsLegacyRateAliases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pricing-alias.toml")
+	toml := "[pricing]\n[[pricing.versions]]\nid = \"v1\"\neffective_at = 2026-01-01T00:00:00Z\ncurrency = \"USD\"\n[[pricing.versions.models]]\nmodel_id = \"model-a\"\ninput_microunits_per_1m = 1\n"
+	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("legacy pricing alias was accepted in TOML")
+	}
+
+	t.Setenv("CSP_PRICING_VERSIONS_JSON", `[{"id":"v1","effective_at":"2026-01-01T00:00:00Z","currency":"USD","models":[{"model_id":"model-a","input_microunits_per_1m":1}]}]`)
+	if _, err := Load(""); err == nil {
+		t.Fatal("legacy pricing alias was accepted in JSON")
+	}
+}
+
+func TestPricingConfigRejectsDuplicateEffectiveInstants(t *testing.T) {
+	effective := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	pricing := &PricingConfig{Versions: []PricingVersionConfig{
+		{ID: "v1", EffectiveAt: effective, Currency: "USD", Models: []ModelPriceConfig{{ModelID: "model-a"}}},
+		{ID: "v2", EffectiveAt: effective, Currency: "USD", Models: []ModelPriceConfig{{ModelID: "model-b"}}},
+	}, SubscriptionAllocationVersions: []SubscriptionAllocationVersionConfig{
+		{ID: "a1", EffectiveAt: effective, Currency: "USD", MonthlyCostMicrounits: 1, AllocationBasis: "proportional_public_estimated_cost"},
+		{ID: "a2", EffectiveAt: effective, Currency: "USD", MonthlyCostMicrounits: 2, AllocationBasis: "proportional_public_estimated_cost"},
+	}}
+	if err := validatePricingConfig(pricing); err == nil {
+		t.Fatal("duplicate pricing effective instants were accepted")
+	}
+	pricing.Versions = pricing.Versions[:1]
+	if err := validatePricingConfig(pricing); err == nil {
+		t.Fatal("duplicate allocation effective instants were accepted")
+	}
+}
