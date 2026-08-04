@@ -36,14 +36,11 @@ func (r *RetentionRunner) deleteRequest(ctx context.Context, id string, actor Ad
 	}
 	r.deleteMu.Lock()
 	defer r.deleteMu.Unlock()
-	marked, err := r.markRequestDeleting(ctx, id)
+	marked, err := r.markRequestDeleting(ctx, id, actor)
 	if err != nil {
 		return err
 	}
 	if !marked {
-		if actor.ID != "" {
-			return recordStandaloneAdminAction(ctx, r.db, actor, "request.delete", id)
-		}
 		return nil
 	}
 	for range retentionMaxDeleteBatches {
@@ -74,10 +71,10 @@ func (r *RetentionRunner) deleteRequest(ctx context.Context, id string, actor Ad
 		}
 		return errors.New("request artifact deletion exceeded bound")
 	}
-	return r.finalizeRequestDelete(ctx, id, actor)
+	return r.finalizeRequestDelete(ctx, id)
 }
 
-func (r *RetentionRunner) markRequestDeleting(ctx context.Context, id string) (bool, error) {
+func (r *RetentionRunner) markRequestDeleting(ctx context.Context, id string, actor AdminPrincipal) (bool, error) {
 	var marked bool
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var request RequestRecord
@@ -96,11 +93,19 @@ func (r *RetentionRunner) markRequestDeleting(ctx context.Context, id string) (b
 			return nil
 		}
 		now := time.Now().UTC()
+		if actor.ID != "" {
+			if err := writeAdminAudit(tx, actor, "request.delete", id, adminAuditMetadata{Fields: []string{"metadata", "content", "artifacts"}}, now); err != nil {
+				return fmt.Errorf("store request deletion audit: %w", err)
+			}
+		}
 		result := tx.Model(&RequestRecord{}).Where("request_id = ? AND terminal_at IS NOT NULL AND deleting_at IS NULL", id).Update("deleting_at", now)
 		if result.Error != nil {
 			return fmt.Errorf("mark request deleting: %w", result.Error)
 		}
-		marked = result.RowsAffected == 1
+		if result.RowsAffected != 1 {
+			return errors.New("request deletion transition was lost")
+		}
+		marked = true
 		return nil
 	})
 	return marked, err
@@ -127,7 +132,7 @@ func (r *RetentionRunner) claimRequestArtifacts(ctx context.Context, requestID s
 	return records, nil
 }
 
-func (r *RetentionRunner) finalizeRequestDelete(ctx context.Context, requestID string, actor AdminPrincipal) error {
+func (r *RetentionRunner) finalizeRequestDelete(ctx context.Context, requestID string) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var request RequestRecord
 		if err := tx.Where("request_id = ? AND deleting_at IS NOT NULL", requestID).First(&request).Error; err != nil {
@@ -171,11 +176,6 @@ WHERE id = ?
 		if request.ConversationID != "" {
 			if err := tx.Model(&ConversationRecord{}).Where("id = ? AND request_count > 0", request.ConversationID).UpdateColumn("request_count", gorm.Expr("request_count - 1")).Error; err != nil {
 				return fmt.Errorf("update conversation request count: %w", err)
-			}
-		}
-		if actor.ID != "" {
-			if err := writeAdminAudit(tx, actor, "request.delete", requestID, adminAuditMetadata{Fields: []string{"metadata", "content", "artifacts"}}, time.Now().UTC()); err != nil {
-				return fmt.Errorf("store request deletion audit: %w", err)
 			}
 		}
 		return nil

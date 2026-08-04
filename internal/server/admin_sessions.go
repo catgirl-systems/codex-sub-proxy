@@ -14,20 +14,24 @@ import (
 )
 
 const (
-	adminSessionCookieName       = "__Host-csp_admin_session"
-	adminLoginNonceCookieName    = "__Host-csp_admin_login_nonce"
-	adminSessionCookiePrefix     = "csp_admin_session_"
-	adminLoginNoncePrefix        = "csp_admin_nonce_"
-	adminSessionIDBytes          = 32
-	adminSessionPrefixBytes      = 8
-	adminSessionTTL              = 8 * time.Hour
-	adminSessionIdleTTL          = 30 * time.Minute
-	adminLoginNonceTTL           = 10 * time.Minute
-	adminSessionMaxCandidates    = 16
-	adminLoginNonceMaxCandidates = 16
+	adminSessionCookieName        = "__Host-csp_admin_session"
+	adminLoginNonceCookieName     = "__Host-csp_admin_login_nonce"
+	adminSessionCookiePrefix      = "csp_admin_session_"
+	adminLoginNoncePrefix         = "csp_admin_nonce_"
+	adminSessionIDBytes           = 32
+	adminSessionPrefixBytes       = 8
+	adminSessionTTL               = 8 * time.Hour
+	adminSessionIdleTTL           = 30 * time.Minute
+	adminLoginNonceTTL            = 10 * time.Minute
+	adminSessionMaxCandidates     = 16
+	adminLoginNonceMaxCandidates  = 16
+	adminLoginNonceMaxOutstanding = 64
 )
 
-var errAdminSessionInvalid = errors.New("invalid admin session")
+var (
+	errAdminSessionInvalid = errors.New("invalid admin session")
+	errAdminLoginNonceCap  = errors.New("admin login is temporarily unavailable")
+)
 
 // AdminSession stores only a digest of the browser session and CSRF secret.
 type AdminSession struct {
@@ -43,16 +47,14 @@ type AdminSession struct {
 	CSRFDigest    []byte     `gorm:"column:csrf_digest;not null;size:32"`
 }
 
-func (AdminSession) TableName() string { return "admin_sessions" }
-
 // AdminLoginNonce is a one-use, short-lived login proof.
 type AdminLoginNonce struct {
 	ID        string     `gorm:"column:id;primaryKey;size:36"`
 	Prefix    string     `gorm:"column:prefix;not null;size:48;index"`
 	Digest    []byte     `gorm:"column:digest;not null;size:32;uniqueIndex"`
 	CreatedAt time.Time  `gorm:"column:created_at;not null;index"`
-	ExpiresAt time.Time  `gorm:"column:expires_at;not null;index"`
-	UsedAt    *time.Time `gorm:"column:used_at;index"`
+	ExpiresAt time.Time  `gorm:"column:expires_at;not null;index:idx_admin_login_nonce_live,priority:2"`
+	UsedAt    *time.Time `gorm:"column:used_at;index:idx_admin_login_nonce_live,priority:1"`
 }
 
 func (AdminLoginNonce) TableName() string { return "admin_login_nonces" }
@@ -299,8 +301,24 @@ func (s *AdminTokenStore) CreateLoginNonce(ctx context.Context) (string, error) 
 		return "", err
 	}
 	record := AdminLoginNonce{ID: id, Prefix: rawValue[:len(adminLoginNoncePrefix)+adminSessionPrefixBytes*2], Digest: append([]byte(nil), digest[:]...), CreatedAt: now, ExpiresAt: now.Add(adminLoginNonceTTL)}
-	if err := s.silentDB().WithContext(ctx).Create(&record).Error; err != nil {
-		return "", fmt.Errorf("store admin login nonce: %w", err)
+	err = s.silentDB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if result := tx.Where("used_at IS NOT NULL OR expires_at <= ?", now).Delete(&AdminLoginNonce{}); result.Error != nil {
+			return fmt.Errorf("prune admin login nonces: %w", result.Error)
+		}
+		var outstanding int64
+		if err := tx.Model(&AdminLoginNonce{}).Where("used_at IS NULL AND expires_at > ?", now).Count(&outstanding).Error; err != nil {
+			return fmt.Errorf("count admin login nonces: %w", err)
+		}
+		if outstanding >= adminLoginNonceMaxOutstanding {
+			return errAdminLoginNonceCap
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			return fmt.Errorf("store admin login nonce: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 	return rawValue, nil
 }

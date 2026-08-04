@@ -2,10 +2,20 @@
   "use strict";
 
   const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+  const PAGE_LIMIT = 50;
+  const MAX_CURSOR_STACK = 64;
+  const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const UTC_MINUTE_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
   const csrf = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const principalScopes = new Set((document.body.dataset.scopes || "").split(",").filter(Boolean));
+  const metadataScope = principalScopes.has("metadata");
   const contentScope = principalScopes.has("content");
-  const state = { active: "overview", createdKey: null, createdKeyTimer: 0 };
+  const state = {
+    active: metadataScope ? "overview" : "content",
+    createdKey: null,
+    createdKeyTimer: 0,
+    pagination: Object.create(null),
+  };
   const root = document.getElementById("view");
   const status = document.getElementById("status");
   const nav = document.getElementById("navigation");
@@ -162,8 +172,7 @@
     const body = el("tbody");
     if (!rows.length) {
       const row = el("tr");
-      const cell = el("td", "No data.", { colspan: headers.length });
-      row.append(cell);
+      row.append(el("td", "No data.", { colspan: headers.length }));
       body.append(row);
     } else rows.forEach((values) => {
       const row = el("tr");
@@ -182,21 +191,42 @@
     return dl;
   }
 
-  function isoValue(date) {
-    return new Date(date).toISOString();
+  function actionButton(label, handler, disabled) {
+    const button = el("button", label, { class: "button", type: "button" });
+    button.disabled = Boolean(disabled);
+    button.addEventListener("click", handler);
+    return button;
   }
 
-  function dateControls() {
-    const now = Date.now();
+  function policyText(policy) {
+    return JSON.stringify(policy || {}, null, 2);
+  }
+
+  function isoMinute(date) {
+    return date.toISOString().slice(0, 16);
+  }
+
+  function defaultAnalyticsRange() {
+    const now = new Date();
+    return { from: isoMinute(new Date(now.getTime() - 24 * 60 * 60 * 1000)), to: isoMinute(now) };
+  }
+
+  function parseUTCMinute(value) {
+    if (typeof value !== "string" || !UTC_MINUTE_PATTERN.test(value)) throw new Error("Use a UTC date and time in YYYY-MM-DDTHH:mm format.");
+    const date = new Date(`${value}:00Z`);
+    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 16) !== value) throw new Error("Use a valid UTC date and time.");
+    return date;
+  }
+
+  function dateControls(fromValue, toValue, intervalValue) {
+    const range = defaultAnalyticsRange();
     const toolbar = el("form", undefined, { class: "toolbar" });
-    const from = formField("From (UTC)", "datetime-local", "from");
-    const to = formField("To (UTC)", "datetime-local", "to");
-    from.querySelector("input").value = new Date(now - 24 * 60 * 60 * 1000).toISOString().slice(0, 16);
-    to.querySelector("input").value = new Date(now).toISOString().slice(0, 16);
+    const from = formField("From (UTC)", "datetime-local", "from", fromValue || range.from);
+    const to = formField("To (UTC)", "datetime-local", "to", toValue || range.to);
     const interval = formField("Interval", "select", "interval");
     const select = interval.querySelector("select");
     ["hour", "day", "month"].forEach((value) => select.append(el("option", value, { value })));
-    select.value = "day";
+    select.value = intervalValue || "day";
     const submit = el("button", "Refresh", { class: "button primary", type: "submit" });
     toolbar.append(from, to, interval, submit);
     toolbar.addEventListener("submit", (event) => {
@@ -207,12 +237,42 @@
   }
 
   function analyticsQuery(from, to, interval) {
-    const fromDate = new Date(from);
-    const toDate = new Date(to);
-    if (!Number.isFinite(fromDate.getTime()) || !Number.isFinite(toDate.getTime()) || toDate <= fromDate) throw new Error("Choose a valid date range.");
-    const query = new URLSearchParams({ from: isoValue(fromDate), to: isoValue(toDate) });
+    const fromDate = parseUTCMinute(from);
+    const toDate = parseUTCMinute(to);
+    if (toDate <= fromDate) throw new Error("Choose a valid date range.");
+    const query = new URLSearchParams({ from: fromDate.toISOString(), to: toDate.toISOString() });
     if (interval) query.set("interval", interval);
     return query;
+  }
+
+  function pageQuery(base, cursor) {
+    const query = new URLSearchParams(base.toString());
+    query.set("limit", String(PAGE_LIMIT));
+    if (cursor) query.set("cursor", cursor);
+    else query.delete("cursor");
+    return query;
+  }
+
+  function resetPagination(key) {
+    const value = { cursor: "", page: 1, stack: [] };
+    state.pagination[key] = value;
+    return value;
+  }
+
+  function paginationControl(pageState, nextCursor, loadPage) {
+    const controls = el("div", undefined, { class: "pagination", "aria-label": "Pagination" });
+    const previous = actionButton("Previous", () => {
+      const cursor = pageState.stack[pageState.stack.length - 1] || "";
+      loadPage(cursor, pageState.stack.slice(0, -1), Math.max(1, pageState.page - 1));
+    }, pageState.stack.length === 0);
+    const current = el("span", `Page ${pageState.page}`, { class: "pagination-page", "aria-live": "polite" });
+    const next = actionButton("Next", () => {
+      const stack = pageState.stack.concat(pageState.cursor);
+      if (stack.length > MAX_CURSOR_STACK) stack.splice(0, stack.length - MAX_CURSOR_STACK);
+      loadPage(nextCursor, stack, pageState.page + 1);
+    }, !nextCursor);
+    controls.append(previous, current, next);
+    return controls;
   }
 
   function appendRowsFromData(target, rows, mapper, headers) {
@@ -223,17 +283,18 @@
     setStatus("Loading overview…");
     try {
       const rangeQuery = analyticsQuery(from, to);
-      const costQuery = analyticsQuery(from, to, interval);
-      const [overview, models, keys, errors, latency, quotas, costs] = await Promise.all([
+      const intervalQuery = analyticsQuery(from, to, interval);
+      const [overview, models, keys, errors, latency, quotas, usage, costs] = await Promise.all([
         api(`/admin/v1/analytics/overview?${rangeQuery}`),
-        api(`/admin/v1/analytics/models?${rangeQuery}`),
-        api(`/admin/v1/analytics/keys?${rangeQuery}`),
-        api(`/admin/v1/analytics/errors?${rangeQuery}`),
+        api(`/admin/v1/analytics/models?${pageQuery(rangeQuery, "")}`),
+        api(`/admin/v1/analytics/keys?${pageQuery(rangeQuery, "")}`),
+        api(`/admin/v1/analytics/errors?${pageQuery(rangeQuery, "")}`),
         api(`/admin/v1/analytics/latency?${rangeQuery}`),
         api(`/admin/v1/analytics/quotas?${rangeQuery}`),
-        api(`/admin/v1/analytics/costs?${costQuery}`)
+        api(`/admin/v1/analytics/usage?${pageQuery(intervalQuery, "")}`),
+        api(`/admin/v1/analytics/costs?${pageQuery(intervalQuery, "")}`),
       ]);
-      root.replaceChildren(dateControls());
+      root.replaceChildren(dateControls(from, to, interval));
       const cards = el("div", undefined, { class: "cards" });
       cards.append(
         metric("Requests", overview.requests?.count),
@@ -243,7 +304,7 @@
         metric("Latency p95 (ms)", overview.latency?.p95_ms),
         metric("Quota-accounted cost", overview.costs?.quota_accounted_cost_microunits),
         metric("Estimated public cost", overview.costs?.estimated_public_cost_microunits),
-        metric("Allocated subscription cost (provisional/final)", overview.costs?.allocated_subscription_cost_microunits)
+        metric("Allocated subscription cost (provisional/final)", overview.costs?.allocated_subscription_cost_microunits),
       );
       root.append(cards);
       const sections = el("div", undefined, { class: "sections" });
@@ -251,26 +312,20 @@
       section.append(el("h2", "Requests"));
       appendRowsFromData(section, overview.states, (row) => [el("td", row.state), el("td", row.count)], ["State", "Count"]);
       sections.append(section);
-      section = el("section", undefined, { class: "card" });
-      section.append(el("h2", "Requested and resolved models"));
-      appendRowsFromData(section, models?.data, (row) => [el("td", row.requested_model), el("td", row.resolved_model), el("td", row.request_count)], ["Requested model", "Resolved model", "Requests"]);
-      sections.append(section);
-      section = el("section", undefined, { class: "card" });
-      section.append(el("h2", "Tokens and images"));
-      appendRowsFromData(section, keys?.data, (row) => [el("td", row.api_key_id), el("td", row.request_count), el("td", row.total_tokens), el("td", row.image_count)], ["API key", "Requests", "Tokens", "Images"]);
-      sections.append(section);
-      section = el("section", undefined, { class: "card" });
-      section.append(el("h2", "Errors"));
-      appendRowsFromData(section, errors?.data, (row) => [el("td", row.error_class), el("td", row.error_code), el("td", row.request_count)], ["Class", "Code", "Requests"]);
-      sections.append(section);
+      sections.append(analyticsTableSection("analytics-models", "Requested and resolved models", "models", rangeQuery, models,
+        ["Requested model", "Resolved model", "Requests"], (row) => [el("td", row.requested_model), el("td", row.resolved_model), el("td", row.request_count)]));
+      sections.append(analyticsTableSection("analytics-keys", "Tokens and images by API key", "keys", rangeQuery, keys,
+        ["API key", "Requests", "Tokens", "Images"], (row) => [el("td", row.api_key_id), el("td", row.request_count), el("td", row.total_tokens), el("td", row.image_count)]));
+      sections.append(analyticsTableSection("analytics-errors", "Errors", "errors", rangeQuery, errors,
+        ["Class", "Code", "Requests"], (row) => [el("td", row.error_class), el("td", row.error_code), el("td", row.request_count)]));
       section = el("section", undefined, { class: "card" });
       section.append(el("h2", "Latency and quota"));
       appendRowsFromData(section, [latency, quotas], (row) => [el("td", row === latency ? "Latency" : "Quota"), el("td", row.count ?? row.quota_accounted_requests), el("td", row.p95_ms ?? row.quota_accounted_cost_microunits)], ["Area", "Count", "Value"]);
       sections.append(section);
-      section = el("section", undefined, { class: "card" });
-      section.append(el("h2", "Cost intervals"));
-      appendRowsFromData(section, costs?.data, (row) => [el("td", row.bucket), el("td", row.estimated_public_cost_microunits), el("td", row.allocated_subscription_cost_microunits), el("td", row.quota_accounted_cost_microunits), el("td", row.provisional)], ["Interval", "Estimated public", "Allocated subscription", "Quota accounted", "Provisional"]);
-      sections.append(section);
+      sections.append(analyticsTableSection("analytics-usage", "Usage intervals", "usage", intervalQuery, usage,
+        ["Interval", "Requests", "Input tokens", "Output tokens", "Images"], (row) => [el("td", row.bucket), el("td", row.request_count), el("td", row.input_tokens), el("td", row.output_tokens), el("td", row.image_count)]));
+      sections.append(analyticsTableSection("analytics-costs", "Cost intervals", "costs", intervalQuery, costs,
+        ["Interval", "Estimated public", "Allocated subscription", "Quota accounted", "Provisional"], (row) => [el("td", row.bucket), el("td", row.estimated_public_cost_microunits), el("td", row.allocated_subscription_cost_microunits), el("td", row.quota_accounted_cost_microunits), el("td", row.provisional)]));
       root.append(sections);
       setStatus("Overview loaded.");
     } catch (error) {
@@ -278,15 +333,31 @@
     }
   }
 
-  function actionButton(label, handler, disabled) {
-    const button = el("button", label, { class: "button", type: "button" });
-    button.disabled = Boolean(disabled);
-    button.addEventListener("click", handler);
-    return button;
-  }
-
-  function policyText(policy) {
-    return JSON.stringify(policy || {}, null, 2);
+  function analyticsTableSection(key, title, endpoint, baseQuery, initial, headers, mapper) {
+    const pageState = resetPagination(key);
+    const section = el("section", undefined, { class: "card", id: key });
+    section.append(el("h2", title));
+    const rows = el("div");
+    section.append(rows);
+    function render(value) {
+      rows.replaceChildren(table(headers, (value?.data || []).map(mapper)));
+      section.querySelector(".pagination")?.remove();
+      section.append(paginationControl(pageState, value?.next_cursor, async (cursor, stack, page) => {
+        setStatus(`Loading ${title.toLowerCase()} page ${page}…`);
+        try {
+          const result = await api(`/admin/v1/analytics/${endpoint}?${pageQuery(baseQuery, cursor)}`);
+          pageState.cursor = cursor;
+          pageState.stack = stack;
+          pageState.page = page;
+          render(result);
+          setStatus(`${title} page ${page} loaded.`);
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : `Unable to load ${title.toLowerCase()}.`, true);
+        }
+      }));
+    }
+    render(initial);
+    return section;
   }
 
   function showCreatedKey(key) {
@@ -307,10 +378,19 @@
   }
 
   async function loadKeys() {
-    setStatus("Loading API keys…");
+    const pageState = resetPagination("keys");
+    await loadKeysPage(pageState, "", [], 1);
+  }
+
+  async function loadKeysPage(pageState, cursor, stack, page) {
+    setStatus(`Loading API keys${page > 1 ? ` page ${page}` : ""}…`);
     try {
-      const value = await api("/admin/v1/api-keys?limit=100");
-      root.replaceChildren();
+      const query = new URLSearchParams({ limit: String(PAGE_LIMIT) });
+      if (cursor) query.set("cursor", cursor);
+      const value = await api(`/admin/v1/api-keys?${query}`);
+      pageState.cursor = cursor;
+      pageState.stack = stack;
+      pageState.page = page;
       const section = el("section", undefined, { class: "card", id: "keys-view" });
       section.append(el("h2", "API keys"));
       const issue = el("form", undefined, { class: "toolbar" });
@@ -345,8 +425,9 @@
         return [el("td", record.name), el("td", record.owner), el("td", record.prefix), el("td", record.disabled ? "Disabled" : "Active"), actions];
       });
       section.append(table(["Name", "Owner", "Prefix", "State", "Actions"], rows));
-      root.append(section);
-      setStatus("API keys loaded.");
+      section.append(paginationControl(pageState, value?.next_cursor, (nextCursor, nextStack, nextPage) => loadKeysPage(pageState, nextCursor, nextStack, nextPage)));
+      root.replaceChildren(section);
+      setStatus(`API keys${page > 1 ? ` page ${page}` : ""} loaded.`);
     } catch (error) { setStatus(error instanceof Error ? error.message : "Unable to load API keys.", true); }
   }
 
@@ -354,9 +435,7 @@
     try {
       const record = await api(`/admin/v1/api-keys/${encodeURIComponent(id)}`);
       const section = el("section", undefined, { class: "card" });
-      section.append(el("h2", "API key detail"), el("p", `Name: ${record.name}`), el("p", `Owner: ${record.owner}`), el("pre", policyText(record.policy), { class: "output" }));
-      const back = actionButton("Back to keys", loadKeys);
-      section.append(back);
+      section.append(el("h2", "API key detail"), el("p", `Name: ${record.name}`), el("p", `Owner: ${record.owner}`), el("pre", policyText(record.policy), { class: "output" }), actionButton("Back to keys", loadKeys));
       root.replaceChildren(section);
       setStatus("API key detail loaded.");
     } catch (error) { setStatus(error instanceof Error ? error.message : "Unable to load API key detail.", true); }
@@ -394,13 +473,23 @@
   function lifecycleQuery() {
     const to = new Date();
     const from = new Date(to.getTime() - 24 * 60 * 60 * 1000);
-    return new URLSearchParams({ from: from.toISOString(), to: to.toISOString(), limit: "50" });
+    return new URLSearchParams({ from: from.toISOString(), to: to.toISOString(), limit: String(PAGE_LIMIT) });
+  }
+  function loadLifecycle(kind) {
+    const pageState = resetPagination(`lifecycle-${kind}`);
+    pageState.baseQuery = lifecycleQuery();
+    return loadLifecyclePage(kind, pageState, "", [], 1);
   }
 
-  async function loadLifecycle(kind) {
-    setStatus(`Loading ${kind}…`);
+  async function loadLifecyclePage(kind, pageState, cursor, stack, page) {
+    setStatus(`Loading ${kind}${page > 1 ? ` page ${page}` : ""}…`);
     try {
-      const value = await api(`/admin/v1/${kind}?${lifecycleQuery()}`);
+      const query = new URLSearchParams(pageState.baseQuery.toString());
+      if (cursor) query.set("cursor", cursor);
+      const value = await api(`/admin/v1/${kind}?${query}`);
+      pageState.cursor = cursor;
+      pageState.stack = stack;
+      pageState.page = page;
       const section = el("section", undefined, { class: "card" });
       section.append(el("h2", kind === "requests" ? "Requests" : "Conversations"));
       const rows = (value?.data || []).map((record) => {
@@ -411,8 +500,9 @@
         return [el("td", record.id), el("td", record.state), el("td", record.created_at || record.accepted_at), el("td", record.request_count ?? record.endpoint), actions];
       });
       section.append(table(["ID", "State", "Created", "Count/endpoint", "Actions"], rows));
+      section.append(paginationControl(pageState, value?.next_cursor, (nextCursor, nextStack, nextPage) => loadLifecyclePage(kind, pageState, nextCursor, nextStack, nextPage)));
       root.replaceChildren(section);
-      setStatus(`${kind} loaded.`);
+      setStatus(`${kind}${page > 1 ? ` page ${page}` : ""} loaded.`);
     } catch (error) { setStatus(error instanceof Error ? error.message : `Unable to load ${kind}.`, true); }
   }
 
@@ -436,7 +526,7 @@
       const url = URL.createObjectURL(blob);
       const link = el("a", "Download export", { href: url, download: `${kind}-${id}.json` });
       link.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
       setStatus("Export downloaded.");
     } catch (error) { setStatus(error instanceof Error ? error.message : "Unable to export content.", true); }
   }
@@ -447,9 +537,52 @@
     catch (error) { setStatus(error instanceof Error ? error.message : "Unable to delete.", true); }
   }
 
+  function contentIDField(label, id) {
+    const field = formField(label, "text", id);
+    const input = field.querySelector("input");
+    input.maxLength = 36;
+    input.pattern = UUID_PATTERN.source;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    return field;
+  }
+
+  function loadContentPanel() {
+    const section = el("section", undefined, { class: "card", role: "region", "aria-labelledby": "content-panel-title" });
+    section.append(el("h2", "Content exports", { id: "content-panel-title" }));
+    section.append(el("p", "Export request or conversation content by identifier. Metadata APIs are not needed for this scope."));
+    const fields = el("div", undefined, { class: "dialog-row" });
+    const requestField = contentIDField("Request ID", "content-request-id");
+    const conversationField = contentIDField("Conversation ID", "content-conversation-id");
+    fields.append(requestField, conversationField);
+    const actions = el("div", undefined, { class: "actions" });
+    const exportID = (field, kind) => {
+      const value = field.querySelector("input").value.trim();
+      if (!UUID_PATTERN.test(value)) {
+        setStatus(`Enter a valid ${kind.slice(0, -1)} UUID.`, true);
+        field.querySelector("input").focus();
+        return;
+      }
+      exportLifecycle(kind, value);
+    };
+    actions.append(actionButton("Export request", () => exportID(requestField, "requests")), actionButton("Export conversation", () => exportID(conversationField, "conversations")));
+    section.append(fields, actions);
+    root.replaceChildren(section);
+    setStatus("Content export panel loaded.");
+  }
+
   function buildNav() {
     nav.replaceChildren();
-    [["overview", "Overview", () => loadOverview(new Date(Date.now() - 86400000), new Date(), "day")], ["keys", "API keys", loadKeys], ["requests", "Requests", () => loadLifecycle("requests")], ["conversations", "Conversations", () => loadLifecycle("conversations")]].forEach(([id, label, handler]) => {
+    const entries = [];
+    if (metadataScope) {
+      entries.push(["overview", "Overview", () => { const range = defaultAnalyticsRange(); loadOverview(range.from, range.to, "day"); }]);
+      entries.push(["keys", "API keys", loadKeys]);
+      entries.push(["requests", "Requests", () => loadLifecycle("requests")]);
+      entries.push(["conversations", "Conversations", () => loadLifecycle("conversations")]);
+    } else if (contentScope) {
+      entries.push(["content", "Content exports", loadContentPanel]);
+    }
+    entries.forEach(([id, label, handler]) => {
       const button = el("button", label, { type: "button", "aria-current": id === state.active ? "page" : "false" });
       button.addEventListener("click", () => { clearCreatedKey(); state.active = id; buildNav(); handler(); });
       nav.append(button);
@@ -457,12 +590,18 @@
     const logout = el("form", undefined, { action: "/admin/logout", method: "post" });
     const csrfField = el("input", undefined, { name: "csrf_token", value: csrf });
     csrfField.type = "hidden";
-    const logoutButton = el("button", "Log out", { type: "submit" });
-    logout.append(csrfField, logoutButton);
+    logout.append(csrfField, el("button", "Log out", { type: "submit" }));
     nav.append(logout);
   }
 
   document.getElementById("logout-form")?.addEventListener("submit", () => clearCreatedKey());
   buildNav();
-  loadOverview(new Date(Date.now() - 86400000), new Date(), "day");
+  if (metadataScope) {
+    const range = defaultAnalyticsRange();
+    loadOverview(range.from, range.to, "day");
+  } else if (contentScope) {
+    loadContentPanel();
+  } else {
+    setStatus("No dashboard scope is available.", true);
+  }
 })();

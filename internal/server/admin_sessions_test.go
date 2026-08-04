@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -123,6 +124,120 @@ func TestAdminLoginNonceIsOneUseAndSameOriginIsExact(t *testing.T) {
 	request.Header.Set("Referer", "http://admin.example/admin/login")
 	if !validateAdminSameOrigin(request) {
 		t.Fatal("same-origin referer rejected")
+	}
+}
+
+func TestAdminLoginNonceAdmissionIsBoundedAndConsumptionFreesCapacity(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store, closeStore := openAdminTestStore(t, []byte("nonce-cap-hmac"), &now)
+	defer closeStore()
+	var indexes []struct {
+		Name string `gorm:"column:name"`
+	}
+	if err := store.db.Raw("PRAGMA index_list('admin_login_nonces')").Scan(&indexes).Error; err != nil {
+		t.Fatal(err)
+	}
+	foundLiveIndex := false
+	for _, index := range indexes {
+		if index.Name == "idx_admin_login_nonce_live" {
+			foundLiveIndex = true
+			break
+		}
+	}
+	if !foundLiveIndex {
+		t.Fatalf("live nonce index missing: %+v", indexes)
+	}
+	app, err := newAdminApplication(NewReadiness(), store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(app)
+	defer server.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	first, err := client.Get(server.URL + adminLoginEndpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBody, _ := io.ReadAll(first.Body)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first login page status = %d", first.StatusCode)
+	}
+	firstNonce := between(string(firstBody), `name="login_nonce" value="`, `"`)
+	if firstNonce == "" {
+		t.Fatal("first login page did not contain a nonce")
+	}
+	var firstCookie *http.Cookie
+	for _, cookie := range first.Cookies() {
+		if cookie.Name == adminLoginNonceCookieName {
+			firstCookie = cookie
+			break
+		}
+	}
+	if firstCookie == nil {
+		t.Fatal("first login page did not set a nonce cookie")
+	}
+	for range adminLoginNonceMaxOutstanding - 1 {
+		response, requestErr := client.Get(server.URL + adminLoginEndpoint)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("fill login page status = %d", response.StatusCode)
+		}
+	}
+	var outstanding int64
+	if err := store.db.Model(&AdminLoginNonce{}).Where("used_at IS NULL AND expires_at > ?", now).Count(&outstanding).Error; err != nil {
+		t.Fatal(err)
+	}
+	if outstanding != adminLoginNonceMaxOutstanding {
+		t.Fatalf("outstanding nonces = %d, want %d", outstanding, adminLoginNonceMaxOutstanding)
+	}
+	statuses := make(chan int, adminLoginNonceMaxOutstanding*2)
+	var waitGroup sync.WaitGroup
+	for range adminLoginNonceMaxOutstanding * 2 {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			response, requestErr := client.Get(server.URL + adminLoginEndpoint)
+			if requestErr != nil {
+				statuses <- 0
+				return
+			}
+			response.Body.Close()
+			statuses <- response.StatusCode
+		}()
+	}
+	waitGroup.Wait()
+	close(statuses)
+	sawUnavailable := false
+	for status := range statuses {
+		if status == http.StatusServiceUnavailable {
+			sawUnavailable = true
+		} else if status != 0 && status != http.StatusOK {
+			t.Fatalf("unexpected concurrent login page status = %d", status)
+		}
+	}
+	if !sawUnavailable {
+		t.Fatal("concurrent login admission never returned unavailable at the cap")
+	}
+	if err := store.db.Model(&AdminLoginNonce{}).Where("used_at IS NULL AND expires_at > ?", now).Count(&outstanding).Error; err != nil {
+		t.Fatal(err)
+	}
+	if outstanding > adminLoginNonceMaxOutstanding {
+		t.Fatalf("concurrent outstanding nonces = %d, cap = %d", outstanding, adminLoginNonceMaxOutstanding)
+	}
+	if err := store.ConsumeLoginNonce(context.Background(), firstCookie.Value, firstNonce); err != nil {
+		t.Fatalf("consume legitimate nonce: %v", err)
+	}
+	freed, err := client.Get(server.URL + adminLoginEndpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freed.Body.Close()
+	if freed.StatusCode != http.StatusOK {
+		t.Fatalf("login page after consumption status = %d", freed.StatusCode)
 	}
 }
 
@@ -260,6 +375,60 @@ func TestAdminDashboardLoginAndCSRFBoundary(t *testing.T) {
 	pageResponse.Body.Close()
 	if pageResponse.StatusCode != http.StatusSeeOther {
 		t.Fatalf("dashboard after logout status=%d", pageResponse.StatusCode)
+	}
+}
+
+func TestAdminDashboardRedirectsAndClearsCookiesAfterBackingTokenRevocation(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store, closeStore := openAdminTestStore(t, []byte("session-revoke-hmac"), &now)
+	defer closeStore()
+	raw := adminTestToken()
+	if _, err := store.MaterializeBootstrap(context.Background(), []byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	principal, err := store.Authenticate(context.Background(), []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionCookie, csrf, _, err := store.CreateSession(context.Background(), principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Revoke(context.Background(), principal.ID, principal); err != nil {
+		t.Fatal(err)
+	}
+	app, err := newAdminApplication(NewReadiness(), store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(app)
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodGet, server.URL+adminDashboardEndpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: adminSessionCookieName, Value: sessionCookie})
+	request.AddCookie(&http.Cookie{Name: adminCSRFTokenCookie, Value: csrf})
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != adminLoginEndpoint {
+		t.Fatalf("revoked session response status=%d location=%q", response.StatusCode, response.Header.Get("Location"))
+	}
+	var clearedSession, clearedCSRF bool
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == adminSessionCookieName && cookie.MaxAge < 0 {
+			clearedSession = true
+		}
+		if cookie.Name == adminCSRFTokenCookie && cookie.MaxAge < 0 {
+			clearedCSRF = true
+		}
+	}
+	if !clearedSession || !clearedCSRF {
+		t.Fatalf("revoked session cookies were not cleared: session=%v csrf=%v", clearedSession, clearedCSRF)
 	}
 }
 

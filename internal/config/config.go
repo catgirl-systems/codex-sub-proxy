@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -290,7 +291,35 @@ func Load(path string) (Config, error) {
 	if err := configurationValidation.Struct(cfg); err != nil {
 		return Config{}, fmt.Errorf("validate configuration: %w", err)
 	}
+	if err := ValidateAdminCookieTransport(cfg.Server.AdminListen, cfg.Security.AdminCookieSecure); err != nil {
+		return Config{}, fmt.Errorf("validate admin cookie transport: %w", err)
+	}
 	return cfg, nil
+}
+
+// ValidateAdminCookieTransport requires insecure admin cookies to use an explicit loopback listener.
+func ValidateAdminCookieTransport(adminListen string, secure bool) error {
+	if secure {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(adminListen)
+	if err != nil || host == "" {
+		return errors.New("insecure admin cookies require an explicit loopback host and port")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 0 || portNumber > 65535 {
+		return errors.New("admin listener port is invalid for insecure cookies")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil || ip.To4()[0] != 127 {
+		if ip == nil || !ip.Equal(net.ParseIP("::1")) {
+			return errors.New("insecure admin cookies require a loopback AdminListen host")
+		}
+	}
+	return nil
 }
 
 const (

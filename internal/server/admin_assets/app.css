@@ -45,6 +45,8 @@ th { white-space: nowrap; }
 .actions { display: flex; flex-wrap: wrap; gap: .4rem; }
 pre.output { max-width: 100%; overflow: auto; padding: .75rem; color: var(--text); background: color-mix(in srgb, var(--bg) 70%, var(--surface)); }
 .dialog-row { display: grid; gap: .55rem; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); }
+.pagination { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .75rem; }
+.pagination-page { color: var(--muted); min-width: 5rem; text-align: center; }
 .hidden { display: none !important; }
 .created-key { display: grid; gap: .5rem; margin-top: .75rem; }
 .created-key input { width: 100%; min-height: 2.4rem; }

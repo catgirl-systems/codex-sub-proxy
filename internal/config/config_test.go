@@ -37,6 +37,38 @@ func TestLoadEmptyFileAndEnvironmentOverrides(t *testing.T) {
 		t.Fatalf("credential file = %q", cfg.Codex.CredentialFile)
 	}
 }
+
+func TestInsecureAdminCookiesRequireExplicitLoopbackListener(t *testing.T) {
+	tests := []struct {
+		name     string
+		listener string
+		wantErr  bool
+	}{
+		{name: "ipv4 loopback", listener: "127.0.0.1:4001"},
+		{name: "ipv4 loopback range", listener: "127.255.255.254:1"},
+		{name: "ipv6 loopback", listener: "[::1]:65535"},
+		{name: "localhost", listener: "localhost:4001"},
+		{name: "zero port is bindable", listener: "127.0.0.1:0"},
+		{name: "empty host", listener: ":4001", wantErr: true},
+		{name: "dns name", listener: "admin.example:4001", wantErr: true},
+		{name: "missing port", listener: "127.0.0.1", wantErr: true},
+		{name: "port too large", listener: "127.0.0.1:65536", wantErr: true},
+		{name: "unbracketed ipv6", listener: "::1:4001", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			contents := "[security]\nadmin_cookie_secure = false\n[server]\nadmin_listen = \"" + test.listener + "\"\n"
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Load(%q) error = %v, wantErr=%v", test.listener, err, test.wantErr)
+			}
+		})
+	}
+}
 func TestJournalConfigDefaultsAndEnvironmentOverrides(t *testing.T) {
 	defaults := Default()
 	if defaults.Journal.Mode != JournalModeDurable {

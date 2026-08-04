@@ -67,6 +67,9 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	if cfg.AdminListen == "" {
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
+	if err := config.ValidateAdminCookieTransport(cfg.AdminListen, cfg.AdminCookieSecure); err != nil {
+		return nil, fmt.Errorf("validate admin cookie transport: %w", err)
+	}
 
 	var pricing *PricingStore
 	errorsChannel := make(chan error, 8)

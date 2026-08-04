@@ -73,6 +73,24 @@ func TestDeleteRequestIsBoundedIdempotentAndAudited(t *testing.T) {
 		t.Fatal(err)
 	}
 	actor := AdminPrincipal{ID: "admin-id", Name: "Admin", Scopes: AdminTokenScopes{AdminScopeMetadata}}
+	marked, err := runner.markRequestDeleting(context.Background(), owner.RequestID, actor)
+	if err != nil || !marked {
+		t.Fatalf("mark request deleting = %t, %v", marked, err)
+	}
+	var tombstone RequestRecord
+	if err := db.Where("request_id = ?", owner.RequestID).First(&tombstone).Error; err != nil {
+		t.Fatal(err)
+	}
+	if tombstone.DeletingAt == nil {
+		t.Fatal("request tombstone was not set")
+	}
+	var initiation AuditRecord
+	if err := db.Where("action = ? AND target_id = ?", "request.delete", owner.RequestID).First(&initiation).Error; err != nil {
+		t.Fatal(err)
+	}
+	if initiation.RequestID != "" || initiation.PrincipalID != actor.ID {
+		t.Fatalf("deletion initiation audit = %+v", initiation)
+	}
 	if err := runner.DeleteRequestAsAdmin(context.Background(), owner.RequestID, actor); err != nil {
 		t.Fatal(err)
 	}

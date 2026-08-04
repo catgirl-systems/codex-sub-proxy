@@ -116,6 +116,55 @@ func TestAdminTokenStoreScopesUseAndRevoke(t *testing.T) {
 	}
 }
 
+func TestAdminAvailabilityTracksRevocationAndExpiryWithoutTakingDataReadinessDown(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store, closeStore := openAdminTestStore(t, []byte("availability-hmac"), &now)
+	defer closeStore()
+	raw := adminTestToken()
+	if _, err := store.MaterializeBootstrap(context.Background(), []byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	readiness := NewReadiness()
+	readiness.Set(true, true, func() CredentialSnapshot { return CredentialSnapshot{Available: true} })
+	readiness.SetAdminSource(func() bool { return store.Available(context.Background()) })
+	if !store.Available(context.Background()) || !readiness.Snapshot().AdminReady() {
+		t.Fatal("usable admin token was not ready")
+	}
+	principal, err := store.Authenticate(context.Background(), []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Revoke(context.Background(), principal.ID, principal); err != nil {
+		t.Fatal(err)
+	}
+	if store.Available(context.Background()) || readiness.Snapshot().AdminReady() {
+		t.Fatal("revoked sole token remained ready")
+	}
+	if !readiness.Snapshot().Ready() {
+		t.Fatal("admin token health affected data readiness")
+	}
+
+	now = time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store, closeStore = openAdminTestStore(t, []byte("expiry-hmac"), &now)
+	defer closeStore()
+	raw = adminTestToken()
+	if _, err := store.MaterializeBootstrap(context.Background(), []byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	principal, err = store.Authenticate(context.Background(), []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := now.Add(time.Hour)
+	if err := store.db.Model(&AdminToken{}).Where("id = ?", principal.ID).Update("expires_at", expiresAt).Error; err != nil {
+		t.Fatal(err)
+	}
+	now = expiresAt
+	if store.Available(context.Background()) {
+		t.Fatal("expired sole token remained available")
+	}
+}
+
 func TestAdminRoutesReturnTokenOnceAndGuardContent(t *testing.T) {
 	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	store, closeStore := openAdminTestStore(t, []byte("admin-hmac"), &now)

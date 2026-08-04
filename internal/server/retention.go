@@ -521,7 +521,7 @@ func pendingConversationJournalRequests(tx *gorm.DB, conversationID string) (boo
 	return pending != 0, nil
 }
 
-func (r *RetentionRunner) markConversationDeleting(ctx context.Context, id string) (bool, error) {
+func (r *RetentionRunner) markConversationDeleting(ctx context.Context, id string, actor AdminPrincipal) (bool, error) {
 	var marked bool
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var conversation ConversationRecord
@@ -552,6 +552,11 @@ func (r *RetentionRunner) markConversationDeleting(ctx context.Context, id strin
 				return nil
 			}
 			now := time.Now().UTC()
+			if actor.ID != "" {
+				if err := writeAdminAudit(tx, actor, "conversation.delete", id, adminAuditMetadata{Fields: []string{"metadata", "content", "artifacts"}}, now); err != nil {
+					return fmt.Errorf("store conversation deletion audit: %w", err)
+				}
+			}
 			conversation = ConversationRecord{ID: id, CreatedAt: now, UpdatedAt: now, ExpiresAt: now, DeletingAt: &now}
 			if err := tx.Create(&conversation).Error; err != nil {
 				return fmt.Errorf("create conversation tombstone: %w", err)
@@ -583,11 +588,19 @@ func (r *RetentionRunner) markConversationDeleting(ctx context.Context, id strin
 			return nil
 		}
 		now := time.Now().UTC()
+		if actor.ID != "" {
+			if err := writeAdminAudit(tx, actor, "conversation.delete", id, adminAuditMetadata{Fields: []string{"metadata", "content", "artifacts"}}, now); err != nil {
+				return fmt.Errorf("store conversation deletion audit: %w", err)
+			}
+		}
 		result := tx.Model(&ConversationRecord{}).Where("id = ? AND deleting_at IS NULL", id).Update("deleting_at", now)
 		if result.Error != nil {
 			return fmt.Errorf("mark conversation deleting: %w", result.Error)
 		}
-		marked = result.RowsAffected == 1
+		if result.RowsAffected != 1 {
+			return errors.New("conversation deletion transition was lost")
+		}
+		marked = true
 		return nil
 	})
 	return marked, err
@@ -617,14 +630,11 @@ func (r *RetentionRunner) deleteConversation(ctx context.Context, id string, act
 	}
 	r.deleteMu.Lock()
 	defer r.deleteMu.Unlock()
-	marked, err := r.markConversationDeleting(ctx, id)
+	marked, err := r.markConversationDeleting(ctx, id, actor)
 	if err != nil {
 		return err
 	}
 	if !marked {
-		if actor.ID != "" {
-			return recordStandaloneAdminAction(ctx, r.db, actor, "conversation.delete", id)
-		}
 		return nil
 	}
 	for range retentionMaxDeleteBatches {
@@ -655,7 +665,7 @@ func (r *RetentionRunner) deleteConversation(ctx context.Context, id string, act
 		}
 		return errors.New("conversation artifact deletion exceeded bound")
 	}
-	return r.finalizeConversationDelete(ctx, id, actor)
+	return r.finalizeConversationDelete(ctx, id)
 }
 
 func (r *RetentionRunner) claimConversationArtifacts(ctx context.Context, conversationID string) ([]ArtifactRecord, error) {
@@ -679,7 +689,7 @@ func (r *RetentionRunner) claimConversationArtifacts(ctx context.Context, conver
 	return records, nil
 }
 
-func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conversationID string, actor AdminPrincipal) error {
+func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conversationID string) error {
 	for range retentionMaxDeleteBatches {
 		var requests []RequestRecord
 		if err := r.db.WithContext(ctx).Where("conversation_id = ?", conversationID).Order("request_id ASC").Limit(r.batchSize).Find(&requests).Error; err != nil {
@@ -821,11 +831,6 @@ func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conver
 		}
 		if err := tx.Where("conversation_id = ?", conversationID).Delete(&ArtifactRecord{}).Error; err != nil {
 			return fmt.Errorf("delete conversation artifact metadata: %w", err)
-		}
-		if actor.ID != "" {
-			if err := writeAdminAudit(tx, actor, "conversation.delete", conversationID, adminAuditMetadata{Fields: []string{"metadata", "content", "artifacts"}}, time.Now().UTC()); err != nil {
-				return fmt.Errorf("store conversation deletion audit: %w", err)
-			}
 		}
 		if err := tx.Where("id = ?", conversationID).Delete(&ConversationRecord{}).Error; err != nil {
 			return fmt.Errorf("delete conversation metadata: %w", err)

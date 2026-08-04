@@ -18,6 +18,13 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 )
 
+func TestStartRejectsInsecureAdminCookiesOutsideExplicitLoopback(t *testing.T) {
+	_, err := Start(Config{Listen: "127.0.0.1:0", AdminListen: "0.0.0.0:0"}, NewReadiness())
+	if err == nil {
+		t.Fatal("wildcard admin listener accepted insecure cookies")
+	}
+}
+
 func TestStartServesHealthAndReadinessOnBothListeners(t *testing.T) {
 	readiness := NewReadiness()
 	servers, err := Start(Config{

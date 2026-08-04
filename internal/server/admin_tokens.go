@@ -227,7 +227,9 @@ func (s *AdminTokenStore) availableForAuth(ctx context.Context) error {
 		return err
 	}
 	var count int64
-	if err := s.silentDB().WithContext(ctx).Model(&AdminToken{}).Count(&count).Error; err != nil || count == 0 {
+	if err := s.silentDB().WithContext(ctx).Model(&AdminToken{}).
+		Where("revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", s.currentTime()).
+		Count(&count).Error; err != nil || count == 0 {
 		return ErrAdminUnavailable
 	}
 	return nil
@@ -242,7 +244,9 @@ func (s *AdminTokenStore) Available(ctx context.Context) bool {
 		return false
 	}
 	var count int64
-	if err := s.silentDB().WithContext(ctx).Model(&AdminToken{}).Count(&count).Error; err != nil {
+	if err := s.silentDB().WithContext(ctx).Model(&AdminToken{}).
+		Where("revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", s.currentTime()).
+		Count(&count).Error; err != nil {
 		return false
 	}
 	return count > 0
