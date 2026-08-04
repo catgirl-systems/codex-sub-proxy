@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -385,5 +386,119 @@ func TestRetentionDefersActiveRequestPayloadUntilTerminal(t *testing.T) {
 	}
 	if payloadCount != 0 {
 		t.Fatalf("terminal payload remains: %d", payloadCount)
+	}
+}
+func TestRetentionExpiresStandaloneAdminAuditsInBoundedBatches(t *testing.T) {
+	db, err := storage.Open(context.Background(), filepath.Join(t.TempDir(), "admin-audits.sqlite3"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := MigrateJournal(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateAdminTokens(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store := newAdminTokenStoreWithClock(db, []byte("admin-hmac"), func() time.Time { return now })
+	bootstrapRaw := adminTestToken()
+	if _, err := store.MaterializeBootstrap(context.Background(), []byte(bootstrapRaw)); err != nil {
+		t.Fatal(err)
+	}
+	actor, err := store.Authenticate(context.Background(), []byte(bootstrapRaw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const operationCount = 24
+	for index := range operationCount {
+		_, record, err := store.Create(context.Background(), AdminTokenCreateRequest{
+			Name:   fmt.Sprintf("retention-%02d", index),
+			Scopes: AdminTokenScopes{AdminScopeMetadata},
+		}, actor)
+		if err != nil {
+			t.Fatalf("create admin token %d: %v", index, err)
+		}
+		if _, err := store.Revoke(context.Background(), record.ID, actor); err != nil {
+			t.Fatalf("revoke admin token %d: %v", index, err)
+		}
+		records, err := store.List(context.Background(), maxAdminListLimit, 0)
+		if err != nil {
+			t.Fatalf("list admin tokens %d: %v", index, err)
+		}
+		if err := store.RecordListAudit(context.Background(), actor, len(records)); err != nil {
+			t.Fatalf("record list audit %d: %v", index, err)
+		}
+	}
+	if err := db.Create(&AuditRecord{
+		ID:        "request-owned-expired",
+		RequestID: "request-owned",
+		EventType: "request.audit",
+		Status:    200,
+		CreatedAt: now,
+		ExpiresAt: now.Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&AuditRecord{
+		ID:        "standalone-unexpired",
+		EventType: "admin_token.list",
+		Status:    200,
+		ExpiresAt: now.Add(adminAuditTTL + time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var expiredBefore int64
+	if err := db.Model(&AuditRecord{}).
+		Where("request_id = ? AND expires_at > ? AND expires_at <= ?", "", time.Time{}, now.Add(adminAuditTTL)).
+		Count(&expiredBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if expiredBefore < operationCount*3 {
+		t.Fatalf("expired standalone audits = %d, want at least %d", expiredBefore, operationCount*3)
+	}
+	runner, err := NewRetentionRunner(db, nil, RetentionConfig{
+		BatchSize:     7,
+		SweepInterval: time.Hour,
+		DrainDeadline: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.RunOnce(context.Background(), now.Add(adminAuditTTL)); err != nil {
+		t.Fatal(err)
+	}
+	var expiredAfterFirst int64
+	if err := db.Model(&AuditRecord{}).
+		Where("request_id = ? AND expires_at > ? AND expires_at <= ?", "", time.Time{}, now.Add(adminAuditTTL)).
+		Count(&expiredAfterFirst).Error; err != nil {
+		t.Fatal(err)
+	}
+	if expiredBefore-expiredAfterFirst > 7 {
+		t.Fatalf("first standalone audit sweep removed %d rows, want at most 7", expiredBefore-expiredAfterFirst)
+	}
+	for expiredAfterFirst > 0 {
+		if err := runner.RunOnce(context.Background(), now.Add(adminAuditTTL)); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Model(&AuditRecord{}).
+			Where("request_id = ? AND expires_at > ? AND expires_at <= ?", "", time.Time{}, now.Add(adminAuditTTL)).
+			Count(&expiredAfterFirst).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var requestOwned, unexpired int64
+	if err := db.Model(&AuditRecord{}).Where("id = ?", "request-owned-expired").Count(&requestOwned).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&AuditRecord{}).Where("id = ?", "standalone-unexpired").Count(&unexpired).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requestOwned != 1 || unexpired != 1 {
+		t.Fatalf("preserved audit counts request-owned/unexpired = %d/%d, want 1/1", requestOwned, unexpired)
 	}
 }

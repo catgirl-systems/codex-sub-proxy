@@ -212,7 +212,7 @@ func (r *RetentionRunner) workerDone() bool {
 	}
 }
 
-// RunOnce executes one bounded payload, artifact, and metadata sweep.
+// RunOnce executes one bounded payload, artifact, metadata, and standalone audit sweep.
 func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
 	if r == nil {
 		return errors.New("retention runner is nil")
@@ -233,7 +233,32 @@ func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
 	if err := r.sweepMetadata(ctx, now); err != nil {
 		errs = append(errs, err)
 	}
+	if err := r.sweepStandaloneAudits(ctx, now); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+func (r *RetentionRunner) sweepStandaloneAudits(ctx context.Context, now time.Time) error {
+	var audits []AuditRecord
+	if err := r.db.WithContext(ctx).
+		Where("request_id = ? AND expires_at > ? AND expires_at <= ?", "", time.Time{}, now).
+		Order("expires_at ASC").
+		Limit(r.batchSize).
+		Find(&audits).Error; err != nil {
+		return fmt.Errorf("load expired standalone audits: %w", err)
+	}
+	for _, audit := range audits {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.db.WithContext(ctx).
+			Where("id = ? AND request_id = ? AND expires_at > ? AND expires_at <= ?", audit.ID, "", time.Time{}, now).
+			Delete(&AuditRecord{}).Error; err != nil {
+			return fmt.Errorf("delete expired standalone audit %q: %w", audit.ID, err)
+		}
+	}
+	return nil
 }
 
 func (r *RetentionRunner) sweepPayloads(ctx context.Context, now time.Time) error {

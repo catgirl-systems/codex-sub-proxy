@@ -68,7 +68,7 @@ func newAdminApplication(readiness *Readiness, store *AdminTokenStore) (*iris.Ap
 		}
 		request, err := decodeAdminTokenCreateRequest(ctx)
 		if err != nil {
-			writeAdminError(ctx, http.StatusBadRequest, "Invalid admin token request.")
+			writeAdminDecodeError(ctx, err)
 			return
 		}
 		raw, record, err := store.Create(ctx.Request().Context(), request, principal)
@@ -240,6 +240,15 @@ func safeAdminTokenMetadata(record AdminToken) adminTokenMetadata {
 	}
 }
 
+func writeAdminDecodeError(ctx iris.Context, err error) {
+	var maxBytesError *http.MaxBytesError
+	if errors.As(err, &maxBytesError) {
+		writeAdminErrorCode(ctx, http.StatusRequestEntityTooLarge, "Request body is too large.", "request_too_large")
+		return
+	}
+	writeAdminError(ctx, http.StatusBadRequest, "Invalid admin token request.")
+}
+
 func writeAdminAuthError(ctx iris.Context, err error) {
 	if errors.Is(err, ErrAdminUnavailable) {
 		writeAdminError(ctx, http.StatusServiceUnavailable, "Administrative authentication is unavailable.")
@@ -274,6 +283,10 @@ func writeAdminOperationError(ctx iris.Context, err error) {
 }
 
 func writeAdminError(ctx iris.Context, status int, message string) {
+	writeAdminErrorCode(ctx, status, message, "admin_request_failed")
+}
+
+func writeAdminErrorCode(ctx iris.Context, status int, message, code string) {
 	writeJSON(ctx, status, struct {
 		Error struct {
 			Message string `json:"message"`
@@ -284,5 +297,5 @@ func writeAdminError(ctx iris.Context, status int, message string) {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 		Code    string `json:"code"`
-	}{Message: message, Type: "admin_error", Code: "admin_request_failed"}})
+	}{Message: message, Type: "admin_error", Code: code}})
 }

@@ -466,3 +466,195 @@ func TestAdminReadinessDoesNotChangeDataReadiness(t *testing.T) {
 		t.Fatalf("admin unavailable route status = %d, want 503", response.StatusCode)
 	}
 }
+func TestAdminMigrationFailureKeepsDataPlaneOperational(t *testing.T) {
+	db, err := storage.Open(context.Background(), t.TempDir()+"/poisoned.sqlite3", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := db.Exec("CREATE VIEW admin_tokens AS SELECT 1 AS id").Error; err != nil {
+		t.Fatal(err)
+	}
+	readiness := NewReadiness()
+	readiness.Set(true, true, func() CredentialSnapshot { return CredentialSnapshot{Available: true} })
+	servers, err := Start(Config{
+		Listen:              "127.0.0.1:0",
+		AdminListen:         "127.0.0.1:0",
+		Database:            db,
+		APIKeyHMACKey:       []byte("api-hmac"),
+		AdminTokenHMACKey:   []byte("admin-hmac"),
+		AdminBootstrapToken: []byte(adminTestToken()),
+	}, readiness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = servers.Shutdown(ctx)
+	})
+	client := &http.Client{Timeout: time.Second}
+	dataReady, err := client.Get("http://" + servers.DataAddr() + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataReady.Body.Close()
+	if dataReady.StatusCode != http.StatusOK {
+		t.Fatalf("data readiness status = %d, want 200", dataReady.StatusCode)
+	}
+	adminReady, err := client.Get("http://" + servers.AdminAddr() + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminReady.Body.Close()
+	if adminReady.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("admin readiness status = %d, want 503", adminReady.StatusCode)
+	}
+	dataRequest, err := http.NewRequest(http.MethodGet, "http://"+servers.DataAddr()+modelsEndpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataResponse, err := client.Do(dataRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataResponse.Body.Close()
+	if dataResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("data request status = %d, want 401", dataResponse.StatusCode)
+	}
+	adminRequest, err := http.NewRequest(http.MethodGet, "http://"+servers.AdminAddr()+adminTokensEndpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminRequest.Header.Set("Authorization", "Bearer "+adminTestToken())
+	adminResponse, err := client.Do(adminRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminResponse.Body.Close()
+	if adminResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("admin request status = %d, want 503", adminResponse.StatusCode)
+	}
+}
+
+type chunkedAdminBody struct {
+	reader *strings.Reader
+}
+
+func (body *chunkedAdminBody) Read(destination []byte) (int, error) {
+	return body.reader.Read(destination)
+}
+
+func TestAdminOversizedBodiesReturnStructured413WithoutMutation(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store, closeStore := openAdminTestStore(t, []byte("admin-hmac"), &now)
+	defer closeStore()
+	bootstrapRaw := adminTestToken()
+	if _, err := store.MaterializeBootstrap(context.Background(), []byte(bootstrapRaw)); err != nil {
+		t.Fatal(err)
+	}
+	app, err := newAdminApplication(NewReadiness(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(app)
+	defer httpServer.Close()
+	var beforeTokens, beforeAudits int64
+	if err := store.db.Model(&AdminToken{}).Count(&beforeTokens).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Model(&AuditRecord{}).Count(&beforeAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	requests := []struct {
+		name string
+		body interface {
+			Read([]byte) (int, error)
+		}
+	}{
+		{
+			name: "fixed length initial decode",
+			body: strings.NewReader(`{"name":"` + strings.Repeat("x", adminBodyLimit) + `","scopes":["metadata"]}`),
+		},
+		{
+			name: "chunked trailing decode",
+			body: &chunkedAdminBody{reader: strings.NewReader(`{"name":"oversized","scopes":["metadata"]}` + strings.Repeat(" ", adminBodyLimit) + `{}`)},
+		},
+	}
+	for _, test := range requests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, httpServer.URL+adminTokensEndpoint, test.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer "+bootstrapRaw)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			var payload struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusRequestEntityTooLarge || payload.Error.Code != "request_too_large" {
+				t.Fatalf("status/code = %d/%q, want 413/request_too_large", response.StatusCode, payload.Error.Code)
+			}
+		})
+	}
+	var afterTokens, afterAudits int64
+	if err := store.db.Model(&AdminToken{}).Count(&afterTokens).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Model(&AuditRecord{}).Count(&afterAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterTokens != beforeTokens || afterAudits != beforeAudits {
+		t.Fatalf("oversized requests changed token/audit counts from %d/%d to %d/%d", beforeTokens, beforeAudits, afterTokens, afterAudits)
+	}
+}
+
+func TestAdminMalformedAndTrailingJSONRemain400(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	store, closeStore := openAdminTestStore(t, []byte("admin-hmac"), &now)
+	defer closeStore()
+	bootstrapRaw := adminTestToken()
+	if _, err := store.MaterializeBootstrap(context.Background(), []byte(bootstrapRaw)); err != nil {
+		t.Fatal(err)
+	}
+	app, err := newAdminApplication(NewReadiness(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(app)
+	defer httpServer.Close()
+	for _, body := range []string{
+		`{"name":"bad","scopes":["metadata"],"unknown":true}`,
+		`{"name":"bad","scopes":["metadata"]}{}`,
+		`{"name":"bad","scopes":["metadata"]`,
+	} {
+		request, err := http.NewRequest(http.MethodPost, httpServer.URL+adminTokensEndpoint, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+bootstrapRaw)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("body %q status = %d, want 400", body, response.StatusCode)
+		}
+	}
+}
