@@ -444,7 +444,38 @@ func analyticsWhere(query *gorm.DB, filter analyticsFilter, alias string) *gorm.
 }
 
 func analyticsUsageJoin(filter analyticsFilter) (string, []any) {
-	return "LEFT JOIN (SELECT ux.request_id, SUM(ux.input_tokens) AS input_tokens, SUM(ux.cached_input_tokens) AS cached_input_tokens, SUM(ux.output_tokens) AS output_tokens, SUM(ux.reasoning_tokens) AS reasoning_tokens, SUM(ux.total_tokens) AS total_tokens, SUM(ux.image_count) AS image_count, SUM(ux.estimated_public_cost_microunits) AS estimated_cost, SUM(ux.allocated_subscription_cost_microunits) AS allocated_cost, SUM(ux.estimated_public_cost_microunits) AS quota_cost FROM usage AS ux JOIN requests AS ur ON ur.request_id = ux.request_id WHERE ur.accepted_at >= ? AND ur.accepted_at < ? GROUP BY ux.request_id) AS u ON u.request_id = r.request_id", []any{filter.From, filter.To}
+	return "LEFT JOIN (SELECT ux.request_id, SUM(ux.input_tokens) AS input_tokens, SUM(ux.cached_input_tokens) AS cached_input_tokens, SUM(ux.output_tokens) AS output_tokens, SUM(ux.reasoning_tokens) AS reasoning_tokens, SUM(ux.total_tokens) AS total_tokens, SUM(ux.image_count) AS image_count, SUM(ux.estimated_public_cost_microunits) AS estimated_cost, SUM(ux.allocated_subscription_cost_microunits) AS allocated_cost FROM usage AS ux JOIN requests AS ur ON ur.request_id = ux.request_id WHERE ur.accepted_at >= ? AND ur.accepted_at < ? GROUP BY ux.request_id) AS u ON u.request_id = r.request_id", []any{filter.From, filter.To}
+}
+
+func analyticsQuotaCost(tx *gorm.DB, filter analyticsFilter) (sql.NullInt64, error) {
+	if !tx.Migrator().HasTable("quota_reservations") {
+		return sql.NullInt64{}, nil
+	}
+	var cost sql.NullInt64
+	query := analyticsWhere(tx.Table("requests AS r").Joins("JOIN (SELECT request_id, MAX(actual_cost_microunits) AS cost FROM quota_reservations WHERE status = ? GROUP BY request_id) AS qr ON qr.request_id = r.request_id", "closed"), filter, "r")
+	if err := query.Select("SUM(qr.cost)").Scan(&cost).Error; err != nil {
+		return sql.NullInt64{}, fmt.Errorf("load finalized quota cost: %w", err)
+	}
+	return cost, nil
+}
+
+func analyticsQuotaCostBuckets(tx *gorm.DB, filter analyticsFilter, bucketExpression string) (map[string]sql.NullInt64, error) {
+	if !tx.Migrator().HasTable("quota_reservations") {
+		return map[string]sql.NullInt64{}, nil
+	}
+	var rows []struct {
+		Bucket string        `gorm:"column:bucket"`
+		Cost   sql.NullInt64 `gorm:"column:cost"`
+	}
+	query := analyticsWhere(tx.Table("requests AS r").Joins("JOIN (SELECT request_id, MAX(actual_cost_microunits) AS cost FROM quota_reservations WHERE status = ? GROUP BY request_id) AS qr ON qr.request_id = r.request_id", "closed"), filter, "r")
+	if err := query.Select(bucketExpression + " AS bucket, SUM(qr.cost) AS cost").Group("bucket").Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("load finalized quota cost buckets: %w", err)
+	}
+	result := make(map[string]sql.NullInt64, len(rows))
+	for _, row := range rows {
+		result[row.Bucket] = row.Cost
+	}
+	return result, nil
 }
 
 func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewResponse, error) {
@@ -463,12 +494,11 @@ func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewRe
 		Images    sql.NullInt64 `gorm:"column:image_count"`
 		Estimated sql.NullInt64 `gorm:"column:estimated_cost"`
 		Allocated sql.NullInt64 `gorm:"column:allocated_cost"`
-		Quota     sql.NullInt64 `gorm:"column:quota_cost"`
 	}
 	join, args := analyticsUsageJoin(filter)
 	query := tx.Table("requests AS r").Joins(join, args...)
 	query = analyticsWhere(query, filter, "r")
-	selectSQL := "COUNT(*) AS count, SUM(CASE WHEN r.status = 'running' THEN 1 ELSE 0 END) AS running, SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded, SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN r.status = 'canceled' THEN 1 ELSE 0 END) AS canceled, SUM(CASE WHEN r.status NOT IN ('running','succeeded','failed','canceled') THEN 1 ELSE 0 END) AS other, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost, SUM(u.quota_cost) AS quota_cost"
+	selectSQL := "COUNT(*) AS count, SUM(CASE WHEN r.status = 'running' THEN 1 ELSE 0 END) AS running, SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded, SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN r.status = 'canceled' THEN 1 ELSE 0 END) AS canceled, SUM(CASE WHEN r.status NOT IN ('running','succeeded','failed','canceled') THEN 1 ELSE 0 END) AS other, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost"
 	if err := query.Select(selectSQL).Scan(&aggregate).Error; err != nil {
 		return analyticsOverviewResponse{}, fmt.Errorf("load analytics overview: %w", err)
 	}
@@ -484,6 +514,10 @@ func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewRe
 	keyQuery := analyticsWhere(tx.Table("requests AS r"), filter, "r").Where("COALESCE(r.api_key_id, '') <> ''")
 	if err := keyQuery.Distinct("r.api_key_id").Count(&activeKeys).Error; err != nil {
 		return analyticsOverviewResponse{}, fmt.Errorf("count analytics keys: %w", err)
+	}
+	quotaCost, err := analyticsQuotaCost(tx, filter)
+	if err != nil {
+		return analyticsOverviewResponse{}, err
 	}
 	allocated := nullIntPtr(aggregate.Allocated)
 	buckets, allocationErr := analyticsAllocationBuckets(tx, filter)
@@ -517,7 +551,7 @@ func analyticsOverview(tx *gorm.DB, filter analyticsFilter) (analyticsOverviewRe
 		Costs: analyticsCostTotals{
 			EstimatedPublicCostMicrounits:       nullIntPtr(aggregate.Estimated),
 			AllocatedSubscriptionCostMicrounits: allocated,
-			QuotaAccountedCostMicrounits:        nullIntPtr(aggregate.Quota),
+			QuotaAccountedCostMicrounits:        nullIntPtr(quotaCost),
 			RoundingBasis:                       pricingRoundingBasis,
 			AllocationBasis:                     pricingAllocationBasis,
 		},
@@ -641,12 +675,11 @@ func analyticsQuotas(tx *gorm.DB, filter analyticsFilter) (analyticsQuotaRespons
 		Requests int64         `gorm:"column:request_count"`
 		Tokens   sql.NullInt64 `gorm:"column:tokens"`
 		Images   sql.NullInt64 `gorm:"column:images"`
-		Cost     sql.NullInt64 `gorm:"column:cost"`
 	}
 	usage := tx.Table("requests AS r").
-		Joins("JOIN (SELECT request_id, SUM(total_tokens) AS tokens, SUM(image_count) AS images, SUM(estimated_public_cost_microunits) AS cost FROM usage GROUP BY request_id) AS u ON u.request_id = r.request_id")
+		Joins("JOIN (SELECT request_id, SUM(total_tokens) AS tokens, SUM(image_count) AS images FROM usage GROUP BY request_id) AS u ON u.request_id = r.request_id")
 	usage = analyticsWhere(usage, filter, "r")
-	if err := usage.Select("COUNT(*) AS request_count, SUM(u.tokens) AS tokens, SUM(u.images) AS images, SUM(u.cost) AS cost").Scan(&accounted).Error; err != nil {
+	if err := usage.Select("COUNT(*) AS request_count, SUM(u.tokens) AS tokens, SUM(u.images) AS images").Scan(&accounted).Error; err != nil {
 		return analyticsQuotaResponse{}, fmt.Errorf("load durable quota usage: %w", err)
 	}
 	var pending struct {
@@ -667,12 +700,16 @@ func analyticsQuotas(tx *gorm.DB, filter analyticsFilter) (analyticsQuotaRespons
 	}
 	result.ReservedRequests = pending.Requests
 	result.ReservedTokens = pending.Tokens
+	quotaCost, err := analyticsQuotaCost(tx, filter)
+	if err != nil {
+		return analyticsQuotaResponse{}, err
+	}
 	result.ReservedImages = pending.Images
 	result.ReservedCostMicrounits = pending.Cost
 	result.QuotaAccountedRequests = accounted.Requests
 	result.QuotaAccountedTokens = nullInt(accounted.Tokens)
 	result.QuotaAccountedImages = nullInt(accounted.Images)
-	result.QuotaAccountedCostMicrounits = nullInt(accounted.Cost)
+	result.QuotaAccountedCostMicrounits = nullInt(quotaCost)
 	return result, nil
 }
 
@@ -695,12 +732,22 @@ func analyticsBuckets(tx *gorm.DB, filter analyticsFilter, costs bool) (analytic
 		}
 		query = query.Where(bucketExpression+" > ?", values[0])
 	}
-	selectSQL := bucketExpression + " AS bucket, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost, SUM(u.quota_cost) AS quota_accounted_cost"
+	selectSQL := bucketExpression + " AS bucket, COUNT(*) AS request_count, SUM(COALESCE(u.input_tokens,0)) AS input_tokens, SUM(COALESCE(u.cached_input_tokens,0)) AS cached_input_tokens, SUM(COALESCE(u.output_tokens,0)) AS output_tokens, SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens, SUM(COALESCE(u.total_tokens,0)) AS total_tokens, SUM(COALESCE(u.image_count,0)) AS image_count, SUM(u.estimated_cost) AS estimated_cost, SUM(u.allocated_cost) AS allocated_cost"
 	query = query.Select(selectSQL).Group("bucket").Order("bucket ASC").Limit(filter.Limit + 1)
 	if err := query.Find(&rows).Error; err != nil {
 		return analyticsResponse{}, fmt.Errorf("load analytics buckets: %w", err)
 	}
 	if costs {
+		quotaByBucket, err := analyticsQuotaCostBuckets(tx, filter, bucketExpression)
+		if err != nil {
+			return analyticsResponse{}, err
+		}
+		for index := range rows {
+			if cost, ok := quotaByBucket[rows[index].Bucket]; ok && cost.Valid {
+				value := cost.Int64
+				rows[index].QuotaAccountedCost = &value
+			}
+		}
 		allocationByBucket, err := analyticsAllocationBuckets(tx, filter)
 		if err != nil {
 			return analyticsResponse{}, err

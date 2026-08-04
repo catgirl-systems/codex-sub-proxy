@@ -220,7 +220,7 @@ func TestAnalyticsQuotaAndCostUseFilteredDurableUsage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	targetCost := int64(7)
+	targetCost := int64(70)
 	otherCost := int64(90)
 	for _, usage := range []UsageRecord{
 		{ReplayID: "quota-target-usage", RequestID: "quota-target", InputTokens: 2, TotalTokens: 5, EstimatedPublicCostMicrounits: &targetCost, CreatedAt: targetAt},
@@ -231,9 +231,9 @@ func TestAnalyticsQuotaAndCostUseFilteredDurableUsage(t *testing.T) {
 		}
 	}
 	if err := db.Create(&apikey.QuotaReservation{
-		ID: "pending-target", KeyID: "k", RequestID: "quota-target", OwnerID: "owner",
+		ID: "closed-target", KeyID: "k", RequestID: "quota-target", OwnerID: "owner",
 		PeriodStart: targetAt.Truncate(24 * time.Hour), RequestedRequests: 1, RequestedTokens: 5,
-		Status: "pending", CreatedAt: targetAt,
+		ActualRequests: 1, ActualTokens: 5, ActualCostMicrounits: 7, Status: "closed", CreatedAt: targetAt,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestAnalyticsQuotaAndCostUseFilteredDurableUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quota.QuotaAccountedRequests != 1 || quota.QuotaAccountedTokens != 5 || quota.QuotaAccountedCostMicrounits != 7 || quota.PendingRequests != 1 {
+	if quota.QuotaAccountedRequests != 1 || quota.QuotaAccountedTokens != 5 || quota.QuotaAccountedCostMicrounits != 7 || quota.PendingRequests != 0 {
 		t.Fatalf("filtered quota = %+v", quota)
 	}
 	costs, err := analyticsBuckets(db, filter, true)
