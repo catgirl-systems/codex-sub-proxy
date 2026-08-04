@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/kataras/iris/v12"
 )
 
@@ -23,6 +22,7 @@ type Readiness struct {
 	credentialSnapshot func() CredentialSnapshot
 	retentionSnapshot  func() RetentionHealth
 	adminSnapshot      func() bool
+	analyticsSnapshot  func() bool
 }
 
 type ReadinessSnapshot struct {
@@ -33,8 +33,10 @@ type ReadinessSnapshot struct {
 	Retention       bool   `json:"retention"`
 	RetentionError  string `json:"retention_error,omitempty"`
 	Admin           bool   `json:"admin"`
+	Analytics       bool   `json:"analytics"`
 	retentionSet    bool
 	adminSet        bool
+	analyticsSet    bool
 }
 
 func NewReadiness() *Readiness {
@@ -65,6 +67,13 @@ func (r *Readiness) SetAdminSource(source func() bool) {
 	r.mu.Unlock()
 }
 
+// SetAnalyticsSource connects immutable input health to admin readiness.
+func (r *Readiness) SetAnalyticsSource(source func() bool) {
+	r.mu.Lock()
+	r.analyticsSnapshot = source
+	r.mu.Unlock()
+}
+
 func (r *Readiness) Snapshot() ReadinessSnapshot {
 	r.mu.RLock()
 	snapshot := ReadinessSnapshot{
@@ -74,6 +83,7 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 	credential := r.credentialSnapshot
 	retention := r.retentionSnapshot
 	admin := r.adminSnapshot
+	analytics := r.analyticsSnapshot
 	r.mu.RUnlock()
 	if credential != nil {
 		current := credential()
@@ -92,6 +102,10 @@ func (r *Readiness) Snapshot() ReadinessSnapshot {
 		snapshot.adminSet = true
 		snapshot.Admin = admin()
 	}
+	if analytics != nil {
+		snapshot.analyticsSet = true
+		snapshot.Analytics = analytics()
+	}
 	return snapshot
 }
 
@@ -100,10 +114,10 @@ func (s ReadinessSnapshot) Ready() bool {
 }
 
 func (s ReadinessSnapshot) AdminReady() bool {
-	if !s.adminSet {
+	if !s.adminSet && !s.analyticsSet {
 		return s.Ready()
 	}
-	return s.Ready() && s.Admin
+	return s.Ready() && (!s.adminSet || s.Admin) && (!s.analyticsSet || s.Analytics)
 }
 
 func buildHealthApplication(readiness *Readiness) *iris.Application {
@@ -242,12 +256,12 @@ func finishJournalRequest(ctx iris.Context, journal *Journal, request JournalReq
 	}
 }
 
-func recordJournalUsage(ctx iris.Context, usage apikey.QuotaUsage) {
+func recordJournalUsageDetails(ctx iris.Context, usage JournalUsage) {
 	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
 	if !ok || value == nil || value.journal == nil {
 		return
 	}
-	if err := value.journal.RecordUsage(ctx.Request().Context(), value.request, 0, usage.Tokens, usage.Tokens, usage.Images); err != nil {
+	if err := value.journal.RecordUsageDetails(ctx.Request().Context(), value.request, usage); err != nil {
 		value.journal.recordError(err)
 	}
 }

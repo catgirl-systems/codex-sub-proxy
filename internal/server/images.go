@@ -163,7 +163,9 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
-		recordJournalUsage(ctx, usage)
+		journalUsage := journalUsageFromCodex(result.Usage, len(result.Images))
+		journalUsage.ResolvedModel = publicRequest.Model
+		recordJournalUsageDetails(ctx, journalUsage)
 		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
 			markJournalTerminal(ctx, requestStatusFailed, "")
 			return
@@ -321,7 +323,9 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
-		recordJournalUsage(ctx, usage)
+		journalUsage := journalUsageFromCodex(result.Usage, len(result.Images))
+		journalUsage.ResolvedModel = publicRequest.Model
+		recordJournalUsageDetails(ctx, journalUsage)
 		if err := writeJSON(ctx, http.StatusOK, response); err != nil {
 			markJournalTerminal(ctx, requestStatusFailed, "")
 			return

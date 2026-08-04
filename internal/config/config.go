@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -40,6 +41,44 @@ type Config struct {
 	Codex     CodexConfig     `toml:"codex"`
 	Journal   JournalConfig   `toml:"journal"`
 	Retention RetentionConfig `toml:"retention"`
+	Pricing   PricingConfig   `toml:"pricing"`
+}
+
+// PricingConfig contains immutable public pricing and subscription inputs.
+type PricingConfig struct {
+	Versions                       []PricingVersionConfig                `toml:"versions"`
+	SubscriptionAllocationVersions []SubscriptionAllocationVersionConfig `toml:"subscription_allocation_versions"`
+}
+
+// PricingVersionConfig defines one public price catalog version.
+type PricingVersionConfig struct {
+	ID          string             `toml:"id" json:"id"`
+	EffectiveAt time.Time          `toml:"effective_at" json:"effective_at"`
+	Currency    string             `toml:"currency" json:"currency"`
+	Models      []ModelPriceConfig `toml:"models" json:"models"`
+}
+
+// ModelPriceConfig defines integer public rates for one model.
+type ModelPriceConfig struct {
+	ModelID                         string `toml:"model_id" json:"model_id"`
+	InputMicrounitsPerMillion       int64  `toml:"input_microunits_per_million" json:"input_microunits_per_million"`
+	CachedInputMicrounitsPerMillion int64  `toml:"cached_input_microunits_per_million" json:"cached_input_microunits_per_million"`
+	OutputMicrounitsPerMillion      int64  `toml:"output_microunits_per_million" json:"output_microunits_per_million"`
+	ReasoningMicrounitsPerMillion   int64  `toml:"reasoning_microunits_per_million" json:"reasoning_microunits_per_million"`
+	ImageMicrounitsPerImage         int64  `toml:"image_microunits_per_image" json:"image_microunits_per_image"`
+	InputMicrounitsPer1M            *int64 `toml:"input_microunits_per_1m" json:"input_microunits_per_1m,omitempty"`
+	CachedInputMicrounitsPer1M      *int64 `toml:"cached_input_microunits_per_1m" json:"cached_input_microunits_per_1m,omitempty"`
+	OutputMicrounitsPer1M           *int64 `toml:"output_microunits_per_1m" json:"output_microunits_per_1m,omitempty"`
+	ReasoningMicrounitsPer1M        *int64 `toml:"reasoning_microunits_per_1m" json:"reasoning_microunits_per_1m,omitempty"`
+}
+
+// SubscriptionAllocationVersionConfig defines one monthly allocation input.
+type SubscriptionAllocationVersionConfig struct {
+	ID                    string    `toml:"id" json:"id"`
+	EffectiveAt           time.Time `toml:"effective_at" json:"effective_at"`
+	Currency              string    `toml:"currency" json:"currency"`
+	MonthlyCostMicrounits int64     `toml:"monthly_cost_microunits" json:"monthly_cost_microunits"`
+	AllocationBasis       string    `toml:"allocation_basis" json:"allocation_basis"`
 }
 
 type ServerConfig struct {
@@ -235,15 +274,147 @@ func Load(path string) (Config, error) {
 	if err := applyEnvironment(&cfg); err != nil {
 		return Config{}, err
 	}
+
 	artifactRoot, err := normalizeArtifactRoot(cfg.Storage.ArtifactRoot)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.Storage.ArtifactRoot = artifactRoot
+	if err := validatePricingConfig(&cfg.Pricing); err != nil {
+		return Config{}, fmt.Errorf("validate pricing configuration: %w", err)
+	}
 	if err := configurationValidation.Struct(cfg); err != nil {
 		return Config{}, fmt.Errorf("validate configuration: %w", err)
 	}
 	return cfg, nil
+}
+
+const (
+	maxPricingVersionIDLength = 64
+	maxPricingModels          = 4096
+	pricingCurrencyUSD        = "USD"
+	pricingAllocationBasis    = "proportional_public_estimated_cost"
+)
+
+func validatePricingConfig(pricing *PricingConfig) error {
+	if pricing == nil {
+		return errors.New("pricing configuration is nil")
+	}
+	if len(pricing.Versions) > 16 || len(pricing.SubscriptionAllocationVersions) > 16 {
+		return errors.New("pricing configuration has too many versions")
+	}
+	pricingIDs := make(map[string]struct{}, len(pricing.Versions))
+	for index := range pricing.Versions {
+		version := &pricing.Versions[index]
+		if err := validatePricingVersion(version); err != nil {
+			return fmt.Errorf("pricing version %d: %w", index, err)
+		}
+		if _, exists := pricingIDs[version.ID]; exists {
+			return fmt.Errorf("duplicate pricing version ID %q", version.ID)
+		}
+		pricingIDs[version.ID] = struct{}{}
+	}
+	allocationIDs := make(map[string]struct{}, len(pricing.SubscriptionAllocationVersions))
+	for index := range pricing.SubscriptionAllocationVersions {
+		version := &pricing.SubscriptionAllocationVersions[index]
+		if err := validateSubscriptionAllocationVersion(version); err != nil {
+			return fmt.Errorf("subscription allocation version %d: %w", index, err)
+		}
+		if _, exists := allocationIDs[version.ID]; exists {
+			return fmt.Errorf("duplicate subscription allocation version ID %q", version.ID)
+		}
+		allocationIDs[version.ID] = struct{}{}
+	}
+	return nil
+}
+
+func validatePricingVersion(version *PricingVersionConfig) error {
+	if version == nil || strings.TrimSpace(version.ID) == "" || version.ID != strings.TrimSpace(version.ID) || len(version.ID) > maxPricingVersionIDLength {
+		return errors.New("version ID is empty, too long, or not trimmed")
+	}
+	if version.EffectiveAt.IsZero() || version.EffectiveAt.Location() != time.UTC {
+		return errors.New("effective time must be an explicit UTC instant")
+	}
+	if version.Currency != pricingCurrencyUSD {
+		return errors.New("currency must be USD")
+	}
+	if len(version.Models) == 0 || len(version.Models) > maxPricingModels {
+		return errors.New("model price list is empty or too large")
+	}
+	seen := make(map[string]struct{}, len(version.Models))
+	for index := range version.Models {
+		model := &version.Models[index]
+		if err := normalizeModelPrice(model); err != nil {
+			return fmt.Errorf("model price %d: %w", index, err)
+		}
+		if strings.TrimSpace(model.ModelID) == "" || model.ModelID != strings.TrimSpace(model.ModelID) || len(model.ModelID) > 256 {
+			return errors.New("model ID is empty, too long, or not trimmed")
+		}
+		if _, exists := seen[model.ModelID]; exists {
+			return fmt.Errorf("duplicate model ID %q", model.ModelID)
+		}
+		seen[model.ModelID] = struct{}{}
+		rates := []int64{
+			model.InputMicrounitsPerMillion,
+			model.CachedInputMicrounitsPerMillion,
+			model.OutputMicrounitsPerMillion,
+			model.ReasoningMicrounitsPerMillion,
+			model.ImageMicrounitsPerImage,
+		}
+		for _, rate := range rates {
+			if rate < 0 {
+				return errors.New("rates must not be negative")
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeModelPrice(model *ModelPriceConfig) error {
+	if model == nil {
+		return errors.New("model price is nil")
+	}
+	aliases := []*int64{
+		model.InputMicrounitsPer1M,
+		model.CachedInputMicrounitsPer1M,
+		model.OutputMicrounitsPer1M,
+		model.ReasoningMicrounitsPer1M,
+	}
+	targets := []*int64{
+		&model.InputMicrounitsPerMillion,
+		&model.CachedInputMicrounitsPerMillion,
+		&model.OutputMicrounitsPerMillion,
+		&model.ReasoningMicrounitsPerMillion,
+	}
+	for index, alias := range aliases {
+		if alias == nil {
+			continue
+		}
+		if *targets[index] != 0 && *targets[index] != *alias {
+			return errors.New("rate aliases have different values")
+		}
+		*targets[index] = *alias
+	}
+	return nil
+}
+
+func validateSubscriptionAllocationVersion(version *SubscriptionAllocationVersionConfig) error {
+	if version == nil || strings.TrimSpace(version.ID) == "" || version.ID != strings.TrimSpace(version.ID) || len(version.ID) > maxPricingVersionIDLength {
+		return errors.New("version ID is empty, too long, or not trimmed")
+	}
+	if version.EffectiveAt.IsZero() || version.EffectiveAt.Location() != time.UTC {
+		return errors.New("effective time must be an explicit UTC instant")
+	}
+	if version.Currency != pricingCurrencyUSD {
+		return errors.New("currency must be USD")
+	}
+	if version.MonthlyCostMicrounits < 0 {
+		return errors.New("monthly cost must not be negative")
+	}
+	if version.AllocationBasis != pricingAllocationBasis {
+		return errors.New("allocation basis is unsupported")
+	}
+	return nil
 }
 
 func normalizeArtifactRoot(path string) (string, error) {
@@ -512,7 +683,141 @@ func applyEnvironment(cfg *Config) error {
 	if err := overrideDuration(&cfg.Retention.DrainDeadline, "CSP_RETENTION_DRAIN_DEADLINE"); err != nil {
 		return err
 	}
+	if err := applyPricingEnvironment(&cfg.Pricing); err != nil {
+		return err
+	}
 	return nil
+}
+func applyPricingEnvironment(pricing *PricingConfig) error {
+	if pricing == nil {
+		return errors.New("pricing configuration is nil")
+	}
+	if value, ok := os.LookupEnv("CSP_PRICING_VERSIONS_JSON"); ok {
+		var versions []PricingVersionConfig
+		if err := json.Unmarshal([]byte(value), &versions); err != nil {
+			return fmt.Errorf("parse CSP_PRICING_VERSIONS_JSON: %w", err)
+		}
+		pricing.Versions = versions
+	}
+	if value, ok := os.LookupEnv("CSP_SUBSCRIPTION_ALLOCATION_VERSIONS_JSON"); ok {
+		var versions []SubscriptionAllocationVersionConfig
+		if err := json.Unmarshal([]byte(value), &versions); err != nil {
+			return fmt.Errorf("parse CSP_SUBSCRIPTION_ALLOCATION_VERSIONS_JSON: %w", err)
+		}
+		pricing.SubscriptionAllocationVersions = versions
+	}
+	if hasPricingVersionEnvironment() {
+		version, err := pricingVersionFromEnvironment(*pricing)
+		if err != nil {
+			return err
+		}
+		if len(pricing.Versions) == 0 {
+			pricing.Versions = []PricingVersionConfig{version}
+		} else {
+			pricing.Versions[0] = version
+		}
+	}
+	if hasSubscriptionEnvironment() {
+		version, err := subscriptionVersionFromEnvironment(*pricing)
+		if err != nil {
+			return err
+		}
+		if len(pricing.SubscriptionAllocationVersions) == 0 {
+			pricing.SubscriptionAllocationVersions = []SubscriptionAllocationVersionConfig{version}
+		} else {
+			pricing.SubscriptionAllocationVersions[0] = version
+		}
+	}
+	return nil
+}
+
+func hasPricingVersionEnvironment() bool {
+	for _, name := range []string{
+		"CSP_PRICING_VERSION_ID",
+		"CSP_PRICING_EFFECTIVE_AT",
+		"CSP_PRICING_CURRENCY",
+		"CSP_PRICING_MODELS_JSON",
+	} {
+		if _, ok := os.LookupEnv(name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func pricingVersionFromEnvironment(pricing PricingConfig) (PricingVersionConfig, error) {
+	version := PricingVersionConfig{Currency: pricingCurrencyUSD}
+	if len(pricing.Versions) != 0 {
+		version = pricing.Versions[0]
+	}
+	overrideString(&version.ID, "CSP_PRICING_VERSION_ID")
+	overrideString(&version.Currency, "CSP_PRICING_CURRENCY")
+	if value, ok := os.LookupEnv("CSP_PRICING_EFFECTIVE_AT"); ok {
+		effective, err := parseUTCInstant(value)
+		if err != nil {
+			return PricingVersionConfig{}, fmt.Errorf("parse CSP_PRICING_EFFECTIVE_AT: %w", err)
+		}
+		version.EffectiveAt = effective
+	}
+	if value, ok := os.LookupEnv("CSP_PRICING_MODELS_JSON"); ok {
+		var models []ModelPriceConfig
+		if err := json.Unmarshal([]byte(value), &models); err != nil {
+			return PricingVersionConfig{}, fmt.Errorf("parse CSP_PRICING_MODELS_JSON: %w", err)
+		}
+		version.Models = models
+	}
+	return version, nil
+}
+
+func hasSubscriptionEnvironment() bool {
+	for _, name := range []string{
+		"CSP_SUBSCRIPTION_ALLOCATION_VERSION_ID",
+		"CSP_SUBSCRIPTION_ALLOCATION_EFFECTIVE_AT",
+		"CSP_SUBSCRIPTION_ALLOCATION_CURRENCY",
+		"CSP_SUBSCRIPTION_ALLOCATION_MONTHLY_COST_MICROUNITS",
+		"CSP_SUBSCRIPTION_ALLOCATION_BASIS",
+	} {
+		if _, ok := os.LookupEnv(name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func subscriptionVersionFromEnvironment(pricing PricingConfig) (SubscriptionAllocationVersionConfig, error) {
+	version := SubscriptionAllocationVersionConfig{Currency: pricingCurrencyUSD, AllocationBasis: pricingAllocationBasis}
+	if len(pricing.SubscriptionAllocationVersions) != 0 {
+		version = pricing.SubscriptionAllocationVersions[0]
+	}
+	overrideString(&version.ID, "CSP_SUBSCRIPTION_ALLOCATION_VERSION_ID")
+	overrideString(&version.Currency, "CSP_SUBSCRIPTION_ALLOCATION_CURRENCY")
+	overrideString(&version.AllocationBasis, "CSP_SUBSCRIPTION_ALLOCATION_BASIS")
+	if value, ok := os.LookupEnv("CSP_SUBSCRIPTION_ALLOCATION_EFFECTIVE_AT"); ok {
+		effective, err := parseUTCInstant(value)
+		if err != nil {
+			return SubscriptionAllocationVersionConfig{}, fmt.Errorf("parse CSP_SUBSCRIPTION_ALLOCATION_EFFECTIVE_AT: %w", err)
+		}
+		version.EffectiveAt = effective
+	}
+	if value, ok := os.LookupEnv("CSP_SUBSCRIPTION_ALLOCATION_MONTHLY_COST_MICROUNITS"); ok {
+		cost, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			return SubscriptionAllocationVersionConfig{}, fmt.Errorf("parse CSP_SUBSCRIPTION_ALLOCATION_MONTHLY_COST_MICROUNITS: %w", err)
+		}
+		version.MonthlyCostMicrounits = cost
+	}
+	return version, nil
+}
+
+func parseUTCInstant(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}, err
+	}
+	if parsed.Location() != time.UTC {
+		return time.Time{}, errors.New("timestamp must use UTC Z")
+	}
+	return parsed, nil
 }
 
 func overrideString(dst *string, names ...string) {

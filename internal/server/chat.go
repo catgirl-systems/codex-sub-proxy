@@ -279,7 +279,9 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
-		recordJournalUsage(ctx, usage)
+		journalUsage := journalUsageFromCodex(result.Response.Usage, 0)
+		journalUsage.ResolvedModel = result.Response.Model
+		recordJournalUsageDetails(ctx, journalUsage)
 		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
 			handleJournalResponseError(ctx, err)
 			return
@@ -857,6 +859,8 @@ type chatCompletionUsage struct {
 	TotalTokens             int64                       `json:"total_tokens"`
 	PromptTokensDetails     chatPromptTokensDetails     `json:"prompt_tokens_details"`
 	CompletionTokensDetails chatCompletionTokensDetails `json:"completion_tokens_details"`
+	CachedTokensKnown       bool                        `json:"-"`
+	ReasoningTokensKnown    bool                        `json:"-"`
 }
 
 type chatPromptTokensDetails struct {
@@ -1013,6 +1017,17 @@ func chatFinishReason(response *codex.CodexResponse, toolCount int) string {
 	return "stop"
 }
 
+func journalUsageFromChatUsage(usage chatCompletionUsage) JournalUsage {
+	result := JournalUsage{
+		InputTokens:            usage.PromptTokens,
+		CachedInputTokens:      usage.PromptTokensDetails.CachedTokens,
+		CachedInputTokensKnown: usage.CachedTokensKnown,
+		ReasoningTokens:        usage.CompletionTokensDetails.ReasoningTokens,
+		ReasoningTokensKnown:   usage.ReasoningTokensKnown,
+	}
+	return result
+}
+
 func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 	result := chatCompletionUsage{}
 	if usage == nil {
@@ -1031,17 +1046,20 @@ func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 		result.TotalTokens = result.PromptTokens + result.CompletionTokens
 	}
 	result.PromptTokensDetails.CachedTokens = int64(usage.PromptCacheHitTokens)
+	result.CachedTokensKnown = usage.PromptCacheHitTokens > 0
 	if usage.InputTokensDetails != nil {
 		if usage.InputTokensDetails.CachedTokens < 0 || usage.InputTokensDetails.ImageTokens < 0 || usage.InputTokensDetails.TextTokens < 0 {
 			return result, errors.New("upstream usage is invalid")
 		}
 		result.PromptTokensDetails.CachedTokens = int64(usage.InputTokensDetails.CachedTokens)
+		result.CachedTokensKnown = true
 	}
 	if usage.OutputTokensDetails != nil {
 		if usage.OutputTokensDetails.ReasoningTokens < 0 || usage.OutputTokensDetails.ImageTokens < 0 || usage.OutputTokensDetails.TextTokens < 0 {
 			return result, errors.New("upstream usage is invalid")
 		}
 		result.CompletionTokensDetails.ReasoningTokens = int64(usage.OutputTokensDetails.ReasoningTokens)
+		result.ReasoningTokensKnown = true
 	}
 	return result, nil
 }
@@ -1113,7 +1131,11 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 		return
 	}
 	if state.mappedUsage != nil {
-		recordJournalUsage(ctx, apikey.QuotaUsage{Tokens: state.mappedUsage.TotalTokens})
+		journalUsage := journalUsageFromChatUsage(*state.mappedUsage)
+		if state.response != nil {
+			journalUsage.ResolvedModel = state.response.Model
+		}
+		recordJournalUsageDetails(ctx, journalUsage)
 	}
 	if includeUsage {
 		usage := *state.mappedUsage

@@ -138,6 +138,27 @@ func quotaUsageFromCodex(usage *codex.CodexUsage, images int) apikey.QuotaUsage 
 	return result
 }
 
+func journalUsageFromCodex(usage *codex.CodexUsage, images int) JournalUsage {
+	result := JournalUsage{ImageCount: int64(images)}
+	if usage == nil {
+		return result
+	}
+	result.InputTokens = int64(usage.InputTokens)
+	result.OutputTokens = int64(usage.OutputTokens)
+	result.TotalTokens = int64(usage.TotalTokens)
+	result.CachedInputTokens = int64(usage.PromptCacheHitTokens)
+	result.CachedInputTokensKnown = usage.PromptCacheHitTokens > 0
+	if usage.InputTokensDetails != nil {
+		result.CachedInputTokens = int64(usage.InputTokensDetails.CachedTokens)
+		result.CachedInputTokensKnown = true
+	}
+	if usage.OutputTokensDetails != nil {
+		result.ReasoningTokens = int64(usage.OutputTokensDetails.ReasoningTokens)
+		result.ReasoningTokensKnown = true
+	}
+	return result
+}
+
 func validateQuotaUsageFromCodex(usage *codex.CodexUsage) error {
 	if usage == nil {
 		return nil

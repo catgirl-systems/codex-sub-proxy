@@ -75,8 +75,11 @@ type RequestRecord struct {
 	APIKeyID         string     `gorm:"column:api_key_id;size:255;index"`
 	Endpoint         string     `gorm:"column:endpoint;not null;size:128;index"`
 	Model            string     `gorm:"column:model;not null;size:256;index"`
+	RequestedModel   string     `gorm:"column:requested_model;size:256;index"`
+	ResolvedModel    string     `gorm:"column:resolved_model;size:256;index"`
 	Mode             string     `gorm:"column:journal_mode;not null;size:16"`
 	Status           string     `gorm:"column:status;not null;size:16;index"`
+	CreatedAt        time.Time  `gorm:"column:created_at;not null;index:idx_requests_created"`
 	AcceptedAt       time.Time  `gorm:"column:accepted_at;not null;index"`
 	StartedAt        time.Time  `gorm:"column:started_at;not null"`
 	UpdatedAt        time.Time  `gorm:"column:updated_at;not null;index"`
@@ -84,6 +87,8 @@ type RequestRecord struct {
 	ExpiresAt        time.Time  `gorm:"column:expires_at;not null;index"`
 	TerminalReplayID string     `gorm:"column:terminal_replay_id;size:36"`
 	TerminalConflict bool       `gorm:"column:terminal_conflict;not null;default:false"`
+	ErrorCode        string     `gorm:"column:error_code;size:128;index"`
+	ErrorClass       string     `gorm:"column:error_class;size:128;index"`
 	DeletingAt       *time.Time `gorm:"column:deleting_at;index"`
 }
 
@@ -114,15 +119,24 @@ type StreamEventRecord struct {
 
 func (StreamEventRecord) TableName() string { return "stream_events" }
 
-// UsageRecord stores bounded, non-secret usage counters.
+// UsageRecord stores bounded, non-secret usage counters and reproducible estimates.
 type UsageRecord struct {
-	ReplayID     string    `gorm:"column:replay_id;primaryKey;size:36"`
-	RequestID    string    `gorm:"column:request_id;not null;size:36;index"`
-	InputTokens  int64     `gorm:"column:input_tokens;not null;default:0"`
-	OutputTokens int64     `gorm:"column:output_tokens;not null;default:0"`
-	TotalTokens  int64     `gorm:"column:total_tokens;not null;default:0"`
-	ImageCount   int64     `gorm:"column:image_count;not null;default:0"`
-	CreatedAt    time.Time `gorm:"column:created_at;not null;index"`
+	ReplayID                            string    `gorm:"column:replay_id;primaryKey;size:36"`
+	RequestID                           string    `gorm:"column:request_id;not null;size:36;index"`
+	InputTokens                         int64     `gorm:"column:input_tokens;not null;default:0"`
+	CachedInputTokens                   int64     `gorm:"column:cached_input_tokens;not null;default:0"`
+	CachedInputTokensKnown              bool      `gorm:"column:cached_input_tokens_known;not null;default:false"`
+	OutputTokens                        int64     `gorm:"column:output_tokens;not null;default:0"`
+	ReasoningTokens                     int64     `gorm:"column:reasoning_tokens;not null;default:0"`
+	ReasoningTokensKnown                bool      `gorm:"column:reasoning_tokens_known;not null;default:false"`
+	TotalTokens                         int64     `gorm:"column:total_tokens;not null;default:0"`
+	ImageCount                          int64     `gorm:"column:image_count;not null;default:0"`
+	PricedModel                         string    `gorm:"column:priced_model;size:256;index"`
+	PricingVersionID                    *string   `gorm:"column:pricing_version_id;size:64;index"`
+	EstimatedPublicCostMicrounits       *int64    `gorm:"column:estimated_public_cost_microunits"`
+	AllocationVersionID                 *string   `gorm:"column:allocation_version_id;size:64;index"`
+	AllocatedSubscriptionCostMicrounits *int64    `gorm:"column:allocated_subscription_cost_microunits"`
+	CreatedAt                           time.Time `gorm:"column:created_at;not null;index"`
 }
 
 func (UsageRecord) TableName() string { return "usage" }
@@ -164,11 +178,16 @@ type lifecycleTerminalPayload struct {
 }
 
 type lifecycleUsagePayload struct {
-	Version      uint16 `json:"version"`
-	InputTokens  int64  `json:"input_tokens"`
-	OutputTokens int64  `json:"output_tokens"`
-	TotalTokens  int64  `json:"total_tokens"`
-	ImageCount   int64  `json:"image_count"`
+	Version                uint16 `json:"version"`
+	InputTokens            int64  `json:"input_tokens"`
+	CachedInputTokens      int64  `json:"cached_input_tokens,omitempty"`
+	CachedInputTokensKnown bool   `json:"cached_input_tokens_known,omitempty"`
+	OutputTokens           int64  `json:"output_tokens"`
+	ReasoningTokens        int64  `json:"reasoning_tokens,omitempty"`
+	ReasoningTokensKnown   bool   `json:"reasoning_tokens_known,omitempty"`
+	TotalTokens            int64  `json:"total_tokens"`
+	ImageCount             int64  `json:"image_count"`
+	ResolvedModel          string `json:"resolved_model,omitempty"`
 }
 
 func migrateLifecycle(db *gorm.DB) error {
@@ -227,13 +246,12 @@ func lifecycleTerminalBytes(state string, detail []byte) ([]byte, error) {
 	return encoded, nil
 }
 
-func lifecycleUsageBytes(input, output, total, images int64) ([]byte, error) {
-	if input < 0 || output < 0 || total < 0 || images < 0 {
+func lifecycleUsageDetailsBytes(value lifecycleUsagePayload) ([]byte, error) {
+	if value.InputTokens < 0 || value.CachedInputTokens < 0 || value.OutputTokens < 0 || value.ReasoningTokens < 0 || value.TotalTokens < 0 || value.ImageCount < 0 {
 		return nil, errors.New("usage counters are negative")
 	}
-	value := lifecycleUsagePayload{
-		Version: lifecycleEventVersion, InputTokens: input, OutputTokens: output,
-		TotalTokens: total, ImageCount: images,
+	if value.CachedInputTokens > value.InputTokens || value.ReasoningTokens > value.OutputTokens {
+		return nil, errors.New("usage breakdown is invalid")
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
@@ -293,11 +311,14 @@ func validateLifecycleTerminal(value lifecycleTerminalPayload) error {
 }
 
 func validateLifecycleUsage(value lifecycleUsagePayload) error {
-	if value.Version != lifecycleEventVersion || value.InputTokens < 0 || value.OutputTokens < 0 || value.TotalTokens < 0 || value.ImageCount < 0 {
+	if value.Version != lifecycleEventVersion || value.InputTokens < 0 || value.CachedInputTokens < 0 || value.OutputTokens < 0 || value.ReasoningTokens < 0 || value.TotalTokens < 0 || value.ImageCount < 0 {
 		return errors.New("usage lifecycle payload is invalid")
 	}
+	if value.CachedInputTokens > value.InputTokens || value.ReasoningTokens > value.OutputTokens {
+		return errors.New("usage lifecycle payload breakdown is invalid")
+	}
 	const maxCounter = 1 << 31
-	if value.InputTokens > maxCounter || value.OutputTokens > maxCounter || value.TotalTokens > maxCounter || value.ImageCount > maxCounter {
+	if value.InputTokens > maxCounter || value.CachedInputTokens > maxCounter || value.OutputTokens > maxCounter || value.ReasoningTokens > maxCounter || value.TotalTokens > maxCounter || value.ImageCount > maxCounter {
 		return errors.New("usage lifecycle payload is too large")
 	}
 	return nil
@@ -414,7 +435,8 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 		row = RequestRecord{
 			ID: accepted.RequestID, ReplayID: source.ReplayID, ConversationID: accepted.ConversationID,
 			APIKeyID: accepted.APIKeyID, Endpoint: accepted.Endpoint, Model: accepted.Model,
-			Mode: accepted.Mode, Status: requestStatusRunning, AcceptedAt: source.CreatedAt,
+			RequestedModel: accepted.Model, Mode: accepted.Mode, Status: requestStatusRunning,
+			CreatedAt: source.CreatedAt, AcceptedAt: source.CreatedAt,
 			StartedAt: source.CreatedAt, UpdatedAt: source.CreatedAt,
 			ExpiresAt: source.CreatedAt.Add(j.metadataTTL),
 		}
@@ -520,17 +542,57 @@ func (j *Journal) ensureUsage(tx *gorm.DB, source JournalRecord, usage lifecycle
 	var existing UsageRecord
 	err := tx.Where("replay_id = ?", source.ReplayID).First(&existing).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		row := UsageRecord{ReplayID: source.ReplayID, RequestID: source.RequestID, InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens, ImageCount: usage.ImageCount, CreatedAt: source.CreatedAt}
+		row := UsageRecord{
+			ReplayID: source.ReplayID, RequestID: source.RequestID,
+			InputTokens: usage.InputTokens, CachedInputTokens: usage.CachedInputTokens,
+			CachedInputTokensKnown: usage.CachedInputTokensKnown,
+			OutputTokens:           usage.OutputTokens, ReasoningTokens: usage.ReasoningTokens,
+			ReasoningTokensKnown: usage.ReasoningTokensKnown, TotalTokens: usage.TotalTokens,
+			ImageCount: usage.ImageCount, CreatedAt: source.CreatedAt,
+		}
 		if err := tx.Create(&row).Error; err != nil {
 			return fmt.Errorf("store lifecycle usage: %w", err)
+		}
+		if usage.ResolvedModel != "" {
+			if err := setResolvedModel(tx, source.RequestID, usage.ResolvedModel); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("load lifecycle usage: %w", err)
 	}
-	if existing.RequestID != source.RequestID || existing.InputTokens != usage.InputTokens || existing.OutputTokens != usage.OutputTokens || existing.TotalTokens != usage.TotalTokens || existing.ImageCount != usage.ImageCount {
+	if existing.RequestID != source.RequestID ||
+		existing.InputTokens != usage.InputTokens ||
+		existing.CachedInputTokens != usage.CachedInputTokens ||
+		existing.CachedInputTokensKnown != usage.CachedInputTokensKnown ||
+		existing.OutputTokens != usage.OutputTokens ||
+		existing.ReasoningTokens != usage.ReasoningTokens ||
+		existing.ReasoningTokensKnown != usage.ReasoningTokensKnown ||
+		existing.TotalTokens != usage.TotalTokens ||
+		existing.ImageCount != usage.ImageCount {
 		return errors.New("lifecycle usage conflicts")
+	}
+	if usage.ResolvedModel != "" {
+		if err := setResolvedModel(tx, source.RequestID, usage.ResolvedModel); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func setResolvedModel(tx *gorm.DB, requestID, resolved string) error {
+	var row RequestRecord
+	if err := tx.Select("resolved_model").Where("request_id = ?", requestID).First(&row).Error; err != nil {
+		return fmt.Errorf("load resolved model: %w", err)
+	}
+	if row.ResolvedModel != "" && row.ResolvedModel != resolved {
+		return errors.New("lifecycle resolved model conflicts")
+	}
+	if row.ResolvedModel == "" {
+		if err := tx.Model(&RequestRecord{}).Where("request_id = ? AND resolved_model = ?", requestID, "").Update("resolved_model", resolved).Error; err != nil {
+			return fmt.Errorf("store resolved model: %w", err)
+		}
 	}
 	return nil
 }
@@ -546,19 +608,28 @@ func (j *Journal) ensureTerminal(tx *gorm.DB, source JournalRecord, terminal lif
 	if err := tx.Where("request_id = ?", source.RequestID).First(&row).Error; err != nil {
 		return fmt.Errorf("load lifecycle terminal request: %w", err)
 	}
+	errorCode, errorClass := "", ""
+	if terminal.State == requestStatusFailed {
+		errorCode, errorClass = "request_failed", "upstream"
+	} else if terminal.State == requestStatusCanceled {
+		errorCode, errorClass = "request_canceled", "canceled"
+	}
+	terminalUpdates := map[string]any{
+		"status": terminal.State, "terminal_at": source.CreatedAt,
+		"terminal_replay_id": source.ReplayID, "updated_at": source.CreatedAt,
+		"expires_at": source.CreatedAt.Add(j.metadataTTL),
+		"error_code": errorCode, "error_class": errorClass,
+	}
 	if row.TerminalAt == nil {
 		now := source.CreatedAt
-		result := tx.Model(&RequestRecord{}).Where("request_id = ? AND terminal_at IS NULL", source.RequestID).Updates(map[string]any{
-			"status":             terminal.State,
-			"terminal_at":        now,
-			"terminal_replay_id": source.ReplayID,
-			"updated_at":         now,
-			"expires_at":         now.Add(j.metadataTTL),
-		})
+		result := tx.Model(&RequestRecord{}).Where("request_id = ? AND terminal_at IS NULL", source.RequestID).Updates(terminalUpdates)
 		if result.Error != nil {
 			return fmt.Errorf("set lifecycle terminal state: %w", result.Error)
 		}
 		if result.RowsAffected == 1 {
+			if err := j.reconcileUsagePricing(tx, source.RequestID, now); err != nil {
+				return err
+			}
 			if err := tx.Model(&ConversationRecord{}).Where("id = ?", row.ConversationID).Updates(map[string]any{"updated_at": now, "expires_at": now.Add(j.metadataTTL)}).Error; err != nil {
 				return fmt.Errorf("update lifecycle conversation expiry: %w", err)
 			}

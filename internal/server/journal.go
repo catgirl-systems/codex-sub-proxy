@@ -110,6 +110,7 @@ type journalWork struct {
 type Journal struct {
 	db            *gorm.DB
 	keys          envelope.KeySet
+	pricing       *PricingStore
 	mode          string
 	queue         chan journalWork
 	replayQueue   chan string
@@ -141,6 +142,12 @@ type Journal struct {
 	errorSink chan<- error
 }
 
+func (j *Journal) setPricingStore(pricing *PricingStore) {
+	if j != nil {
+		j.pricing = pricing
+	}
+}
+
 // MigrateJournal creates the journal, receipt, and lifecycle projection tables.
 func MigrateJournal(db *gorm.DB) error {
 	if db == nil {
@@ -148,6 +155,9 @@ func MigrateJournal(db *gorm.DB) error {
 	}
 	if err := db.AutoMigrate(&JournalRequestRecord{}, &JournalRecord{}, &JournalReceipt{}); err != nil {
 		return fmt.Errorf("migrate journal: %w", err)
+	}
+	if err := MigratePricing(db); err != nil {
+		return err
 	}
 	if err := migrateLifecycle(db); err != nil {
 		return err
@@ -462,9 +472,35 @@ func (j *Journal) appendInternal(ctx context.Context, state *journalRequestState
 	return nil
 }
 
+// JournalUsage contains the durable usage fields needed for reconciliation.
+type JournalUsage struct {
+	InputTokens            int64
+	CachedInputTokens      int64
+	CachedInputTokensKnown bool
+	OutputTokens           int64
+	ReasoningTokens        int64
+	ReasoningTokensKnown   bool
+	TotalTokens            int64
+	ImageCount             int64
+	ResolvedModel          string
+}
+
 // RecordUsage appends one bounded usage update.
 func (j *Journal) RecordUsage(ctx context.Context, request JournalRequest, input, output, total, images int64) error {
-	payload, err := lifecycleUsageBytes(input, output, total, images)
+	return j.RecordUsageDetails(ctx, request, JournalUsage{
+		InputTokens: input, OutputTokens: output, TotalTokens: total, ImageCount: images,
+	})
+}
+
+// RecordUsageDetails appends usage with optional cache, reasoning, and model data.
+func (j *Journal) RecordUsageDetails(ctx context.Context, request JournalRequest, usage JournalUsage) error {
+	payload, err := lifecycleUsageDetailsBytes(lifecycleUsagePayload{
+		Version: lifecycleEventVersion, InputTokens: usage.InputTokens,
+		CachedInputTokens: usage.CachedInputTokens, CachedInputTokensKnown: usage.CachedInputTokensKnown,
+		OutputTokens: usage.OutputTokens, ReasoningTokens: usage.ReasoningTokens,
+		ReasoningTokensKnown: usage.ReasoningTokensKnown, TotalTokens: usage.TotalTokens,
+		ImageCount: usage.ImageCount, ResolvedModel: usage.ResolvedModel,
+	})
 	if err != nil {
 		return err
 	}

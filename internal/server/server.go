@@ -4,14 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
-	"gorm.io/gorm"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"gorm.io/gorm"
 )
 
 const (
@@ -36,6 +38,7 @@ type Config struct {
 	JournalMode          string
 	JournalQueueCapacity int
 	JournalDrainDeadline time.Duration
+	Pricing              config.PricingConfig
 }
 
 type Servers struct {
@@ -64,6 +67,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		return nil, fmt.Errorf("admin listener address is empty")
 	}
 
+	var pricing *PricingStore
 	errorsChannel := make(chan error, 8)
 	var journal *Journal
 	var quota *apikey.QuotaStore
@@ -83,6 +87,16 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	if cfg.Database != nil {
 		if err := MigrateJournal(cfg.Database); err != nil {
 			return nil, err
+		}
+		var pricingErr error
+		pricing, pricingErr = InitializePricing(cfg.Database, cfg.Pricing)
+		if pricingErr != nil {
+			return nil, fmt.Errorf("initialize pricing: %w", pricingErr)
+		}
+		if readiness != nil {
+			readiness.SetAnalyticsSource(func() bool {
+				return pricing.Available()
+			})
 		}
 		if err := apikey.Migrate(cfg.Database); err != nil {
 			return nil, err
@@ -110,6 +124,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			return nil, err
 		}
 		journal.setErrorSink(errorsChannel)
+		journal.setPricingStore(pricing)
 		if err := journal.Replay(context.Background()); err != nil {
 			return nil, fmt.Errorf("replay journal: %w", err)
 		}
@@ -162,7 +177,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
 	adminHandler, err := newAdminApplicationWithLifecycle(readiness, adminStore, apiKeyStore, adminLifecycleDependencies{
-		db: cfg.Database, keys: cfg.PayloadKeys, artifacts: cfg.ArtifactStore, retention: retention,
+		db: cfg.Database, keys: cfg.PayloadKeys, artifacts: cfg.ArtifactStore, retention: retention, pricing: pricing,
 	})
 	if err != nil {
 		closeStarted()

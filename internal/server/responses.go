@@ -186,7 +186,9 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
-		recordJournalUsage(ctx, usage)
+		journalUsage := journalUsageFromCodex(result.Response.Usage, 0)
+		journalUsage.ResolvedModel = result.Response.Model
+		recordJournalUsageDetails(ctx, journalUsage)
 		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
 			handleJournalResponseError(ctx, err)
 			return
@@ -426,7 +428,9 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 			if err := lease.reconcile(usage); err != nil {
 				return err
 			}
-			recordJournalUsage(ctx, usage)
+			journalUsage := journalUsageFromCodex(event.Response.Usage, 0)
+			journalUsage.ResolvedModel = event.Response.Model
+			recordJournalUsageDetails(ctx, journalUsage)
 		}
 		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
 			return err

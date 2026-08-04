@@ -145,6 +145,7 @@ func newAdminApplicationWithLifecycle(readiness *Readiness, store *AdminTokenSto
 	})
 	registerAdminAPIKeyRoutes(app, store, apiKeyStore)
 	registerAdminLifecycleRoutes(app, store, lifecycle)
+	registerAdminAnalyticsRoutes(app, store, lifecycle)
 	if err := app.Build(); err != nil {
 		return nil, err
 	}

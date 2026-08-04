@@ -163,6 +163,7 @@ func run(args []string) error {
 		JournalMode:          string(cfg.Journal.Mode),
 		JournalQueueCapacity: cfg.Journal.QueueCapacity,
 		JournalDrainDeadline: cfg.Journal.DrainDeadline,
+		Pricing:              cfg.Pricing,
 	}, readiness)
 	if err != nil {
 		return err

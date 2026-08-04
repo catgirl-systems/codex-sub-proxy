@@ -44,6 +44,7 @@ type adminLifecycleDependencies struct {
 	keys      envelope.KeySet
 	artifacts *ArtifactStore
 	retention *RetentionRunner
+	pricing   *PricingStore
 }
 
 type adminLifecycleCursor struct {
