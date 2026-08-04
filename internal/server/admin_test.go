@@ -652,9 +652,18 @@ func TestAdminMalformedAndTrailingJSONRemain400(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		var payload struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
 		response.Body.Close()
-		if response.StatusCode != http.StatusBadRequest {
-			t.Fatalf("body %q status = %d, want 400", body, response.StatusCode)
+		if response.StatusCode != http.StatusBadRequest || payload.Error.Message != "Invalid admin token request." {
+			t.Fatalf("body %q response = %d/%q", body, response.StatusCode, payload.Error.Message)
 		}
 	}
 }

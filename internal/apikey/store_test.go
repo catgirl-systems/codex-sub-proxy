@@ -74,6 +74,87 @@ func TestCreateStoresOnlySafeKeyDataAndAuthorizesPolicy(t *testing.T) {
 	}
 }
 
+func TestAuthorizePrincipalReloadsCurrentPolicy(t *testing.T) {
+	db := testAPIKeyDatabase(t)
+	hmacKey := []byte("01234567890123456789012345678901")
+	authorizer := NewAuthorizer(db, hmacKey)
+	rawKey, record, err := Create(context.Background(), db, hmacKey, Policy{
+		Name:                  "key",
+		Owner:                 "owner",
+		AllowedEndpoints:      []string{"/v1/models"},
+		AllowedModels:         []string{"gpt-a"},
+		MaxConcurrentRequests: 1,
+		PeriodRequestLimit:    1,
+		PeriodDuration:        time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("create API key: %v", err)
+	}
+	stale, err := authorizer.Authenticate(context.Background(), rawKey)
+	if err != nil {
+		t.Fatalf("authenticate API key: %v", err)
+	}
+	if err := db.Model(&Record{}).Where("id = ?", record.ID).Updates(map[string]any{
+		"allowed_endpoints":       StringList([]string{"/v1/responses"}),
+		"allowed_models":          StringList([]string{"gpt-b"}),
+		"max_concurrent_requests": 7,
+		"period_request_limit":    11,
+		"period_duration":         int64(2 * time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("narrow API key policy: %v", err)
+	}
+	refreshed, err := authorizer.AuthorizePrincipal(context.Background(), stale, "/v1/responses", "gpt-b")
+	if err != nil {
+		t.Fatalf("authorize refreshed policy: %v", err)
+	}
+	if !slicesEqual(refreshed.AllowedEndpoints, []string{"/v1/responses"}) ||
+		!slicesEqual(refreshed.AllowedModels, []string{"gpt-b"}) {
+		t.Fatalf("refreshed allowlists = endpoints %v models %v", refreshed.AllowedEndpoints, refreshed.AllowedModels)
+	}
+	if refreshed.Policy.MaxConcurrentRequests != 7 || refreshed.Policy.PeriodRequestLimit != 11 ||
+		refreshed.Policy.PeriodDuration != 2*time.Hour {
+		t.Fatalf("refreshed quota policy = %+v", refreshed.Policy)
+	}
+	if _, err := authorizer.AuthorizePrincipal(context.Background(), stale, "/v1/models", "gpt-a"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("stale endpoint authorization error = %v, want forbidden", err)
+	}
+	if err := db.Model(&Record{}).Where("id = ?", record.ID).Update("disabled_at", time.Now().UTC()).Error; err != nil {
+		t.Fatalf("disable API key: %v", err)
+	}
+	if _, err := authorizer.AuthorizePrincipal(context.Background(), refreshed, "/v1/responses", "gpt-b"); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("disabled current authorization error = %v, want invalid key", err)
+	}
+}
+
+func TestCreateTxExpiryCrossingReturnsSentinelWithoutMutation(t *testing.T) {
+	db := testAPIKeyDatabase(t)
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	expiry := now.Add(time.Second)
+	store := NewStore(db, []byte("01234567890123456789012345678901"))
+	store.now = func() time.Time { return expiry }
+	policy := Policy{
+		Name:             "key",
+		Owner:            "owner",
+		AllowedEndpoints: []string{"/v1/models"},
+		ExpiresAt:        &expiry,
+	}
+	var createErr error
+	err := store.Transaction(context.Background(), func(tx *gorm.DB) error {
+		_, _, createErr = store.CreateTx(tx, policy)
+		return createErr
+	})
+	if !errors.Is(err, ErrInvalidExpiry) || !errors.Is(createErr, ErrInvalidExpiry) {
+		t.Fatalf("expiry crossing errors = transaction %v create %v", err, createErr)
+	}
+	var count int64
+	if err := db.Model(&Record{}).Count(&count).Error; err != nil {
+		t.Fatalf("count API keys: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("API key count after rejected expiry = %d, want 0", count)
+	}
+}
+
 func TestCreateRejectsDuplicatePolicyValues(t *testing.T) {
 	db := testAPIKeyDatabase(t)
 	cases := []Policy{

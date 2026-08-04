@@ -33,6 +33,15 @@ var (
 	ErrUnavailable = errors.New("API key authentication is unavailable")
 )
 
+// ErrInvalidExpiry indicates that an API key expiry is not strictly in the future.
+var ErrInvalidExpiry = errors.New("invalid API key expiry")
+
+func copyStrings(values []string) []string {
+	copied := make([]string, len(values))
+	copy(copied, values)
+	return copied
+}
+
 // StringList stores a JSON string list in one SQLite column.
 type StringList []string
 
@@ -137,8 +146,8 @@ func (record Record) Policy() (Policy, error) {
 	policy := Policy{
 		Name:                            record.Name,
 		Owner:                           record.Owner,
-		AllowedEndpoints:                []string(record.AllowedEndpoints),
-		AllowedModels:                   []string(record.AllowedModels),
+		AllowedEndpoints:                copyStrings(record.AllowedEndpoints),
+		AllowedModels:                   copyStrings(record.AllowedModels),
 		ExpiresAt:                       record.ExpiresAt,
 		MaxConcurrentRequests:           record.MaxConcurrentRequests,
 		RollingRequestCount:             record.RollingRequestCount,
@@ -185,8 +194,8 @@ func generateRecord(hmacKey []byte, policy Policy) (string, Record, error) {
 		Owner:                           policy.Owner,
 		Prefix:                          KeyPrefix + public,
 		Digest:                          append([]byte(nil), digest[:]...),
-		AllowedEndpoints:                StringList(append([]string(nil), policy.AllowedEndpoints...)),
-		AllowedModels:                   StringList(append([]string(nil), policy.AllowedModels...)),
+		AllowedEndpoints:                StringList(copyStrings(policy.AllowedEndpoints)),
+		AllowedModels:                   StringList(copyStrings(policy.AllowedModels)),
 		CreatedAt:                       time.Now().UTC(),
 		ExpiresAt:                       policy.ExpiresAt,
 		MaxConcurrentRequests:           policy.MaxConcurrentRequests,

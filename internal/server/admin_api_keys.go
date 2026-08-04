@@ -99,8 +99,8 @@ func (policy adminAPIKeyPolicy) toPolicy(name, owner string) (apikey.Policy, err
 	converted := apikey.Policy{
 		Name:                            name,
 		Owner:                           owner,
-		AllowedEndpoints:                append([]string(nil), policy.AllowedEndpoints...),
-		AllowedModels:                   append([]string(nil), policy.AllowedModels...),
+		AllowedEndpoints:                append([]string{}, policy.AllowedEndpoints...),
+		AllowedModels:                   append([]string{}, policy.AllowedModels...),
 		ExpiresAt:                       policy.ExpiresAt,
 		MaxConcurrentRequests:           policy.MaxConcurrentRequests,
 		RollingRequestCount:             policy.RollingRequestCount,
@@ -133,8 +133,8 @@ func adminAPIKeyPolicyFromRecord(record apikey.Record) (adminAPIKeyPolicy, error
 
 func adminAPIKeyPolicyFromPolicy(policy apikey.Policy) adminAPIKeyPolicy {
 	return adminAPIKeyPolicy{
-		AllowedEndpoints:                append([]string(nil), policy.AllowedEndpoints...),
-		AllowedModels:                   append([]string(nil), policy.AllowedModels...),
+		AllowedEndpoints:                append([]string{}, policy.AllowedEndpoints...),
+		AllowedModels:                   append([]string{}, policy.AllowedModels...),
 		ExpiresAt:                       policy.ExpiresAt,
 		MaxConcurrentRequests:           policy.MaxConcurrentRequests,
 		RollingRequestCount:             policy.RollingRequestCount,
@@ -155,8 +155,8 @@ func adminAPIKeyPolicyFromPolicy(policy apikey.Policy) adminAPIKeyPolicy {
 
 func adminAPIKeyPolicyUpdates(policy apikey.Policy) map[string]any {
 	return map[string]any{
-		"allowed_endpoints":                  apikey.StringList(append([]string(nil), policy.AllowedEndpoints...)),
-		"allowed_models":                     apikey.StringList(append([]string(nil), policy.AllowedModels...)),
+		"allowed_endpoints":                  apikey.StringList(append([]string{}, policy.AllowedEndpoints...)),
+		"allowed_models":                     apikey.StringList(append([]string{}, policy.AllowedModels...)),
 		"expires_at":                         policy.ExpiresAt,
 		"max_concurrent_requests":            policy.MaxConcurrentRequests,
 		"rolling_request_count":              policy.RollingRequestCount,
@@ -308,7 +308,7 @@ func registerAdminAPIKeyRoutes(app *iris.Application, adminStore *AdminTokenStor
 		}
 		var body adminAPIKeyIssueBody
 		if err := decodeAdminAPIKeyBody(ctx, &body); err != nil {
-			writeAdminDecodeError(ctx, err)
+			writeAdminDecodeError(ctx, err, "Invalid API key request.")
 			return
 		}
 		if err := validateAdminAPIKeyText(body.Name, "name"); err != nil {
@@ -322,10 +322,6 @@ func registerAdminAPIKeyRoutes(app *iris.Application, adminStore *AdminTokenStor
 		policy, err := body.Policy.toPolicy(body.Name, body.Owner)
 		if err != nil {
 			writeAdminOperationError(ctx, err)
-			return
-		}
-		if policy.ExpiresAt != nil && !policy.ExpiresAt.After(time.Now().UTC()) {
-			writeAdminOperationError(ctx, fmt.Errorf("%w: expiry is not in the future", errAdminAPIKeyRequest))
 			return
 		}
 		if store == nil {
@@ -473,7 +469,7 @@ func registerAdminAPIKeyRoutes(app *iris.Application, adminStore *AdminTokenStor
 		}
 		var body adminAPIKeyPatchBody
 		if err := decodeAdminAPIKeyBody(ctx, &body); err != nil {
-			writeAdminDecodeError(ctx, err)
+			writeAdminDecodeError(ctx, err, "Invalid API key request.")
 			return
 		}
 		if body.empty() {

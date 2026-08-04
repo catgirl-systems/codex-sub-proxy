@@ -85,7 +85,8 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
-		if err := authorizer.AuthorizePrincipal(requestContext, principal, responsesEndpoint, publicRequest.Model); err != nil {
+		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, responsesEndpoint, publicRequest.Model)
+		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return
 		}

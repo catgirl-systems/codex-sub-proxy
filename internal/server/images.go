@@ -88,7 +88,8 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
 			return
 		}
-		if err := authorizer.AuthorizePrincipal(request.Context(), principal, imagesGenerationsEndpoint, publicRequest.Model); err != nil {
+		principal, err = authorizer.AuthorizePrincipal(request.Context(), principal, imagesGenerationsEndpoint, publicRequest.Model)
+		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return
 		}
@@ -235,7 +236,8 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
 			return
 		}
-		if err := authorizer.AuthorizePrincipal(request.Context(), principal, imagesEditsEndpoint, publicRequest.Model); err != nil {
+		principal, err = authorizer.AuthorizePrincipal(request.Context(), principal, imagesEditsEndpoint, publicRequest.Model)
+		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return
 		}

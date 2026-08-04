@@ -37,7 +37,7 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 		principal, err := authorizer.AuthenticateHeader(ctx.Request().Context(), headers[0])
 		if err == nil {
 			setJournalAuditPrincipal(ctx, principal.ID)
-			err = authorizer.AuthorizePrincipal(ctx.Request().Context(), principal, modelsEndpoint, "")
+			principal, err = authorizer.AuthorizePrincipal(ctx.Request().Context(), principal, modelsEndpoint, "")
 		}
 		if err != nil {
 			writeAPIKeyError(ctx, err)

@@ -64,7 +64,7 @@ func (s *Store) CreateTx(tx *gorm.DB, policy Policy) (string, Record, error) {
 		return "", Record{}, err
 	}
 	if policy.ExpiresAt != nil && !policy.ExpiresAt.After(s.currentTime()) {
-		return "", Record{}, errors.New("API key expiry must be in the future")
+		return "", Record{}, fmt.Errorf("create API key: %w", ErrInvalidExpiry)
 	}
 	rawKey, record, err := generateRecord(s.hmacKey, policy)
 	if err != nil {
@@ -109,7 +109,7 @@ func Create(ctx context.Context, db *gorm.DB, hmacKey []byte, policy Policy) (st
 		return "", Record{}, err
 	}
 	if policy.ExpiresAt != nil && !policy.ExpiresAt.After(time.Now().UTC()) {
-		return "", Record{}, errors.New("API key expiry must be in the future")
+		return "", Record{}, fmt.Errorf("create API key: %w", ErrInvalidExpiry)
 	}
 
 	var rawKey string
@@ -167,38 +167,76 @@ func (a *Authorizer) AuthenticateHeader(ctx context.Context, header string) (Pri
 	return a.Authenticate(ctx, rawKey)
 }
 
-// AuthorizePrincipal applies endpoint and model policy and records successful use.
-func (a *Authorizer) AuthorizePrincipal(ctx context.Context, principal Principal, endpoint, model string) error {
+// AuthorizePrincipal reloads the current API-key policy, applies endpoint and
+// model access, and records successful use in one transaction.
+func (a *Authorizer) AuthorizePrincipal(ctx context.Context, principal Principal, endpoint, model string) (Principal, error) {
 	if a == nil {
-		return fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
+		return Principal{}, fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
 	}
 	if ctx == nil {
-		return errors.New("API key context is nil")
+		return Principal{}, errors.New("API key context is nil")
 	}
 	if a.db == nil {
-		return fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
+		return Principal{}, fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
 	}
-	if !contains(principal.AllowedEndpoints, endpoint) {
-		return ErrForbidden
+
+	var refreshed Principal
+	err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var record Record
+		if result := tx.Where("id = ?", principal.ID).First(&record); result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				return ErrInvalidKey
+			}
+			return fmt.Errorf("load current API key: %w", result.Error)
+		}
+		now := time.Now().UTC()
+		if record.RevokedAt != nil || record.DisabledAt != nil ||
+			(record.ExpiresAt != nil && !now.Before(record.ExpiresAt.UTC())) {
+			return ErrInvalidKey
+		}
+		policy, err := record.Policy()
+		if err != nil {
+			return fmt.Errorf("read current API key policy: %w", err)
+		}
+		if !contains(policy.AllowedEndpoints, endpoint) {
+			return ErrForbidden
+		}
+		if model != "" && !contains(policy.AllowedModels, model) {
+			return ErrForbidden
+		}
+		refreshed = principalFromRecord(record, policy)
+
+		result := tx.Model(&Record{}).
+			Where("id = ? AND revoked_at IS NULL AND disabled_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", record.ID, now).
+			UpdateColumn("last_used_at", gorm.Expr(
+				"CASE WHEN last_used_at IS NULL OR last_used_at < ? THEN ? ELSE last_used_at END",
+				now,
+				now,
+			))
+		if result.Error != nil {
+			return fmt.Errorf("update API key last used time: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return ErrInvalidKey
+		}
+		return nil
+	})
+	if err != nil {
+		return Principal{}, err
 	}
-	if model != "" && !contains(principal.AllowedModels, model) {
-		return ErrForbidden
+	return refreshed, nil
+}
+
+func principalFromRecord(record Record, policy Policy) Principal {
+	return Principal{
+		ID:               record.ID,
+		Prefix:           record.Prefix,
+		Name:             policy.Name,
+		Owner:            policy.Owner,
+		AllowedEndpoints: copyStrings(policy.AllowedEndpoints),
+		AllowedModels:    copyStrings(policy.AllowedModels),
+		Policy:           policy,
 	}
-	now := time.Now().UTC()
-	result := a.db.WithContext(ctx).Model(&Record{}).
-		Where("id = ? AND revoked_at IS NULL AND disabled_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", principal.ID, now).
-		UpdateColumn("last_used_at", gorm.Expr(
-			"CASE WHEN last_used_at IS NULL OR last_used_at < ? THEN ? ELSE last_used_at END",
-			now,
-			now,
-		))
-	if result.Error != nil {
-		return fmt.Errorf("update API key last used time: %w", result.Error)
-	}
-	if result.RowsAffected != 1 {
-		return ErrInvalidKey
-	}
-	return nil
 }
 
 // AuthorizeHeader authenticates a Bearer value and applies endpoint/model policy.
@@ -207,10 +245,11 @@ func (a *Authorizer) AuthorizeHeader(ctx context.Context, header string, endpoin
 	if err != nil {
 		return Principal{}, err
 	}
-	if err := a.AuthorizePrincipal(ctx, principal, endpoint, model); err != nil {
+	refreshed, err := a.AuthorizePrincipal(ctx, principal, endpoint, model)
+	if err != nil {
 		return Principal{}, err
 	}
-	return principal, nil
+	return refreshed, nil
 }
 
 // Authorize authenticates a key and applies endpoint/model policy.
@@ -219,10 +258,11 @@ func (a *Authorizer) Authorize(ctx context.Context, rawKey, endpoint, model stri
 	if err != nil {
 		return Principal{}, err
 	}
-	if err := a.AuthorizePrincipal(ctx, principal, endpoint, model); err != nil {
+	refreshed, err := a.AuthorizePrincipal(ctx, principal, endpoint, model)
+	if err != nil {
 		return Principal{}, err
 	}
-	return principal, nil
+	return refreshed, nil
 }
 
 // Authenticate verifies the key without granting endpoint or model access.
@@ -301,15 +341,7 @@ func (a *Authorizer) Authenticate(ctx context.Context, rawKey string) (Principal
 	if err != nil {
 		return Principal{}, fmt.Errorf("read API key policy: %w", err)
 	}
-	return Principal{
-		ID:               record.ID,
-		Prefix:           record.Prefix,
-		Name:             policy.Name,
-		Owner:            policy.Owner,
-		AllowedEndpoints: append([]string(nil), policy.AllowedEndpoints...),
-		AllowedModels:    append([]string(nil), policy.AllowedModels...),
-		Policy:           policy,
-	}, nil
+	return principalFromRecord(record, policy), nil
 }
 
 func contains(values []string, wanted string) bool {

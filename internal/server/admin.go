@@ -69,7 +69,7 @@ func newAdminApplication(readiness *Readiness, store *AdminTokenStore, apiKeySto
 		}
 		request, err := decodeAdminTokenCreateRequest(ctx)
 		if err != nil {
-			writeAdminDecodeError(ctx, err)
+			writeAdminDecodeError(ctx, err, "Invalid admin token request.")
 			return
 		}
 		raw, record, err := store.Create(ctx.Request().Context(), request, principal)
@@ -245,13 +245,13 @@ func safeAdminTokenMetadata(record AdminToken) adminTokenMetadata {
 	}
 }
 
-func writeAdminDecodeError(ctx iris.Context, err error) {
+func writeAdminDecodeError(ctx iris.Context, err error, invalidMessage string) {
 	var maxBytesError *http.MaxBytesError
 	if errors.As(err, &maxBytesError) {
 		writeAdminErrorCode(ctx, http.StatusRequestEntityTooLarge, "Request body is too large.", "request_too_large")
 		return
 	}
-	writeAdminError(ctx, http.StatusBadRequest, "Invalid admin token request.")
+	writeAdminError(ctx, http.StatusBadRequest, invalidMessage)
 }
 
 func writeAdminAuthError(ctx iris.Context, err error) {
@@ -274,6 +274,8 @@ func writeAdminOperationError(ctx iris.Context, err error) {
 	switch {
 	case errors.Is(err, apikey.ErrUnavailable):
 		writeAdminError(ctx, http.StatusServiceUnavailable, "API-key management is unavailable.")
+	case errors.Is(err, apikey.ErrInvalidExpiry):
+		writeAdminError(ctx, http.StatusBadRequest, "Invalid API key request.")
 	case errors.Is(err, errAdminAPIKeyNotFound):
 		writeAdminError(ctx, http.StatusNotFound, "API key not found.")
 	case errors.Is(err, errAdminAPIKeyRequest):

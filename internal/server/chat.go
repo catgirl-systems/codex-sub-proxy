@@ -190,7 +190,8 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			}
 			return
 		}
-		if err := authorizer.AuthorizePrincipal(requestContext, principal, chatCompletionsEndpoint, publicRequest.Model); err != nil {
+		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, chatCompletionsEndpoint, publicRequest.Model)
+		if err != nil {
 			writeAPIKeyError(ctx, err)
 			return
 		}
