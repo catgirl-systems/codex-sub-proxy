@@ -650,14 +650,16 @@ func listAdminRequests(ctx iris.Context, db *gorm.DB, filter adminLifecycleListF
 	if filter.Endpoint != "" {
 		query = query.Where("endpoint = ?", filter.Endpoint)
 	}
-	if filter.State == "active" {
-		return nil, "", fmt.Errorf("%w: invalid request state", errAdminLifecycleRequest)
-	}
 	if filter.State != "" {
-		if filter.State == "deleting" {
+		switch filter.State {
+		case "active":
+			query = query.Where("deleting_at IS NULL")
+		case "deleting":
 			query = query.Where("deleting_at IS NOT NULL")
-		} else {
+		case requestStatusRunning, requestStatusSucceeded, requestStatusFailed, requestStatusCanceled:
 			query = query.Where("status = ? AND deleting_at IS NULL", filter.State)
+		default:
+			return nil, "", fmt.Errorf("%w: invalid request state", errAdminLifecycleRequest)
 		}
 	}
 	if filter.From != nil {
@@ -702,19 +704,26 @@ func listAdminConversations(ctx iris.Context, db *gorm.DB, filter adminLifecycle
 	if filter.HasCursor {
 		query = query.Where("(conversations.created_at < ?) OR (conversations.created_at = ? AND conversations.id < ?)", filter.Cursor.CreatedAt, filter.Cursor.CreatedAt, filter.Cursor.ID)
 	}
-	if filter.State != "" {
-		switch filter.State {
-		case "deleting":
-			query = query.Where("conversations.deleting_at IS NOT NULL")
-		case "active":
-			query = query.Where("conversations.deleting_at IS NULL")
-		default:
-			return nil, "", fmt.Errorf("%w: invalid conversation state", errAdminLifecycleRequest)
-		}
+	needsRequestFilter := filter.KeyID != "" || filter.Endpoint != "" || filter.From != nil || filter.To != nil
+	switch filter.State {
+	case "":
+	case "deleting":
+		query = query.Where("conversations.deleting_at IS NOT NULL")
+	case "active":
+		query = query.Where("conversations.deleting_at IS NULL")
+	case requestStatusRunning, requestStatusSucceeded, requestStatusFailed, requestStatusCanceled:
+		needsRequestFilter = true
+	default:
+		return nil, "", fmt.Errorf("%w: invalid conversation state", errAdminLifecycleRequest)
 	}
-	if filter.KeyID != "" || filter.Endpoint != "" || filter.From != nil || filter.To != nil {
+	if needsRequestFilter {
 		existsSQL := "EXISTS (SELECT 1 FROM requests filtered_requests WHERE filtered_requests.conversation_id = conversations.id"
-		args := make([]any, 0, 4)
+		args := make([]any, 0, 5)
+		switch filter.State {
+		case requestStatusRunning, requestStatusSucceeded, requestStatusFailed, requestStatusCanceled:
+			existsSQL += " AND filtered_requests.status = ? AND filtered_requests.deleting_at IS NULL"
+			args = append(args, filter.State)
+		}
 		if filter.KeyID != "" {
 			existsSQL += " AND filtered_requests.api_key_id = ?"
 			args = append(args, filter.KeyID)
@@ -731,7 +740,7 @@ func listAdminConversations(ctx iris.Context, db *gorm.DB, filter adminLifecycle
 			existsSQL += " AND filtered_requests.accepted_at <= ?"
 			args = append(args, *filter.To)
 		}
-		query = query.Where(existsSQL+")", args...)
+		query = query.Where(existsSQL+" LIMIT 1)", args...)
 	}
 	var rows []adminConversationListRow
 	if err := query.Scan(&rows).Error; err != nil {
@@ -896,7 +905,7 @@ func loadRequestExportPlanData(ctx iris.Context, db *gorm.DB, id string, metadat
 	}
 	var journals []JournalRecord
 	if err := db.WithContext(ctx.Request().Context()).
-		Select("replay_id, request_id, sequence, event_type, event_version, key_version, payload, created_at").
+		Select("replay_id, request_id, sequence, mode, event_type, event_version, key_version, payload, checksum, created_at").
 		Where("request_id = ?", id).
 		Order("sequence ASC, replay_id ASC").
 		Limit(adminLifecycleMaxEvents + 2).
@@ -909,6 +918,9 @@ func loadRequestExportPlanData(ctx iris.Context, db *gorm.DB, id string, metadat
 	plans := make([]adminExportPayloadPlan, 0, len(journals))
 	inputSeen := false
 	for _, journal := range journals {
+		if err := validateJournalRecord(journal); err != nil {
+			return adminRequestExportPlan{}, fmt.Errorf("validate request export event: %w", err)
+		}
 		if journal.EventType == journalRequestEventType || journal.EventType == "request.running" {
 			continue
 		}
