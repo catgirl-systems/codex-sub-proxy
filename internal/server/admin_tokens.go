@@ -651,6 +651,8 @@ type adminAuditMetadata struct {
 	ExpiresAt *time.Time       `json:"expires_at,omitempty"`
 	Count     int              `json:"count,omitempty"`
 	Bootstrap bool             `json:"bootstrap,omitempty"`
+	Fields    []string         `json:"fields,omitempty"`
+	Filters   []string         `json:"filters,omitempty"`
 }
 
 func writeAdminAudit(tx *gorm.DB, principal AdminPrincipal, action, targetID string, metadata adminAuditMetadata, createdAt time.Time) error {

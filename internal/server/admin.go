@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/kataras/iris/v12"
 )
 
@@ -55,7 +56,7 @@ func setAdminPrincipal(ctx iris.Context, principal AdminPrincipal) {
 	}
 }
 
-func newAdminApplication(readiness *Readiness, store *AdminTokenStore) (*iris.Application, error) {
+func newAdminApplication(readiness *Readiness, store *AdminTokenStore, apiKeyStore *apikey.Store) (*iris.Application, error) {
 	app := buildAdminHealthApplication(readiness)
 	app.Post(adminTokensEndpoint, func(ctx iris.Context) {
 		principal, ok := authenticateAdminRequest(ctx, store)
@@ -125,6 +126,7 @@ func newAdminApplication(readiness *Readiness, store *AdminTokenStore) (*iris.Ap
 		}
 		writeJSON(ctx, http.StatusOK, safeAdminTokenMetadata(record))
 	})
+	registerAdminAPIKeyRoutes(app, store, apiKeyStore)
 	if err := app.Build(); err != nil {
 		return nil, err
 	}
@@ -154,6 +156,9 @@ func authorizeAdminScope(ctx iris.Context, store *AdminTokenStore, principal Adm
 	}
 	if err != nil {
 		return err
+	}
+	if store == nil {
+		return ErrAdminUnavailable
 	}
 	return store.Authorize(ctx.Request().Context(), principal, scope)
 }
@@ -267,6 +272,12 @@ func writeAdminAuthError(ctx iris.Context, err error) {
 }
 func writeAdminOperationError(ctx iris.Context, err error) {
 	switch {
+	case errors.Is(err, apikey.ErrUnavailable):
+		writeAdminError(ctx, http.StatusServiceUnavailable, "API-key management is unavailable.")
+	case errors.Is(err, errAdminAPIKeyNotFound):
+		writeAdminError(ctx, http.StatusNotFound, "API key not found.")
+	case errors.Is(err, errAdminAPIKeyRequest):
+		writeAdminError(ctx, http.StatusBadRequest, "Invalid API key request.")
 	case errors.Is(err, ErrAdminUnavailable):
 		writeAdminError(ctx, http.StatusServiceUnavailable, "Administrative authentication is unavailable.")
 	case errors.Is(err, ErrAdminTokenNotFound):

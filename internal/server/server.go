@@ -67,6 +67,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	errorsChannel := make(chan error, 8)
 	var journal *Journal
 	var quota *apikey.QuotaStore
+	var apiKeyStore *apikey.Store
 	var retention *RetentionRunner
 	closeStarted := func() {
 		if retention != nil {
@@ -83,9 +84,10 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if err := MigrateJournal(cfg.Database); err != nil {
 			return nil, err
 		}
-		if err := apikey.MigrateQuota(cfg.Database); err != nil {
+		if err := apikey.Migrate(cfg.Database); err != nil {
 			return nil, err
 		}
+		apiKeyStore = apikey.NewStore(cfg.Database, cfg.APIKeyHMACKey)
 		if cfg.ArtifactStore != nil {
 			if err := cfg.ArtifactStore.Reconcile(context.Background()); err != nil {
 				return nil, fmt.Errorf("reconcile artifact store: %w", err)
@@ -148,7 +150,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		closeStarted()
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
-	adminHandler, err := newAdminApplication(readiness, adminStore)
+	adminHandler, err := newAdminApplication(readiness, adminStore, apiKeyStore)
 	if err != nil {
 		closeStarted()
 		return nil, fmt.Errorf("build admin application: %w", err)

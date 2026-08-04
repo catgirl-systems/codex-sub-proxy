@@ -110,6 +110,8 @@ type Record struct {
 	CreatedAt                       time.Time  `gorm:"column:created_at;not null"`
 	ExpiresAt                       *time.Time `gorm:"column:expires_at"`
 	DisabledAt                      *time.Time `gorm:"column:disabled_at"`
+	RevokedAt                       *time.Time `gorm:"column:revoked_at;index"`
+	RevokedBy                       string     `gorm:"column:revoked_by;size:36"`
 	LastUsedAt                      *time.Time `gorm:"column:last_used_at"`
 	MaxConcurrentRequests           int64      `gorm:"column:max_concurrent_requests;not null;default:0"`
 	RollingRequestCount             int64      `gorm:"column:rolling_request_count;not null;default:0"`

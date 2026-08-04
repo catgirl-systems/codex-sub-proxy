@@ -184,6 +184,11 @@ func newQuotaStore(db *gorm.DB, ownerID string, now func() time.Time) *QuotaStor
 	return &QuotaStore{db: db, ownerID: ownerID, now: now}
 }
 
+// ValidatePolicy validates both endpoint/model access and quota combinations.
+func ValidatePolicy(policy Policy) error {
+	return validatePolicy(policy)
+}
+
 func validatePolicy(policy Policy) error {
 	if err := validator.New().Struct(policy); err != nil {
 		return fmt.Errorf("validate API key policy: %w", err)

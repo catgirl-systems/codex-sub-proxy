@@ -124,7 +124,7 @@ func TestAdminRoutesReturnTokenOnceAndGuardContent(t *testing.T) {
 	if _, err := store.MaterializeBootstrap(context.Background(), []byte(bootstrapRaw)); err != nil {
 		t.Fatal(err)
 	}
-	app, err := newAdminApplication(NewReadiness(), store)
+	app, err := newAdminApplication(NewReadiness(), store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +557,7 @@ func TestAdminOversizedBodiesReturnStructured413WithoutMutation(t *testing.T) {
 	if _, err := store.MaterializeBootstrap(context.Background(), []byte(bootstrapRaw)); err != nil {
 		t.Fatal(err)
 	}
-	app, err := newAdminApplication(NewReadiness(), store)
+	app, err := newAdminApplication(NewReadiness(), store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,7 +631,7 @@ func TestAdminMalformedAndTrailingJSONRemain400(t *testing.T) {
 	if _, err := store.MaterializeBootstrap(context.Background(), []byte(bootstrapRaw)); err != nil {
 		t.Fatal(err)
 	}
-	app, err := newAdminApplication(NewReadiness(), store)
+	app, err := newAdminApplication(NewReadiness(), store, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

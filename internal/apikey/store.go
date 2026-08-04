@@ -9,7 +9,79 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
+
+// Store owns durable API-key records and their HMAC generator.
+// Its transaction methods are intentionally concrete so callers can include
+// related lifecycle writes, such as administrative audit records, in one tx.
+type Store struct {
+	db      *gorm.DB
+	hmacKey []byte
+	now     func() time.Time
+}
+
+// NewStore creates an API-key store backed by db.
+func NewStore(db *gorm.DB, hmacKey []byte) *Store {
+	return &Store{
+		db:      db,
+		hmacKey: append([]byte(nil), hmacKey...),
+		now:     func() time.Time { return time.Now().UTC() },
+	}
+}
+
+// DB returns the store database for an enclosing transaction.
+func (s *Store) DB() *gorm.DB {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Session(&gorm.Session{Logger: logger.Discard})
+}
+
+// Transaction runs fn in a bounded store transaction.
+func (s *Store) Transaction(ctx context.Context, fn func(*gorm.DB) error) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("API key transaction: %w", ErrUnavailable)
+	}
+	if ctx == nil {
+		return errors.New("API key transaction context is nil")
+	}
+	if fn == nil {
+		return errors.New("API key transaction function is nil")
+	}
+	return s.DB().WithContext(ctx).Transaction(fn)
+}
+
+// CreateTx generates and inserts a key. The caller owns transaction scope.
+func (s *Store) CreateTx(tx *gorm.DB, policy Policy) (string, Record, error) {
+	if s == nil || len(s.hmacKey) == 0 {
+		return "", Record{}, fmt.Errorf("create API key: %w", ErrUnavailable)
+	}
+	if tx == nil {
+		return "", Record{}, errors.New("create API key transaction is nil")
+	}
+	if err := validatePolicy(policy); err != nil {
+		return "", Record{}, err
+	}
+	if policy.ExpiresAt != nil && !policy.ExpiresAt.After(s.currentTime()) {
+		return "", Record{}, errors.New("API key expiry must be in the future")
+	}
+	rawKey, record, err := generateRecord(s.hmacKey, policy)
+	if err != nil {
+		return "", Record{}, err
+	}
+	if err := tx.Create(&record).Error; err != nil {
+		return "", Record{}, fmt.Errorf("store API key: %w", err)
+	}
+	return rawKey, record, nil
+}
+
+func (s *Store) currentTime() time.Time {
+	if s == nil || s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
+}
 
 // Migrate creates the durable API-key and quota tables and their indexes.
 func Migrate(db *gorm.DB) error {
@@ -114,7 +186,7 @@ func (a *Authorizer) AuthorizePrincipal(ctx context.Context, principal Principal
 	}
 	now := time.Now().UTC()
 	result := a.db.WithContext(ctx).Model(&Record{}).
-		Where("id = ?", principal.ID).
+		Where("id = ? AND revoked_at IS NULL AND disabled_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", principal.ID, now).
 		UpdateColumn("last_used_at", gorm.Expr(
 			"CASE WHEN last_used_at IS NULL OR last_used_at < ? THEN ? ELSE last_used_at END",
 			now,
@@ -222,7 +294,7 @@ func (a *Authorizer) Authenticate(ctx context.Context, rawKey string) (Principal
 	}
 	record := candidates[matched]
 	now := time.Now().UTC()
-	if record.DisabledAt != nil || (record.ExpiresAt != nil && !now.Before(record.ExpiresAt.UTC())) {
+	if record.RevokedAt != nil || record.DisabledAt != nil || (record.ExpiresAt != nil && !now.Before(record.ExpiresAt.UTC())) {
 		return Principal{}, ErrInvalidKey
 	}
 	policy, err := record.Policy()
