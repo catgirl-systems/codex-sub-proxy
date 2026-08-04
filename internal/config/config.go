@@ -125,6 +125,7 @@ type SecurityConfig struct {
 	APIKeyHMACKeyEnv                        string   `toml:"api_key_hmac_key_env" validate:"required"`
 	AdminTokenHMACKeyEnv                    string   `toml:"admin_token_hmac_key_env" validate:"required"`
 	AdminBootstrapTokenEnv                  string   `toml:"admin_bootstrap_token_env" validate:"required"`
+	AdminCookieSecure                       bool     `toml:"admin_cookie_secure"`
 }
 
 type ResponsesTransport string
@@ -235,6 +236,7 @@ func Default() Config {
 			APIKeyHMACKeyEnv:               "CSP_API_KEY_HMAC_KEY",
 			AdminTokenHMACKeyEnv:           "CSP_ADMIN_TOKEN_HMAC_KEY",
 			AdminBootstrapTokenEnv:         "CSP_ADMIN_BOOTSTRAP_TOKEN",
+			AdminCookieSecure:              true,
 		},
 		Codex: CodexConfig{
 			CredentialFile:     defaultCredentialFile,

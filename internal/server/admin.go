@@ -75,6 +75,11 @@ func newAdminApplication(readiness *Readiness, store *AdminTokenStore, apiKeySto
 
 func newAdminApplicationWithLifecycle(readiness *Readiness, store *AdminTokenStore, apiKeyStore *apikey.Store, lifecycle adminLifecycleDependencies) (*iris.Application, error) {
 	app := buildAdminHealthApplication(readiness)
+	app.Configure(iris.WithConfiguration(iris.Configuration{DisablePathCorrectionRedirection: true}))
+	if store != nil {
+		store.setCookieSecure(lifecycle.cookieSecure)
+	}
+	registerAdminDashboardRoutes(app, store, lifecycle.cookieSecure)
 	app.Post(adminTokensEndpoint, func(ctx iris.Context) {
 		principal, ok := authenticateAdminRequest(ctx, store)
 		if !ok {
@@ -157,13 +162,57 @@ func authenticateAdminRequest(ctx iris.Context, store *AdminTokenStore) (AdminPr
 		writeAdminError(ctx, http.StatusServiceUnavailable, "Administrative authentication is unavailable.")
 		return AdminPrincipal{}, false
 	}
-	principal, err := store.AuthenticateHeaders(ctx.Request().Context(), ctx.Request().Header.Values("Authorization"))
+	headers := ctx.Request().Header.Values("Authorization")
+	if len(headers) > 0 {
+		principal, err := store.AuthenticateHeaders(ctx.Request().Context(), headers)
+		if err != nil {
+			writeAdminAuthError(ctx, err)
+			return AdminPrincipal{}, false
+		}
+		setAdminPrincipal(ctx, principal)
+		return principal, true
+	}
+	cookie, cookieErr := requestAdminCookie(ctx.Request(), adminSessionCookieName, adminSessionFallbackCookie, store.cookieSecure)
+	if cookieErr == nil && cookie.Value != "" {
+		principal, auth, err := store.AuthenticateSession(ctx.Request().Context(), cookie.Value)
+		if err != nil {
+			writeAdminAuthError(ctx, err)
+			return AdminPrincipal{}, false
+		}
+		if isAdminUnsafeMethod(ctx.Method()) {
+			if !validateAdminRequestOrigin(ctx.Request(), store.cookieSecure) {
+				writeAdminCSRFError(ctx)
+				return AdminPrincipal{}, false
+			}
+			if !store.ValidateSessionCSRF(csrfTokenFromRequest(ctx), auth) {
+				writeAdminCSRFError(ctx)
+				return AdminPrincipal{}, false
+			}
+		}
+		setAdminPrincipal(ctx, principal)
+		setAdminSessionContext(ctx, auth, "")
+		return principal, true
+	}
+	principal, err := store.AuthenticateHeaders(ctx.Request().Context(), headers)
 	if err != nil {
 		writeAdminAuthError(ctx, err)
 		return AdminPrincipal{}, false
 	}
 	setAdminPrincipal(ctx, principal)
 	return principal, true
+}
+
+func isAdminUnsafeMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	default:
+		return true
+	}
+}
+
+func writeAdminCSRFError(ctx iris.Context) {
+	writeAdminErrorCode(ctx, http.StatusForbidden, "The browser request failed CSRF validation.", "csrf_failed")
 }
 
 func authorizeAdminScope(ctx iris.Context, store *AdminTokenStore, principal AdminPrincipal, scope AdminTokenScope) error {
@@ -280,6 +329,11 @@ func writeAdminAuthError(ctx iris.Context, err error) {
 	}
 	if errors.Is(err, ErrAdminTokenForbidden) {
 		writeAdminError(ctx, http.StatusForbidden, "The admin token does not have the required scope.")
+		return
+	}
+	if errors.Is(err, errAdminSessionInvalid) {
+		ctx.Header("WWW-Authenticate", "Bearer")
+		writeAdminError(ctx, http.StatusUnauthorized, "Incorrect admin token provided.")
 		return
 	}
 	if !errors.Is(err, ErrAdminTokenInvalid) {

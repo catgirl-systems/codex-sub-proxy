@@ -178,28 +178,35 @@ var adminTokenValidator = validator.New()
 
 // AdminTokenStore authenticates and mutates admin token records.
 type AdminTokenStore struct {
-	db      *gorm.DB
-	hmacKey []byte
-	now     func() time.Time
+	db           *gorm.DB
+	hmacKey      []byte
+	now          func() time.Time
+	cookieSecure bool
 }
 
 func NewAdminTokenStore(db *gorm.DB, hmacKey []byte) *AdminTokenStore {
-	return &AdminTokenStore{db: db, hmacKey: append([]byte(nil), hmacKey...), now: func() time.Time { return time.Now().UTC() }}
+	return &AdminTokenStore{db: db, hmacKey: append([]byte(nil), hmacKey...), now: func() time.Time { return time.Now().UTC() }, cookieSecure: true}
 }
 
 func newAdminTokenStoreWithClock(db *gorm.DB, hmacKey []byte, now func() time.Time) *AdminTokenStore {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &AdminTokenStore{db: db, hmacKey: append([]byte(nil), hmacKey...), now: now}
+	return &AdminTokenStore{db: db, hmacKey: append([]byte(nil), hmacKey...), now: now, cookieSecure: true}
 }
 
-// MigrateAdminTokens creates the admin token table and the extended audit columns.
+func (s *AdminTokenStore) setCookieSecure(secure bool) {
+	if s != nil {
+		s.cookieSecure = secure
+	}
+}
+
+// MigrateAdminTokens creates admin token, session, nonce, and audit tables.
 func MigrateAdminTokens(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("migrate admin tokens: %w", ErrAdminUnavailable)
 	}
-	if err := db.AutoMigrate(&AdminToken{}, &AuditRecord{}); err != nil {
+	if err := db.AutoMigrate(&AdminToken{}, &AdminSession{}, &AdminLoginNonce{}, &AuditRecord{}); err != nil {
 		return fmt.Errorf("migrate admin tokens: %w", err)
 	}
 	return nil

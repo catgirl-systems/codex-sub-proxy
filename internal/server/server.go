@@ -29,6 +29,7 @@ type Config struct {
 	APIKeyHMACKey        []byte
 	AdminTokenHMACKey    []byte
 	AdminBootstrapToken  []byte
+	AdminCookieSecure    bool
 	PayloadKeys          envelope.KeySet
 	ResponsesTransport   *codex.ResponsesTransport
 	ImagesClient         *codex.ImagesClient
@@ -192,7 +193,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
 	adminHandler, err := newAdminApplicationWithLifecycle(readiness, adminStore, apiKeyStore, adminLifecycleDependencies{
-		db: cfg.Database, keys: cfg.PayloadKeys, artifacts: cfg.ArtifactStore, retention: retention, pricing: pricing,
+		db: cfg.Database, keys: cfg.PayloadKeys, artifacts: cfg.ArtifactStore, retention: retention, pricing: pricing, cookieSecure: cfg.AdminCookieSecure,
 	})
 	if err != nil {
 		closeStarted()

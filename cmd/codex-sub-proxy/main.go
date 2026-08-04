@@ -147,6 +147,7 @@ func run(args []string) error {
 		APIKeyHMACKey:       apiKeyHMACKey,
 		AdminTokenHMACKey:   adminHMACKey,
 		AdminBootstrapToken: adminBootstrapToken,
+		AdminCookieSecure:   cfg.Security.AdminCookieSecure,
 		ResponsesTransport:  responsesTransport,
 		PayloadKeys:         payloadKeys,
 		ImagesClient:        imagesClient,

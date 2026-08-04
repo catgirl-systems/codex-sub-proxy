@@ -40,11 +40,12 @@ var (
 )
 
 type adminLifecycleDependencies struct {
-	db        *gorm.DB
-	keys      envelope.KeySet
-	artifacts *ArtifactStore
-	retention *RetentionRunner
-	pricing   *PricingStore
+	db           *gorm.DB
+	keys         envelope.KeySet
+	artifacts    *ArtifactStore
+	retention    *RetentionRunner
+	pricing      *PricingStore
+	cookieSecure bool
 }
 
 type adminLifecycleCursor struct {

@@ -214,7 +214,7 @@ func (r *RetentionRunner) workerDone() bool {
 	}
 }
 
-// RunOnce executes one bounded payload, artifact, metadata, and standalone audit sweep.
+// RunOnce executes one bounded payload, artifact, metadata, audit, and admin-session sweep.
 func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
 	if r == nil {
 		return errors.New("retention runner is nil")
@@ -240,7 +240,52 @@ func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
 	if err := r.sweepStandaloneAudits(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
+	if err := r.sweepAdminSessions(sweepCtx, now); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+func (r *RetentionRunner) sweepAdminSessions(ctx context.Context, now time.Time) error {
+	if !r.db.Migrator().HasTable(&AdminSession{}) {
+		return nil
+	}
+	var sessions []AdminSession
+	if err := r.db.WithContext(ctx).
+		Where("revoked_at IS NOT NULL OR expires_at <= ? OR idle_expires_at <= ?", now, now).
+		Order("expires_at ASC").
+		Limit(r.batchSize).
+		Find(&sessions).Error; err != nil {
+		return fmt.Errorf("load expired admin sessions: %w", err)
+	}
+	for _, session := range sessions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.db.WithContext(ctx).Where("id = ?", session.ID).Delete(&AdminSession{}).Error; err != nil {
+			return fmt.Errorf("delete expired admin session: %w", err)
+		}
+	}
+	if !r.db.Migrator().HasTable(&AdminLoginNonce{}) {
+		return nil
+	}
+	var nonces []AdminLoginNonce
+	if err := r.db.WithContext(ctx).
+		Where("used_at IS NOT NULL OR expires_at <= ?", now).
+		Order("expires_at ASC").
+		Limit(r.batchSize).
+		Find(&nonces).Error; err != nil {
+		return fmt.Errorf("load expired admin login nonces: %w", err)
+	}
+	for _, nonce := range nonces {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.db.WithContext(ctx).Where("id = ?", nonce.ID).Delete(&AdminLoginNonce{}).Error; err != nil {
+			return fmt.Errorf("delete expired admin login nonce: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *RetentionRunner) sweepStandaloneAudits(ctx context.Context, now time.Time) error {
