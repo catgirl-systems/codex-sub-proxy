@@ -188,9 +188,6 @@ func run(args []string) error {
 	if cfg.Telemetry.ShutdownTimeout > cleanupTimeout {
 		cleanupTimeout = cfg.Telemetry.ShutdownTimeout
 	}
-	if cleanupTimeout <= 0 {
-		cleanupTimeout = 10 * time.Second
-	}
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 	servers, err := server.Start(server.Config{
 		Listen:              cfg.Server.Listen,

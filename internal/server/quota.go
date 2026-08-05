@@ -22,9 +22,6 @@ type quotaLease struct {
 var errQuotaFinalization = errors.New("quota success finalization failed")
 
 func admitRequestQuota(ctx context.Context, store *apikey.QuotaStore, principal apikey.Principal, request apikey.QuotaRequest) (*quotaLease, error) {
-	if store == nil {
-		return nil, nil
-	}
 	admission, err := store.Admit(ctx, principal.ID, principal.Policy, request)
 	if err != nil {
 		return nil, err

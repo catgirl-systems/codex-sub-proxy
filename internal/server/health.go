@@ -197,7 +197,7 @@ func setJournalAuditPrincipal(ctx iris.Context, apiKeyID string) {
 
 func recordJournalRejection(ctx iris.Context, status int, eventType string) {
 	value, ok := ctx.Values().Get(journalAuditValueKey).(*journalAuditValue)
-	if !ok || value == nil || value.journal == nil || value.recorded {
+	if !ok || value == nil || value.recorded {
 		return
 	}
 	value.recorded = true
@@ -226,14 +226,14 @@ func startJournalRequestWithMetadata(ctx iris.Context, journal *Journal, metadat
 
 func markJournalTerminal(ctx iris.Context, state, detail string) {
 	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
-	if !ok || value == nil || value.journal == nil {
+	if !ok || value == nil {
 		return
 	}
 	markJournalTerminalValue(value, state, detail)
 }
 
 func markJournalTerminalValue(value *journalRequestValue, state, detail string) {
-	if value == nil || value.journal == nil {
+	if value == nil {
 		return
 	}
 	if err := value.journal.RecordTerminal(context.WithoutCancel(value.context), value.request, state, []byte(detail)); err != nil {
@@ -258,7 +258,7 @@ func finishJournalRequest(ctx iris.Context, journal *Journal, request JournalReq
 
 func recordJournalUsageDetails(ctx iris.Context, usage JournalUsage) {
 	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
-	if !ok || value == nil || value.journal == nil {
+	if !ok || value == nil {
 		return
 	}
 	if err := value.journal.RecordUsageDetails(ctx.Request().Context(), value.request, usage); err != nil {

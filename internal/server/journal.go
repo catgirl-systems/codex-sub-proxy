@@ -143,9 +143,7 @@ type Journal struct {
 }
 
 func (j *Journal) setPricingStore(pricing *PricingStore) {
-	if j != nil {
-		j.pricing = pricing
-	}
+	j.pricing = pricing
 }
 
 // MigrateJournal creates the journal, receipt, and lifecycle projection tables.
@@ -234,9 +232,6 @@ func newJournalWithKeysAndTTLs(db *gorm.DB, mode string, queueCapacity int, drai
 
 // Start starts the single materializer worker.
 func (j *Journal) Start() error {
-	if j == nil {
-		return errors.New("journal is nil")
-	}
 	j.workerMu.Lock()
 	defer j.workerMu.Unlock()
 	if j.workerStarted {
@@ -257,9 +252,6 @@ func (j *Journal) Start() error {
 }
 
 func (j *Journal) beginOperation() error {
-	if j == nil {
-		return errors.New("journal is nil")
-	}
 	j.lifecycleMu.RLock()
 	defer j.lifecycleMu.RUnlock()
 	if !j.accepting {
@@ -873,9 +865,6 @@ func (j *Journal) markApplied(ctx context.Context, replayID string) error {
 
 // Close stops intake and drains accepted records within the configured deadline.
 func (j *Journal) Close(ctx context.Context) error {
-	if j == nil {
-		return nil
-	}
 	if ctx == nil {
 		return errors.New("journal close context is nil")
 	}

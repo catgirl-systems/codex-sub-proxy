@@ -103,13 +103,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
-		if journal != nil {
-			defer finishJournalRequest(ctx, journal, journalRequestID)
-		}
-		if transport == nil {
-			writeResponsesError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
-			return
-		}
+		defer finishJournalRequest(ctx, journal, journalRequestID)
 		privateRequest, err := privateResponseRequest(publicRequest)
 		if err != nil {
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
@@ -127,9 +121,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 				}
 				return
 			}
-			if lease != nil {
-				defer func() { _ = lease.release("request ended") }()
-			}
+			defer func() { _ = lease.release("request ended") }()
 			serveResponsesStream(ctx, requestContext, transport, privateRequest, lease, artifacts, artifactRequired)
 			return
 		}
@@ -143,9 +135,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			}
 			return
 		}
-		if lease != nil {
-			defer func() { _ = lease.release("request ended") }()
-		}
+		defer func() { _ = lease.release("request ended") }()
 		if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Now().Add(imagesWriteTimeout)); err != nil {
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return

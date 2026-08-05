@@ -48,12 +48,8 @@ type Telemetry struct {
 
 // NewTelemetry builds one process-wide meter provider.
 func NewTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[string]string) (*Telemetry, error) {
-	return newTelemetry(ctx, cfg, headers)
-}
-
-func newTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[string]string) (*Telemetry, error) {
 	if ctx == nil {
-		ctx = context.Background()
+		return nil, errors.New("telemetry context is nil")
 	}
 	telemetry := &Telemetry{}
 	resourceValue, err := resource.New(ctx, resource.WithAttributes(

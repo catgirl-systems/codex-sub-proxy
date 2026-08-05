@@ -15,16 +15,10 @@ const (
 )
 
 func (j *Journal) reconcileUsagePricing(tx *gorm.DB, requestID string, terminalAt time.Time) error {
-	if j == nil {
-		return nil
-	}
 	return reconcileUsagePricing(tx, j.pricing, requestID, terminalAt)
 }
 
 func reconcileUsagePricing(tx *gorm.DB, pricing *PricingStore, requestID string, terminalAt time.Time) error {
-	if pricing == nil || !pricing.Available() {
-		return nil
-	}
 	var request RequestRecord
 	if err := tx.Select("request_id, model, requested_model, resolved_model, created_at, accepted_at").Where("request_id = ?", requestID).First(&request).Error; err != nil {
 		return fmt.Errorf("load request for pricing: %w", err)
@@ -78,9 +72,6 @@ func reconcileUsagePricing(tx *gorm.DB, pricing *PricingStore, requestID string,
 func reconcileTerminalUsagePricing(ctx context.Context, db *gorm.DB, pricing *PricingStore) error {
 	if ctx == nil {
 		return errors.New("pricing reconciliation context is nil")
-	}
-	if db == nil || pricing == nil || !pricing.Available() {
-		return nil
 	}
 	const candidateWhere = "r.terminal_at IS NOT NULL AND (u.pricing_version_id IS NULL OR u.estimated_public_cost_microunits IS NULL OR u.priced_model = '')"
 	processed := 0

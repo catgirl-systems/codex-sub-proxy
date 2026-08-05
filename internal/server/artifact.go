@@ -237,9 +237,6 @@ func newArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl ti
 
 // Close releases the descriptor-anchored artifact root.
 func (s *ArtifactStore) Close() error {
-	if s == nil {
-		return nil
-	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	if s.root == nil {
@@ -252,9 +249,6 @@ func (s *ArtifactStore) Close() error {
 	return s.closeErr
 }
 func (s *ArtifactStore) acquireOperation(ctx context.Context) (*ArtifactBarrier, error) {
-	if s == nil {
-		return nil, errors.New("artifact store is closed")
-	}
 	if ctx == nil {
 		return nil, errors.New("artifact operation context is nil")
 	}
@@ -821,9 +815,6 @@ func (s *ArtifactStore) Reconcile(ctx context.Context) error {
 }
 
 func (s *ArtifactStore) reconcileWithBarrier(ctx context.Context, barrier *ArtifactBarrier) error {
-	if s == nil {
-		return errors.New("artifact store is closed")
-	}
 	if barrier == nil {
 		return errors.New("artifact barrier is nil")
 	}

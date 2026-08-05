@@ -90,8 +90,8 @@ func TestPricingStoreEffectiveBoundaryAndConflict(t *testing.T) {
 	conflict := old
 	conflict.Models[0].InputMicrounitsPerMillion = 9
 	conflicted, err := InitializePricing(db, config.PricingConfig{Versions: []config.PricingVersionConfig{conflict}})
-	if err != nil || conflicted.Available() || conflicted.Err() == nil {
-		t.Fatalf("conflict availability = store=%+v err=%v", conflicted, err)
+	if err == nil || conflicted != nil {
+		t.Fatalf("pricing conflict = store=%+v err=%v", conflicted, err)
 	}
 	var count int64
 	if err := db.Model(&PricingVersion{}).Count(&count).Error; err != nil {
@@ -128,11 +128,17 @@ func TestPricingStoreRejectsDuplicateEffectiveVersions(t *testing.T) {
 		t.Fatalf("idempotent pricing reopen: %v", err)
 	}
 	conflicted, err := InitializePricing(db, config.PricingConfig{
-		Versions:                       []config.PricingVersionConfig{{ID: "v2", EffectiveAt: effective, Currency: "USD", Models: []config.ModelPriceConfig{{ModelID: "model-a", InputMicrounitsPerMillion: 2}}}},
-		SubscriptionAllocationVersions: []config.SubscriptionAllocationVersionConfig{{ID: "a2", EffectiveAt: effective, Currency: "USD", MonthlyCostMicrounits: 20, AllocationBasis: pricingAllocationBasis}},
+		Versions: []config.PricingVersionConfig{{
+			ID: "v2", EffectiveAt: effective, Currency: "USD",
+			Models: []config.ModelPriceConfig{{ModelID: "model-a", InputMicrounitsPerMillion: 2}},
+		}},
+		SubscriptionAllocationVersions: []config.SubscriptionAllocationVersionConfig{{
+			ID: "a2", EffectiveAt: effective, Currency: "USD",
+			MonthlyCostMicrounits: 20, AllocationBasis: pricingAllocationBasis,
+		}},
 	})
-	if err != nil || conflicted.Available() || conflicted.Err() == nil {
-		t.Fatalf("duplicate effective reopen was available: store=%+v err=%v", conflicted, err)
+	if err == nil || conflicted != nil {
+		t.Fatalf("duplicate effective reopen = store=%+v err=%v", conflicted, err)
 	}
 	var pricingCount, allocationCount int64
 	if err := db.Model(&PricingVersion{}).Count(&pricingCount).Error; err != nil {

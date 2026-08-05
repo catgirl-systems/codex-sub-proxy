@@ -6,6 +6,7 @@ import (
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/openai"
 	"github.com/kataras/iris/v12"
 	"gorm.io/gorm"
 )
@@ -31,37 +32,56 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 func newDataApplicationWithPolicy(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool, policy applicationPolicy) (*iris.Application, error) {
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
-	app.Get(modelsEndpoint, func(ctx iris.Context) {
-		setJournalAuditContext(ctx, journal, modelsEndpoint)
-		headers := ctx.Request().Header.Values("Authorization")
-		if len(headers) != 1 {
-			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
-			return
-		}
-		principal, err := authorizer.AuthenticateHeader(ctx.Request().Context(), headers[0])
-		if err == nil {
-			setJournalAuditPrincipal(ctx, principal.ID)
-			principal, err = authorizer.AuthorizePrincipal(ctx.Request().Context(), principal, modelsEndpoint, "")
-		}
-		if err != nil {
-			writeAPIKeyError(ctx, err)
-			return
-		}
-		models := make([]modelObject, 0, len(principal.AllowedModels))
-		for _, id := range principal.AllowedModels {
-			models = append(models, modelObject{
-				ID:      id,
-				Object:  "model",
-				Created: 0,
-				OwnedBy: apikey.ModelOwner,
-			})
-		}
-		writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
-	})
-	app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport, journal, quota))
-	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal, quota, artifacts, artifactRequired))
-	app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
-	app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
+	unavailable := func(ctx iris.Context) {
+		writeJSON(ctx, http.StatusServiceUnavailable, openai.ErrorResponse{Error: openai.Error{
+			Type: "server_error", Code: "service_unavailable", Message: "The service is unavailable.",
+		}})
+	}
+	if authorizer != nil {
+		app.Get(modelsEndpoint, func(ctx iris.Context) {
+			setJournalAuditContext(ctx, journal, modelsEndpoint)
+			headers := ctx.Request().Header.Values("Authorization")
+			if len(headers) != 1 {
+				writeAPIKeyError(ctx, apikey.ErrInvalidKey)
+				return
+			}
+			principal, err := authorizer.AuthenticateHeader(ctx.Request().Context(), headers[0])
+			if err == nil {
+				setJournalAuditPrincipal(ctx, principal.ID)
+				principal, err = authorizer.AuthorizePrincipal(ctx.Request().Context(), principal, modelsEndpoint, "")
+			}
+			if err != nil {
+				writeAPIKeyError(ctx, err)
+				return
+			}
+			models := make([]modelObject, 0, len(principal.AllowedModels))
+			for _, id := range principal.AllowedModels {
+				models = append(models, modelObject{
+					ID: id, Object: "model", Created: 0, OwnedBy: apikey.ModelOwner,
+				})
+			}
+			writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
+		})
+	} else {
+		app.Any(modelsEndpoint, unavailable)
+	}
+	if authorizer != nil && transport != nil && quota != nil {
+		app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport, journal, quota))
+	} else {
+		app.Any(chatCompletionsEndpoint, unavailable)
+	}
+	if authorizer != nil && transport != nil && quota != nil {
+		app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal, quota, artifacts, artifactRequired))
+	} else {
+		app.Any(responsesEndpoint, unavailable)
+	}
+	if authorizer != nil && quota != nil {
+		app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
+		app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
+	} else {
+		app.Any(imagesGenerationsEndpoint, unavailable)
+		app.Any(imagesEditsEndpoint, unavailable)
+	}
 	if err := installApplicationMiddleware(app, policy); err != nil {
 		return nil, err
 	}

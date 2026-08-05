@@ -86,9 +86,7 @@ func (SubscriptionAllocationVersion) BeforeDelete(*gorm.DB) error {
 
 // PricingStore writes immutable inputs and resolves prices for request times.
 type PricingStore struct {
-	db        *gorm.DB
-	available bool
-	err       error
+	db *gorm.DB
 }
 
 // MigratePricing creates the immutable pricing input tables.
@@ -103,8 +101,6 @@ func MigratePricing(db *gorm.DB) error {
 }
 
 // InitializePricing persists new configuration without changing old rows.
-// A duplicate ID with a different checksum leaves analytics unavailable, while
-// the caller can keep the data plane running with the returned store.
 func InitializePricing(db *gorm.DB, pricing config.PricingConfig) (*PricingStore, error) {
 	if db == nil {
 		return nil, errors.New("pricing database is nil")
@@ -112,7 +108,7 @@ func InitializePricing(db *gorm.DB, pricing config.PricingConfig) (*PricingStore
 	if err := MigratePricing(db); err != nil {
 		return nil, err
 	}
-	store := &PricingStore{db: db, available: true}
+	store := &PricingStore{db: db}
 	if err := validatePricingInputs(&pricing); err != nil {
 		return nil, err
 	}
@@ -120,34 +116,22 @@ func InitializePricing(db *gorm.DB, pricing config.PricingConfig) (*PricingStore
 		if conflict, err := storedPricingEffectiveConflict(tx); err != nil {
 			return err
 		} else if conflict {
-			store.available = false
-			store.err = fmt.Errorf("%w: stored pricing versions share an effective time", errPricingVersionConflict)
+			return fmt.Errorf("%w: stored pricing versions share an effective time", errPricingVersionConflict)
 		}
 		if conflict, err := storedSubscriptionEffectiveConflict(tx); err != nil {
 			return err
 		} else if conflict {
-			store.available = false
-			store.err = fmt.Errorf("%w: stored subscription allocation versions share an effective time", errPricingVersionConflict)
+			return fmt.Errorf("%w: stored subscription allocation versions share an effective time", errPricingVersionConflict)
 		}
 		for index := range pricing.Versions {
 			version := pricing.Versions[index]
 			if err := insertPricingVersion(tx, version); err != nil {
-				if errors.Is(err, errPricingVersionConflict) {
-					store.available = false
-					store.err = err
-					continue
-				}
 				return fmt.Errorf("persist pricing version %q: %w", version.ID, err)
 			}
 		}
 		for index := range pricing.SubscriptionAllocationVersions {
 			version := pricing.SubscriptionAllocationVersions[index]
 			if err := insertSubscriptionVersion(tx, version); err != nil {
-				if errors.Is(err, errPricingVersionConflict) {
-					store.available = false
-					store.err = err
-					continue
-				}
 				return fmt.Errorf("persist subscription allocation version %q: %w", version.ID, err)
 			}
 		}
@@ -404,20 +388,12 @@ func subscriptionChecksum(input config.SubscriptionAllocationVersionConfig) (str
 	return hex.EncodeToString(digest[:]), nil
 }
 
-// Available reports whether immutable inputs agree with stored versions.
-func (s *PricingStore) Available() bool { return s != nil && s.available }
-
-// Err returns the immutable input conflict, if startup found one.
-func (s *PricingStore) Err() error {
-	if s == nil {
-		return errors.New("pricing store is unavailable")
-	}
-	return s.err
-}
+// Available reports whether pricing initialized successfully.
+func (s *PricingStore) Available() bool { return s != nil }
 
 func (s *PricingStore) resolvePricing(tx *gorm.DB, at time.Time, modelID string) (PricingVersion, ModelPrice, bool, error) {
-	if s == nil || !s.available || tx == nil {
-		return PricingVersion{}, ModelPrice{}, false, nil
+	if tx == nil {
+		return PricingVersion{}, ModelPrice{}, false, errors.New("pricing transaction is nil")
 	}
 	var version PricingVersion
 	if err := tx.Where("effective_at <= ?", at.UTC()).Order("effective_at DESC, id DESC").First(&version).Error; err != nil {

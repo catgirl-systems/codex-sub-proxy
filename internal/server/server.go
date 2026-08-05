@@ -84,6 +84,9 @@ func Start(cfg Config, readiness *Readiness) (*Servers, error) {
 }
 
 func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout time.Duration) (*Servers, error) {
+	if cfg.CleanupTimeout <= 0 {
+		cfg.CleanupTimeout = 10 * time.Second
+	}
 	if cfg.Listen == "" {
 		return nil, fmt.Errorf("data listener address is empty")
 	}
@@ -142,21 +145,13 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if pricingErr != nil {
 			return nil, fmt.Errorf("initialize pricing: %w", pricingErr)
 		}
-		if pricing.Available() {
-			deadline := cfg.JournalDrainDeadline
-			if deadline <= 0 {
-				deadline = cfg.Retention.DrainDeadline
-			}
-			if deadline <= 0 {
-				deadline = 10 * time.Second
-			}
-			reconcileContext, cancel := context.WithTimeout(context.Background(), deadline)
-			if err := reconcileTerminalUsagePricing(reconcileContext, cfg.Database, pricing); err != nil {
-				pricing.available = false
-				pricing.err = fmt.Errorf("startup usage pricing reconciliation: %w", err)
-			}
+		deadline := cfg.CleanupTimeout
+		reconcileContext, cancel := context.WithTimeout(context.Background(), deadline)
+		if err := reconcileTerminalUsagePricing(reconcileContext, cfg.Database, pricing); err != nil {
 			cancel()
+			return nil, fmt.Errorf("reconcile startup usage pricing: %w", err)
 		}
+		cancel()
 		if readiness != nil {
 			readiness.SetAnalyticsSource(func() bool {
 				return pricing.Available()
@@ -392,11 +387,7 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 	}
 	s.forceClose()
 	s.waitGroup.Wait()
-	cleanupTimeout := s.cleanupTimeout
-	if cleanupTimeout <= 0 {
-		cleanupTimeout = 10 * time.Second
-	}
-	cleanupContext, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	cleanupContext, cancel := context.WithTimeout(context.Background(), s.cleanupTimeout)
 	cleanupErr := s.closeResources(cleanupContext)
 	cancel()
 	if cleanupErr != nil {

@@ -104,9 +104,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
-		if journal != nil {
-			defer finishJournalRequest(ctx, journal, journalRequestID)
-		}
+		defer finishJournalRequest(ctx, journal, journalRequestID)
 		if client == nil {
 			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -121,9 +119,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			}
 			return
 		}
-		if lease != nil {
-			defer func() { _ = lease.release("request ended") }()
-		}
+		defer func() { _ = lease.release("request ended") }()
 		setTransportOutcome(ctx, "http")
 		result, err := client.Generate(request.Context(), codex.CodexImageGenerationRequest{
 			Model:             publicRequest.Model,
@@ -254,9 +250,7 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
-		if journal != nil {
-			defer finishJournalRequest(ctx, journal, journalRequestID)
-		}
+		defer finishJournalRequest(ctx, journal, journalRequestID)
 		if client == nil {
 			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -281,9 +275,7 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			}
 			return
 		}
-		if lease != nil {
-			defer func() { _ = lease.release("request ended") }()
-		}
+		defer func() { _ = lease.release("request ended") }()
 		setTransportOutcome(ctx, "http")
 		result, err := client.Edit(request.Context(), codex.CodexImageEditRequest{
 			Model:             publicRequest.Model,

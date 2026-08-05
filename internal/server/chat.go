@@ -207,13 +207,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
-		if journal != nil {
-			defer finishJournalRequest(ctx, journal, journalRequestID)
-		}
-		if transport == nil {
-			writeChatError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
-			return
-		}
+		defer finishJournalRequest(ctx, journal, journalRequestID)
 		privateRequest, err := privateChatRequest(publicRequest)
 		if err != nil {
 			if errors.Is(err, errChatUnsupported) {
@@ -233,9 +227,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			}
 			return
 		}
-		if lease != nil {
-			defer func() { _ = lease.release("request ended") }()
-		}
+		defer func() { _ = lease.release("request ended") }()
 		if publicRequest.Stream {
 			serveChatStream(ctx, requestContext, transport, privateRequest, publicRequest.Model, includeUsage, lease)
 			return
@@ -1226,9 +1218,6 @@ func (state *chatStreamState) event(event codex.CodexResponseStreamEvent) error 
 		return nil
 	}
 	if isCodexTerminal(event.Type) {
-		if event.Response == nil && event.Type != codex.CodexEventError {
-			return state.fail(errors.New("terminal response is missing"))
-		}
 		if event.Response == nil {
 			return state.fail(errors.New("terminal response is missing"))
 		}
