@@ -170,9 +170,6 @@ func SaveCredential(path string, credential Credential, keys envelope.KeySet) er
 }
 
 func saveCredential(ctx context.Context, path string, credential Credential, keys envelope.KeySet) error {
-	if ctx == nil {
-		return errors.New("credential save context is nil")
-	}
 	if err := checkCredentialContext(ctx, "save credential"); err != nil {
 		return err
 	}
@@ -198,9 +195,6 @@ func saveCredential(ctx context.Context, path string, credential Credential, key
 }
 
 func saveCredentialIfUnchanged(ctx context.Context, path string, expected, replacement Credential, keys envelope.KeySet) (Credential, bool, error) {
-	if ctx == nil {
-		return Credential{}, false, errors.New("credential save context is nil")
-	}
 	if err := checkCredentialContext(ctx, "compare credential"); err != nil {
 		return Credential{}, false, err
 	}
@@ -246,9 +240,6 @@ func checkCredentialContext(ctx context.Context, operation string) error {
 }
 
 func writeCredential(ctx context.Context, path string, encoded []byte) error {
-	if ctx == nil {
-		return errors.New("credential save context is nil")
-	}
 	directory := filepath.Dir(path)
 	if err := checkCredentialContext(ctx, "create credential directory"); err != nil {
 		return err
@@ -552,9 +543,8 @@ func readImportedCredential(ctx context.Context, sourcePath string) (Credential,
 		return Credential{}, nil, errors.New("credential source is not a regular file")
 	}
 	if strings.EqualFold(filepath.Ext(sourcePath), ".db") || filepath.Base(sourcePath) == "agent.db" {
-		if credential, err := readOMPCredential(ctx, sourcePath); err == nil {
-			return credential, info, nil
-		}
+		credential, err := readOMPCredential(ctx, sourcePath)
+		return credential, info, err
 	}
 	credential, err := readCredentialJSON(sourcePath)
 	return credential, info, err
@@ -722,6 +712,31 @@ func readCodexKeyring(ctx context.Context, codexHome string) ([]byte, error) {
 	return data, nil
 }
 
+type tokenIdentity struct {
+	accountID, userID, workspaceID, planType, email string
+	fedramp                                         bool
+}
+
+func (claims identityClaims) identity() tokenIdentity {
+	identity := tokenIdentity{
+		accountID:   firstNonEmpty(claims.AccountID, claims.AccountID2),
+		userID:      firstNonEmpty(claims.UserID, claims.Subject),
+		workspaceID: claims.WorkspaceID,
+		email:       claims.Email,
+	}
+	if claims.Auth != nil {
+		identity.accountID = firstNonEmpty(claims.Auth.AccountID, identity.accountID)
+		identity.userID = firstNonEmpty(claims.Auth.UserID, claims.Auth.UserID2, identity.userID)
+		identity.workspaceID = firstNonEmpty(claims.Auth.WorkspaceID, identity.workspaceID)
+		identity.planType = claims.Auth.PlanType
+		identity.fedramp = claims.Auth.AccountIsFedRAMP
+	}
+	if identity.email == "" && claims.Profile != nil {
+		identity.email = claims.Profile.Email
+	}
+	return identity
+}
+
 func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.Time, accountID, userID, workspaceID, planType string, fedramp bool, email string, requireIdentity bool) (Credential, error) {
 	credential := Credential{
 		AccessToken:      strings.TrimSpace(accessToken),
@@ -742,50 +757,25 @@ func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.T
 			credential.ExpiresAt = tokenExpiry
 		}
 	}
-	accessClaims := jwtIdentity(credential.AccessToken)
-	idClaims := jwtIdentity(idToken)
+	accessIdentity := jwtIdentity(credential.AccessToken).identity()
+	idIdentity := jwtIdentity(idToken).identity()
 	if credential.AccountID == "" {
-		credential.AccountID = firstNonEmpty(
-			accessClaims.AuthAccountID(),
-			accessClaims.AccountID,
-			accessClaims.AccountID2,
-			idClaims.AuthAccountID(),
-			idClaims.AccountID,
-			idClaims.AccountID2,
-		)
+		credential.AccountID = firstNonEmpty(accessIdentity.accountID, idIdentity.accountID)
 	}
 	if credential.UserID == "" {
-		credential.UserID = firstNonEmpty(
-			accessClaims.UserID,
-			accessClaims.AuthUserID(),
-			accessClaims.Subject,
-			idClaims.UserID,
-			idClaims.AuthUserID(),
-			idClaims.Subject,
-		)
+		credential.UserID = firstNonEmpty(accessIdentity.userID, idIdentity.userID)
 	}
 	if credential.WorkspaceID == "" {
-		credential.WorkspaceID = firstNonEmpty(
-			accessClaims.AuthWorkspaceID(),
-			accessClaims.WorkspaceID,
-			idClaims.AuthWorkspaceID(),
-			idClaims.WorkspaceID,
-			credential.AccountID,
-		)
+		credential.WorkspaceID = firstNonEmpty(accessIdentity.workspaceID, idIdentity.workspaceID, credential.AccountID)
 	}
 	if credential.PlanType == "" {
-		credential.PlanType = firstNonEmpty(accessClaims.AuthPlanType(), idClaims.AuthPlanType())
+		credential.PlanType = firstNonEmpty(accessIdentity.planType, idIdentity.planType)
 	}
 	if !credential.AccountIsFedRAMP {
-		credential.AccountIsFedRAMP = accessClaims.AuthFedRAMP() || idClaims.AuthFedRAMP()
+		credential.AccountIsFedRAMP = accessIdentity.fedramp || idIdentity.fedramp
 	}
 	if credential.Email == "" {
-		credential.Email = firstNonEmpty(
-			accessClaims.Email,
-			accessClaims.ProfileEmail(),
-			idClaims.Email,
-			idClaims.ProfileEmail(),
-		)
+		credential.Email = firstNonEmpty(accessIdentity.email, idIdentity.email)
 	}
 	if err := credentialValidation.Struct(credential); err != nil {
 		return Credential{}, errors.New("invalid credential")
@@ -794,45 +784,6 @@ func buildCredential(accessToken, refreshToken, idToken string, expiresAt time.T
 		return Credential{}, errors.New("credential is missing account identity")
 	}
 	return credential, nil
-}
-
-func (claims identityClaims) AuthAccountID() string {
-	if claims.Auth == nil {
-		return ""
-	}
-	return claims.Auth.AccountID
-}
-
-func (claims identityClaims) AuthUserID() string {
-	if claims.Auth == nil {
-		return ""
-	}
-	return firstNonEmpty(claims.Auth.UserID, claims.Auth.UserID2)
-}
-
-func (claims identityClaims) AuthWorkspaceID() string {
-	if claims.Auth == nil {
-		return ""
-	}
-	return claims.Auth.WorkspaceID
-}
-
-func (claims identityClaims) AuthPlanType() string {
-	if claims.Auth == nil {
-		return ""
-	}
-	return claims.Auth.PlanType
-}
-
-func (claims identityClaims) AuthFedRAMP() bool {
-	return claims.Auth != nil && claims.Auth.AccountIsFedRAMP
-}
-
-func (claims identityClaims) ProfileEmail() string {
-	if claims.Profile == nil {
-		return ""
-	}
-	return claims.Profile.Email
 }
 
 func jwtIdentity(token string) identityClaims {
