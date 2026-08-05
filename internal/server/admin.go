@@ -74,6 +74,10 @@ func newAdminApplication(readiness *Readiness, store *AdminTokenStore, apiKeySto
 }
 
 func newAdminApplicationWithLifecycle(readiness *Readiness, store *AdminTokenStore, apiKeyStore *apikey.Store, lifecycle adminLifecycleDependencies) (*iris.Application, error) {
+	return newAdminApplicationWithLifecyclePolicy(readiness, store, apiKeyStore, lifecycle, applicationPolicy{listener: "admin", admin: true})
+}
+
+func newAdminApplicationWithLifecyclePolicy(readiness *Readiness, store *AdminTokenStore, apiKeyStore *apikey.Store, lifecycle adminLifecycleDependencies, policy applicationPolicy) (*iris.Application, error) {
 	app := buildAdminHealthApplication(readiness)
 	app.Configure(iris.WithConfiguration(iris.Configuration{DisablePathCorrectionRedirection: true}))
 	if store != nil {
@@ -151,6 +155,9 @@ func newAdminApplicationWithLifecycle(readiness *Readiness, store *AdminTokenSto
 	registerAdminAPIKeyRoutes(app, store, apiKeyStore)
 	registerAdminLifecycleRoutes(app, store, lifecycle)
 	registerAdminAnalyticsRoutes(app, store, lifecycle)
+	if err := installApplicationMiddleware(app, policy); err != nil {
+		return nil, err
+	}
 	if err := app.Build(); err != nil {
 		return nil, err
 	}
@@ -373,6 +380,7 @@ func writeAdminError(ctx iris.Context, status int, message string) {
 }
 
 func writeAdminErrorCode(ctx iris.Context, status int, message, code string) {
+	setRequestError(ctx, errorClassForStatus(status), code)
 	writeJSON(ctx, status, struct {
 		Error struct {
 			Message string `json:"message"`

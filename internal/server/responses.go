@@ -151,6 +151,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 
+		setTransportOutcome(ctx, "http")
 		result, err := transport.Do(requestContext, privateRequest)
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
@@ -395,6 +396,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 
 	terminalWritten := false
 	lastSequence := -1
+	setTransportOutcome(ctx, "websocket")
 	streamErr := transport.Stream(requestContext, privateRequest, func(event codex.CodexResponseStreamEvent) error {
 		if requestContext.Err() != nil {
 			return requestContext.Err()
@@ -936,6 +938,7 @@ func responsesErrorTypeForCategory(category codex.ErrorCategory) string {
 }
 
 func writeResponsesError(ctx iris.Context, status int, typ, code, message string) {
+	setRequestError(ctx, errorClassForStatus(status), code)
 	if _, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue); !ok {
 		recordJournalRejection(ctx, status, "audit.rejected."+code)
 	}

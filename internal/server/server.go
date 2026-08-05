@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -40,6 +42,13 @@ type Config struct {
 	JournalQueueCapacity int
 	JournalDrainDeadline time.Duration
 	Pricing              config.PricingConfig
+	CORS                 config.CORSConfig
+	TrustedProxyCIDRs    []string
+	DataTLS              config.TLSConfig
+	AdminTLS             config.TLSConfig
+	Logger               *slog.Logger
+	Telemetry            *Telemetry
+	BuildVersion         string
 }
 
 type Servers struct {
@@ -54,6 +63,8 @@ type Servers struct {
 	journal       *Journal
 	retention     *RetentionRunner
 	artifacts     *ArtifactStore
+	telemetry     *Telemetry
+	logger        *slog.Logger
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
@@ -69,6 +80,28 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	}
 	if err := config.ValidateAdminCookieTransport(cfg.AdminListen, cfg.AdminCookieSecure); err != nil {
 		return nil, fmt.Errorf("validate admin cookie transport: %w", err)
+	}
+	if err := config.ValidateListenerTLS(cfg.Listen, cfg.DataTLS, false); err != nil {
+		return nil, fmt.Errorf("validate data listener security: %w", err)
+	}
+	if err := config.ValidateListenerTLS(cfg.AdminListen, cfg.AdminTLS, true); err != nil {
+		return nil, fmt.Errorf("validate admin listener security: %w", err)
+	}
+	trustedProxies, err := config.TrustedProxyPrefixes(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("validate trusted proxy configuration: %w", err)
+	}
+	dataTLS, err := loadTLSConfig(cfg.DataTLS)
+	if err != nil {
+		return nil, err
+	}
+	adminTLS, err := loadTLSConfig(cfg.AdminTLS)
+	if err != nil {
+		return nil, err
+	}
+	allowedOrigins, err := canonicalAllowedOrigins(cfg.CORS.AllowedOrigins)
+	if err != nil {
+		return nil, fmt.Errorf("validate CORS configuration: %w", err)
 	}
 
 	var pricing *PricingStore
@@ -190,13 +223,27 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			return adminStore != nil && adminStore.Available(context.Background())
 		})
 	}
-	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal, quota, cfg.ArtifactStore, cfg.ArtifactRequired)
+	dataHandler, err := newDataApplicationWithPolicy(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal, quota, cfg.ArtifactStore, cfg.ArtifactRequired, applicationPolicy{
+		listener:       "data",
+		allowedOrigins: allowedOrigins,
+		corsMaxAge:     cfg.CORS.MaxAge,
+		trustedProxies: trustedProxies,
+		logger:         cfg.Logger,
+		telemetry:      cfg.Telemetry,
+	})
 	if err != nil {
 		closeStarted()
 		return nil, fmt.Errorf("build data application: %w", err)
 	}
-	adminHandler, err := newAdminApplicationWithLifecycle(readiness, adminStore, apiKeyStore, adminLifecycleDependencies{
+	adminHandler, err := newAdminApplicationWithLifecyclePolicy(readiness, adminStore, apiKeyStore, adminLifecycleDependencies{
 		db: cfg.Database, keys: cfg.PayloadKeys, artifacts: cfg.ArtifactStore, retention: retention, pricing: pricing, cookieSecure: cfg.AdminCookieSecure,
+	}, applicationPolicy{
+		listener:       "admin",
+		admin:          true,
+		corsMaxAge:     cfg.CORS.MaxAge,
+		trustedProxies: trustedProxies,
+		logger:         cfg.Logger,
+		telemetry:      cfg.Telemetry,
 	})
 	if err != nil {
 		closeStarted()
@@ -206,13 +253,19 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	dataListener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		closeStarted()
-		return nil, fmt.Errorf("listen for data plane on %q: %w", cfg.Listen, err)
+		return nil, fmt.Errorf("listen for data plane: %w", err)
 	}
 	adminListener, err := net.Listen("tcp", cfg.AdminListen)
 	if err != nil {
 		_ = dataListener.Close()
 		closeStarted()
-		return nil, fmt.Errorf("listen for admin plane on %q: %w", cfg.AdminListen, err)
+		return nil, fmt.Errorf("listen for admin plane: %w", err)
+	}
+	if dataTLS != nil {
+		dataListener = tls.NewListener(dataListener, dataTLS)
+	}
+	if adminTLS != nil {
+		adminListener = tls.NewListener(adminListener, adminTLS)
 	}
 	servers := &Servers{
 		dataServer: &http.Server{
@@ -237,10 +290,16 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		journal:       journal,
 		retention:     retention,
 		artifacts:     cfg.ArtifactStore,
+		telemetry:     cfg.Telemetry,
+		logger:        cfg.Logger,
 	}
 	servers.waitGroup.Add(2)
 	go servers.serve(servers.dataServer, dataListener)
 	go servers.serve(servers.adminServer, adminListener)
+	if cfg.Logger != nil {
+		cfg.Logger.Info("server_started", "listener", "data", "tls", dataTLS != nil)
+		cfg.Logger.Info("server_started", "listener", "admin", "tls", adminTLS != nil)
+	}
 	return servers, nil
 }
 
@@ -284,7 +343,7 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			s.forceClose()
-			if err := s.closeJournal(ctx); err != nil {
+			if err := s.closeResources(ctx); err != nil {
 				errs = append(errs, err)
 			}
 			return errors.Join(append(errs, ctx.Err())...)
@@ -301,17 +360,29 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-serveDone:
-		if err := s.closeJournal(ctx); err != nil {
+		if err := s.closeResources(ctx); err != nil {
 			errs = append(errs, err)
 		}
-		return errors.Join(errs...)
 	case <-ctx.Done():
 		s.forceClose()
-		if err := s.closeJournal(ctx); err != nil {
+		if err := s.closeResources(ctx); err != nil {
 			errs = append(errs, err)
 		}
-		return errors.Join(append(errs, ctx.Err())...)
+		errs = append(errs, ctx.Err())
 	}
+	if s.logger != nil {
+		s.logger.Info("server_stopped", "listener", "data")
+		s.logger.Info("server_stopped", "listener", "admin")
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Servers) closeResources(ctx context.Context) error {
+	err := s.closeJournal(ctx)
+	if s.telemetry != nil {
+		err = errors.Join(err, s.telemetry.Shutdown(ctx))
+	}
+	return err
 }
 
 func (s *Servers) closeJournal(ctx context.Context) error {

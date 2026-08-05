@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1081,16 +1082,21 @@ func sha256ArtifactFile(chunks [][]byte) [sha256.Size]byte {
 	copy(result[:], digest.Sum(nil))
 	return result
 }
-
 func artifactImageMIME(data []byte) (string, bool) {
-	if len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n" {
-		return "image/png", true
+	var actual string
+	switch {
+	case len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n":
+		actual = "image/png"
+	case len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		actual = "image/jpeg"
+	case len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		actual = "image/webp"
+	default:
+		return "", false
 	}
-	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
-		return "image/jpeg", true
+	detected := strings.ToLower(strings.Split(http.DetectContentType(data), ";")[0])
+	if detected != actual && !(actual == "image/webp" && detected == "application/octet-stream") {
+		return "", false
 	}
-	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
-		return "image/webp", true
-	}
-	return "", false
+	return actual, true
 }

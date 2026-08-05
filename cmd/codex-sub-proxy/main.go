@@ -5,13 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
-	"time"
-
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
@@ -19,11 +12,19 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/server"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 	"gorm.io/gorm"
+	"log/slog"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 )
+
+var processLogger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		log.Print(err)
+		processLogger.Error("process_exit", "error_class", "startup", "error_code", "failed")
 		os.Exit(1)
 	}
 }
@@ -53,6 +54,23 @@ func run(args []string) error {
 		return err
 	}
 
+	var telemetry *server.Telemetry
+	telemetryHeaders := map[string]string{}
+	if cfg.Telemetry.Enabled {
+		var telemetryErr error
+		telemetryHeaders, telemetryErr = cfg.Telemetry.ResolveHeaders(os.LookupEnv)
+		if telemetryErr != nil {
+			processLogger.Warn("telemetry_unavailable", "error_class", "telemetry", "error_code", "headers_invalid")
+		} else {
+			telemetry, telemetryErr = server.NewTelemetry(context.Background(), cfg.Telemetry, telemetryHeaders, "dev")
+			if telemetryErr != nil {
+				processLogger.Warn("telemetry_unavailable", "error_class", "telemetry", "error_code", "exporter_unavailable")
+				telemetry = nil
+			}
+		}
+	} else {
+		telemetry, _ = server.NewTelemetry(context.Background(), cfg.Telemetry, telemetryHeaders, "dev")
+	}
 	payloadKeys, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
 	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
 	apiKeyHMACKey, apiKeyHMACErr := cfg.Security.APIKeyHMACKey(os.LookupEnv)
@@ -70,23 +88,23 @@ func run(args []string) error {
 	storageReady := false
 	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
 	if err != nil {
-		log.Printf("storage is unavailable: %v", err)
+		processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "path_unavailable")
 	} else {
 		db, err = storage.Open(context.Background(), databasePath, cfg.Storage.BusyTimeout)
 		if err != nil {
-			log.Printf("storage is unavailable: %v", err)
+			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "open")
 		} else if err := payload.Migrate(db); err != nil {
-			log.Printf("storage is unavailable: %v", err)
+			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "payload_migrate")
 		} else if err := apikey.Migrate(db); err != nil {
-			log.Printf("storage is unavailable: %v", err)
+			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "apikey_migrate")
 		} else if err := server.MigrateJournal(db); err != nil {
-			log.Printf("storage is unavailable: %v", err)
+			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "journal_migrate")
 		} else if payloadErr != nil {
-			log.Printf("artifact storage is unavailable: %v", payloadErr)
+			processLogger.Error("artifact_unavailable", "error_class", "storage", "error_code", "payload_key")
 		} else {
 			artifactStore, err = server.NewArtifactStore(db, cfg.Storage.ArtifactRoot, payloadKeys, cfg.Retention.ArtifactTTL)
 			if err != nil {
-				log.Printf("storage is unavailable: %v", err)
+				processLogger.Error("artifact_unavailable", "error_class", "storage", "error_code", "open")
 			} else {
 				storageReady = true
 			}
@@ -165,11 +183,22 @@ func run(args []string) error {
 		JournalQueueCapacity: cfg.Journal.QueueCapacity,
 		JournalDrainDeadline: cfg.Journal.DrainDeadline,
 		Pricing:              cfg.Pricing,
+		CORS:                 cfg.CORS,
+		TrustedProxyCIDRs:    cfg.Server.TrustedProxyCIDRs,
+		DataTLS:              cfg.Server.DataTLS,
+		AdminTLS:             cfg.Server.AdminTLS,
+		Logger:               processLogger,
+		Telemetry:            telemetry,
+		BuildVersion:         "dev",
 	}, readiness)
 	if err != nil {
+		if telemetry != nil {
+			_ = telemetry.Shutdown(context.Background())
+		}
+		processLogger.Error("server_start_failed", "error_class", "server", "error_code", "startup")
 		return err
 	}
-
+	processLogger.Info("process_started", "service", "codex-sub-proxy", "build_version", "dev")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	select {

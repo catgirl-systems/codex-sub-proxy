@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,6 +38,63 @@ const (
 	defaultRetentionDrainDeadline = 10 * time.Second
 	maxRetentionDuration          = 365 * 24 * time.Hour
 )
+const (
+	defaultTelemetryExportInterval  = 30 * time.Second
+	defaultTelemetryShutdownTimeout = 5 * time.Second
+	maxTelemetryHeaderEnvs          = 16
+	maxTelemetryDuration            = time.Hour
+	maxCORSOrigins                  = 32
+	maxTrustedProxyCIDRs            = 32
+)
+
+// TLSConfig contains one certificate and private key pair.
+type TLSConfig struct {
+	CertificateFile string `toml:"certificate_file"`
+	PrivateKeyFile  string `toml:"private_key_file"`
+}
+
+// CORSConfig contains the exact data-plane origins that may call the API.
+type CORSConfig struct {
+	AllowedOrigins []string      `toml:"allowed_origins"`
+	MaxAge         time.Duration `toml:"max_age"`
+}
+
+// TelemetryConfig contains bounded OpenTelemetry exporter settings.
+type TelemetryConfig struct {
+	Enabled         bool              `toml:"enabled"`
+	Endpoint        string            `toml:"endpoint"`
+	HeadersEnv      map[string]string `toml:"headers_env"`
+	ExportInterval  time.Duration     `toml:"export_interval"`
+	ShutdownTimeout time.Duration     `toml:"shutdown_timeout"`
+	Insecure        bool              `toml:"insecure"`
+}
+
+// ResolveHeaders loads header values from the named environment variables.
+func (t TelemetryConfig) ResolveHeaders(lookup func(string) (string, bool)) (map[string]string, error) {
+	if lookup == nil {
+		return nil, errors.New("telemetry header lookup is nil")
+	}
+	if len(t.HeadersEnv) > maxTelemetryHeaderEnvs {
+		return nil, errors.New("telemetry has too many header variables")
+	}
+	headers := make(map[string]string, len(t.HeadersEnv))
+	for header, envName := range t.HeadersEnv {
+		header = strings.TrimSpace(header)
+		envName = strings.TrimSpace(envName)
+		if header == "" || envName == "" || strings.ContainsAny(header, "\r\n") || strings.ContainsAny(envName, "\r\n") {
+			return nil, errors.New("telemetry header name or environment variable is invalid")
+		}
+		value, ok := lookup(envName)
+		if !ok || value == "" {
+			return nil, errors.New("telemetry header environment variable is missing")
+		}
+		if len(value) > 4096 || strings.ContainsAny(value, "\r\n") {
+			return nil, errors.New("telemetry header value is invalid")
+		}
+		headers[header] = value
+	}
+	return headers, nil
+}
 
 type Config struct {
 	Server    ServerConfig    `toml:"server"`
@@ -45,6 +104,8 @@ type Config struct {
 	Journal   JournalConfig   `toml:"journal"`
 	Retention RetentionConfig `toml:"retention"`
 	Pricing   PricingConfig   `toml:"pricing"`
+	CORS      CORSConfig      `toml:"cors"`
+	Telemetry TelemetryConfig `toml:"telemetry"`
 }
 
 // PricingConfig contains immutable public pricing and subscription inputs.
@@ -81,8 +142,11 @@ type SubscriptionAllocationVersionConfig struct {
 }
 
 type ServerConfig struct {
-	Listen      string `toml:"listen" validate:"required"`
-	AdminListen string `toml:"admin_listen" validate:"required"`
+	Listen            string    `toml:"listen" validate:"required"`
+	AdminListen       string    `toml:"admin_listen" validate:"required"`
+	TrustedProxyCIDRs []string  `toml:"trusted_proxy_cidrs" validate:"max=32"`
+	DataTLS           TLSConfig `toml:"data_tls"`
+	AdminTLS          TLSConfig `toml:"admin_tls"`
 }
 
 type StorageConfig struct {
@@ -217,7 +281,6 @@ func securityConfigStructValidation(sl validator.StructLevel) {
 		}
 	}
 }
-
 func Default() Config {
 	return Config{
 		Server: ServerConfig{
@@ -256,6 +319,11 @@ func Default() Config {
 			BatchSize:     defaultRetentionBatchSize,
 			DrainDeadline: defaultRetentionDrainDeadline,
 		},
+		CORS: CORSConfig{MaxAge: 10 * time.Minute},
+		Telemetry: TelemetryConfig{
+			ExportInterval:  defaultTelemetryExportInterval,
+			ShutdownTimeout: defaultTelemetryShutdownTimeout,
+		},
 	}
 }
 
@@ -264,22 +332,21 @@ func Load(path string) (Config, error) {
 	if path != "" {
 		contents, err := os.ReadFile(path)
 		if err != nil && !os.IsNotExist(err) {
-			return Config{}, fmt.Errorf("read config %q: %w", path, err)
+			return Config{}, fmt.Errorf("read config: %w", err)
 		}
 		if err == nil && len(strings.TrimSpace(string(contents))) > 0 {
 			metadata, err := toml.Decode(string(contents), &cfg)
 			if err != nil {
-				return Config{}, fmt.Errorf("decode config %q: %w", path, err)
+				return Config{}, fmt.Errorf("decode config: %w", err)
 			}
 			if undecoded := metadata.Undecoded(); len(undecoded) != 0 {
-				return Config{}, fmt.Errorf("decode config %q: unknown key %q", path, undecoded[0].String())
+				return Config{}, fmt.Errorf("decode config: unknown key")
 			}
 		}
 	}
 	if err := applyEnvironment(&cfg); err != nil {
 		return Config{}, err
 	}
-
 	artifactRoot, err := normalizeArtifactRoot(cfg.Storage.ArtifactRoot)
 	if err != nil {
 		return Config{}, err
@@ -288,13 +355,218 @@ func Load(path string) (Config, error) {
 	if err := validatePricingConfig(&cfg.Pricing); err != nil {
 		return Config{}, fmt.Errorf("validate pricing configuration: %w", err)
 	}
+	if err := validateCORSConfig(&cfg.CORS); err != nil {
+		return Config{}, fmt.Errorf("validate CORS configuration: %w", err)
+	}
+	if err := canonicalizeTrustedProxyCIDRs(&cfg.Server.TrustedProxyCIDRs); err != nil {
+		return Config{}, fmt.Errorf("validate trusted proxy configuration: %w", err)
+	}
+	if err := validateTelemetryConfig(&cfg.Telemetry); err != nil {
+		return Config{}, fmt.Errorf("validate telemetry configuration: %w", err)
+	}
 	if err := configurationValidation.Struct(cfg); err != nil {
 		return Config{}, fmt.Errorf("validate configuration: %w", err)
 	}
 	if err := ValidateAdminCookieTransport(cfg.Server.AdminListen, cfg.Security.AdminCookieSecure); err != nil {
 		return Config{}, fmt.Errorf("validate admin cookie transport: %w", err)
 	}
+	if err := ValidateListenerTLS(cfg.Server.Listen, cfg.Server.DataTLS, false); err != nil {
+		return Config{}, fmt.Errorf("validate data listener security: %w", err)
+	}
+	if err := ValidateListenerTLS(cfg.Server.AdminListen, cfg.Server.AdminTLS, true); err != nil {
+		return Config{}, fmt.Errorf("validate admin listener security: %w", err)
+	}
 	return cfg, nil
+}
+
+func validateCORSConfig(cors *CORSConfig) error {
+	if cors == nil {
+		return errors.New("CORS configuration is nil")
+	}
+	if len(cors.AllowedOrigins) > maxCORSOrigins {
+		return errors.New("CORS has too many origins")
+	}
+	if cors.MaxAge <= 0 || cors.MaxAge > 24*time.Hour {
+		return errors.New("CORS max age is out of bounds")
+	}
+	seen := make(map[string]struct{}, len(cors.AllowedOrigins))
+	for index := range cors.AllowedOrigins {
+		origin, err := CanonicalOrigin(cors.AllowedOrigins[index])
+		if err != nil {
+			return fmt.Errorf("origin %d: %w", index, err)
+		}
+		if _, ok := seen[origin]; ok {
+			return errors.New("CORS origins must be unique")
+		}
+		seen[origin] = struct{}{}
+		cors.AllowedOrigins[index] = origin
+	}
+	return nil
+}
+
+// CanonicalOrigin validates and canonicalizes one exact CORS origin.
+func CanonicalOrigin(raw string) (string, error) {
+	if raw == "" || len(raw) > 256 || strings.ContainsAny(raw, "*\r\n\t ") {
+		return "", errors.New("origin is invalid")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("origin must contain only scheme and host")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("origin scheme is unsupported")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return "", errors.New("origin host is empty")
+	}
+	if strings.Contains(host, "%") {
+		return "", errors.New("origin host zone is unsupported")
+	}
+	port := parsed.Port()
+	if port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", errors.New("origin port is invalid")
+		}
+	}
+	isLoopback := strings.EqualFold(host, "localhost")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		isLoopback = ip.IsLoopback()
+	}
+	if scheme == "http" && !isLoopback {
+		return "", errors.New("HTTP origins require loopback hosts")
+	}
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	canonicalHost := host
+	if strings.Contains(host, ":") {
+		canonicalHost = "[" + host + "]"
+	}
+	if port != "" {
+		canonicalHost += ":" + port
+	}
+	return scheme + "://" + canonicalHost, nil
+}
+
+func canonicalizeTrustedProxyCIDRs(cidrs *[]string) error {
+	if cidrs == nil {
+		return errors.New("trusted proxy list is nil")
+	}
+	if len(*cidrs) > maxTrustedProxyCIDRs {
+		return errors.New("trusted proxy list is too large")
+	}
+	seen := make(map[string]struct{}, len(*cidrs))
+	for index, raw := range *cidrs {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || !prefix.IsValid() {
+			return fmt.Errorf("CIDR %d is invalid", index)
+		}
+		prefix = prefix.Masked()
+		canonical := prefix.String()
+		if _, ok := seen[canonical]; ok {
+			return errors.New("trusted proxy CIDRs must be unique")
+		}
+		seen[canonical] = struct{}{}
+		(*cidrs)[index] = canonical
+	}
+	return nil
+}
+
+// TrustedProxyPrefixes returns canonical prefixes for request boundary use.
+func TrustedProxyPrefixes(cidrs []string) ([]netip.Prefix, error) {
+	if len(cidrs) > maxTrustedProxyCIDRs {
+		return nil, errors.New("trusted proxy list is too large")
+	}
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	seen := make(map[netip.Prefix]struct{}, len(cidrs))
+	for _, raw := range cidrs {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || !prefix.IsValid() {
+			return nil, errors.New("trusted proxy CIDR is invalid")
+		}
+		prefix = prefix.Masked()
+		if _, ok := seen[prefix]; ok {
+			return nil, errors.New("trusted proxy CIDRs must be unique")
+		}
+		seen[prefix] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+	return prefixes, nil
+}
+
+func validateTelemetryConfig(telemetry *TelemetryConfig) error {
+	if telemetry == nil {
+		return errors.New("telemetry configuration is nil")
+	}
+	if len(telemetry.HeadersEnv) > maxTelemetryHeaderEnvs {
+		return errors.New("telemetry has too many header variables")
+	}
+	if telemetry.ExportInterval <= 0 || telemetry.ExportInterval > maxTelemetryDuration {
+		return errors.New("telemetry export interval is out of bounds")
+	}
+	if telemetry.ShutdownTimeout <= 0 || telemetry.ShutdownTimeout > time.Minute {
+		return errors.New("telemetry shutdown timeout is out of bounds")
+	}
+	if !telemetry.Enabled {
+		return nil
+	}
+	if telemetry.Endpoint == "" {
+		return errors.New("telemetry endpoint is required when enabled")
+	}
+	parsed, err := url.Parse(telemetry.Endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return errors.New("telemetry endpoint is invalid")
+	}
+	if parsed.Scheme == "https" && telemetry.Insecure {
+		return errors.New("insecure telemetry transport is invalid for HTTPS")
+	}
+	if parsed.Scheme != "https" {
+		if parsed.Scheme != "http" || !telemetry.Insecure {
+			return errors.New("telemetry endpoint requires HTTPS")
+		}
+		host := strings.ToLower(parsed.Hostname())
+		ip, ipErr := netip.ParseAddr(host)
+		if ipErr != nil && !strings.EqualFold(host, "localhost") {
+			return errors.New("insecure telemetry endpoint must be loopback")
+		}
+		if ipErr == nil && !ip.IsLoopback() {
+			return errors.New("insecure telemetry endpoint must be loopback")
+		}
+	}
+	return nil
+}
+
+// ValidateListenerTLS enforces TLS and cookie policy for listener addresses.
+func ValidateListenerTLS(listen string, tlsConfig TLSConfig, admin bool) error {
+	if listen == "" {
+		return errors.New("listener address is empty")
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return errors.New("listener address is invalid")
+	}
+	hasCertificate := strings.TrimSpace(tlsConfig.CertificateFile) != ""
+	hasKey := strings.TrimSpace(tlsConfig.PrivateKeyFile) != ""
+	if hasCertificate != hasKey {
+		return errors.New("TLS certificate and private key must be configured together")
+	}
+	loopback := strings.EqualFold(host, "localhost")
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		loopback = ip.IsLoopback()
+	}
+	if host == "" || host == "*" {
+		loopback = false
+	}
+	if !loopback && !hasCertificate {
+		return errors.New("non-loopback listener requires TLS")
+	}
+	if admin && !loopback && !hasCertificate {
+		return errors.New("non-loopback admin listener requires TLS and secure cookies")
+	}
+	return nil
 }
 
 // ValidateAdminCookieTransport requires insecure admin cookies to use an explicit loopback listener.
@@ -681,10 +953,43 @@ func ExpandPath(path string) (string, error) {
 func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Server.Listen, "CSP_SERVER_LISTEN", "CSP_LISTEN")
 	overrideString(&cfg.Server.AdminListen, "CSP_SERVER_ADMIN_LISTEN", "CSP_ADMIN_LISTEN")
+	overrideString(&cfg.Server.DataTLS.CertificateFile, "CSP_SERVER_DATA_TLS_CERTIFICATE_FILE")
+	overrideString(&cfg.Server.DataTLS.PrivateKeyFile, "CSP_SERVER_DATA_TLS_PRIVATE_KEY_FILE")
+	overrideString(&cfg.Server.AdminTLS.CertificateFile, "CSP_SERVER_ADMIN_TLS_CERTIFICATE_FILE")
+	overrideString(&cfg.Server.AdminTLS.PrivateKeyFile, "CSP_SERVER_ADMIN_TLS_PRIVATE_KEY_FILE")
+	if value, ok := os.LookupEnv("CSP_SERVER_TRUSTED_PROXY_CIDRS"); ok {
+		cfg.Server.TrustedProxyCIDRs = splitEnvironmentList(value)
+	}
 	overrideString(&cfg.Storage.SQLitePath, "CSP_STORAGE_SQLITE_PATH", "CSP_SQLITE_PATH")
 	overrideString(&cfg.Storage.ArtifactRoot, "CSP_STORAGE_ARTIFACT_ROOT", "CSP_ARTIFACT_ROOT")
 	if err := overrideDuration(&cfg.Storage.BusyTimeout, "CSP_STORAGE_BUSY_TIMEOUT", "CSP_BUSY_TIMEOUT"); err != nil {
 		return err
+	}
+	if value, ok := os.LookupEnv("CSP_CORS_ALLOWED_ORIGINS"); ok {
+		cfg.CORS.AllowedOrigins = splitEnvironmentList(value)
+	}
+	if err := overrideDuration(&cfg.CORS.MaxAge, "CSP_CORS_MAX_AGE"); err != nil {
+		return err
+	}
+	if err := overrideBool(&cfg.Telemetry.Enabled, "CSP_OTEL_ENABLED", "CSP_TELEMETRY_ENABLED"); err != nil {
+		return err
+	}
+	overrideString(&cfg.Telemetry.Endpoint, "CSP_OTEL_ENDPOINT", "CSP_TELEMETRY_ENDPOINT")
+	if err := overrideDuration(&cfg.Telemetry.ExportInterval, "CSP_OTEL_EXPORT_INTERVAL", "CSP_TELEMETRY_EXPORT_INTERVAL"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Telemetry.ShutdownTimeout, "CSP_OTEL_SHUTDOWN_TIMEOUT", "CSP_TELEMETRY_SHUTDOWN_TIMEOUT"); err != nil {
+		return err
+	}
+	if err := overrideBool(&cfg.Telemetry.Insecure, "CSP_OTEL_INSECURE", "CSP_TELEMETRY_INSECURE"); err != nil {
+		return err
+	}
+	if value, ok := os.LookupEnv("CSP_OTEL_HEADERS_ENV"); ok {
+		headers, err := parseTelemetryHeaderEnvList(value)
+		if err != nil {
+			return err
+		}
+		cfg.Telemetry.HeadersEnv = headers
 	}
 	overrideString(&cfg.Security.PayloadEncryptionKeyEnv, "CSP_SECURITY_PAYLOAD_ENCRYPTION_KEY_ENV")
 	overrideString(&cfg.Security.CredentialEncryptionKeyEnv, "CSP_SECURITY_CREDENTIAL_ENCRYPTION_KEY_ENV")
@@ -704,10 +1009,10 @@ func applyEnvironment(cfg *Config) error {
 	if err := overrideDuration(&cfg.Retention.ArtifactTTL, "CSP_RETENTION_ARTIFACT_TTL", "CSP_ARTIFACT_TTL"); err != nil {
 		return err
 	}
-	if err := overrideDuration(&cfg.Retention.PayloadTTL, "CSP_RETENTION_PAYLOAD_TTL", "CSP_PAYLOAD_TTL"); err != nil {
+	if err := overrideDuration(&cfg.Retention.PayloadTTL, "CSP_RETENTION_PAYLOAD_TTL"); err != nil {
 		return err
 	}
-	if err := overrideDuration(&cfg.Retention.MetadataTTL, "CSP_RETENTION_METADATA_TTL", "CSP_METADATA_TTL"); err != nil {
+	if err := overrideDuration(&cfg.Retention.MetadataTTL, "CSP_RETENTION_METADATA_TTL"); err != nil {
 		return err
 	}
 	if err := overrideDuration(&cfg.Retention.SweepInterval, "CSP_RETENTION_SWEEP_INTERVAL", "CSP_RETENTION_INTERVAL"); err != nil {
@@ -719,11 +1024,9 @@ func applyEnvironment(cfg *Config) error {
 	if err := overrideDuration(&cfg.Retention.DrainDeadline, "CSP_RETENTION_DRAIN_DEADLINE"); err != nil {
 		return err
 	}
-	if err := applyPricingEnvironment(&cfg.Pricing); err != nil {
-		return err
-	}
-	return nil
+	return applyPricingEnvironment(&cfg.Pricing)
 }
+
 func applyPricingEnvironment(pricing *PricingConfig) error {
 	if pricing == nil {
 		return errors.New("pricing configuration is nil")
@@ -768,12 +1071,7 @@ func applyPricingEnvironment(pricing *PricingConfig) error {
 }
 
 func hasPricingVersionEnvironment() bool {
-	for _, name := range []string{
-		"CSP_PRICING_VERSION_ID",
-		"CSP_PRICING_EFFECTIVE_AT",
-		"CSP_PRICING_CURRENCY",
-		"CSP_PRICING_MODELS_JSON",
-	} {
+	for _, name := range []string{"CSP_PRICING_VERSION_ID", "CSP_PRICING_EFFECTIVE_AT", "CSP_PRICING_CURRENCY", "CSP_PRICING_MODELS_JSON"} {
 		if _, ok := os.LookupEnv(name); ok {
 			return true
 		}
@@ -806,13 +1104,7 @@ func pricingVersionFromEnvironment(pricing PricingConfig) (PricingVersionConfig,
 }
 
 func hasSubscriptionEnvironment() bool {
-	for _, name := range []string{
-		"CSP_SUBSCRIPTION_ALLOCATION_VERSION_ID",
-		"CSP_SUBSCRIPTION_ALLOCATION_EFFECTIVE_AT",
-		"CSP_SUBSCRIPTION_ALLOCATION_CURRENCY",
-		"CSP_SUBSCRIPTION_ALLOCATION_MONTHLY_COST_MICROUNITS",
-		"CSP_SUBSCRIPTION_ALLOCATION_BASIS",
-	} {
+	for _, name := range []string{"CSP_SUBSCRIPTION_ALLOCATION_VERSION_ID", "CSP_SUBSCRIPTION_ALLOCATION_EFFECTIVE_AT", "CSP_SUBSCRIPTION_ALLOCATION_CURRENCY", "CSP_SUBSCRIPTION_ALLOCATION_MONTHLY_COST_MICROUNITS", "CSP_SUBSCRIPTION_ALLOCATION_BASIS"} {
 		if _, ok := os.LookupEnv(name); ok {
 			return true
 		}
@@ -906,4 +1198,47 @@ func overrideInt(dst *int, names ...string) error {
 		}
 	}
 	return nil
+}
+
+func overrideBool(dst *bool, names ...string) error {
+	for _, name := range names {
+		if value, ok := os.LookupEnv(name); ok {
+			parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+			if err != nil {
+				return fmt.Errorf("parse %s: %w", name, err)
+			}
+			*dst = parsed
+			return nil
+		}
+	}
+	return nil
+}
+
+func splitEnvironmentList(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
+}
+
+func parseTelemetryHeaderEnvList(value string) (map[string]string, error) {
+	parts := splitEnvironmentList(value)
+	headers := make(map[string]string, len(parts))
+	for _, part := range parts {
+		name, envName, ok := strings.Cut(part, "=")
+		if !ok || strings.TrimSpace(name) == "" || strings.TrimSpace(envName) == "" {
+			return nil, errors.New("telemetry header environment mapping is invalid")
+		}
+		name = strings.TrimSpace(name)
+		envName = strings.TrimSpace(envName)
+		if _, exists := headers[name]; exists {
+			return nil, errors.New("telemetry header environment mappings must be unique")
+		}
+		headers[name] = envName
+	}
+	return headers, nil
 }

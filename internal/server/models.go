@@ -25,6 +25,10 @@ type modelsResponse struct {
 }
 
 func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) (*iris.Application, error) {
+	return newDataApplicationWithPolicy(readiness, db, hmacKey, transport, imagesClient, journal, quota, artifacts, artifactRequired, applicationPolicy{listener: "data"})
+}
+
+func newDataApplicationWithPolicy(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool, policy applicationPolicy) (*iris.Application, error) {
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
 	app.Get(modelsEndpoint, func(ctx iris.Context) {
@@ -58,6 +62,9 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, trans
 	app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal, quota, artifacts, artifactRequired))
 	app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
 	app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
+	if err := installApplicationMiddleware(app, policy); err != nil {
+		return nil, err
+	}
 	if err := app.Build(); err != nil {
 		return nil, err
 	}
@@ -82,6 +89,7 @@ func writeAPIKeyError(ctx iris.Context, err error) {
 		typeName = "permission_error"
 		code = "insufficient_permissions"
 	}
+	setRequestError(ctx, errorClassForStatus(status), code)
 	writeJSON(ctx, status, struct {
 		Error struct {
 			Message string  `json:"message"`

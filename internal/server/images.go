@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -125,6 +124,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 		if lease != nil {
 			defer func() { _ = lease.release("request ended") }()
 		}
+		setTransportOutcome(ctx, "http")
 		result, err := client.Generate(request.Context(), codex.CodexImageGenerationRequest{
 			Model:             publicRequest.Model,
 			Prompt:            publicRequest.Prompt,
@@ -284,6 +284,7 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 		if lease != nil {
 			defer func() { _ = lease.release("request ended") }()
 		}
+		setTransportOutcome(ctx, "http")
 		result, err := client.Edit(request.Context(), codex.CodexImageEditRequest{
 			Model:             publicRequest.Model,
 			Prompt:            publicRequest.Prompt,
@@ -362,6 +363,7 @@ func writeImagesMethodNotAllowed(ctx iris.Context) {
 }
 
 func writeImagesError(ctx iris.Context, status int, code, message string) {
+	setRequestError(ctx, errorClassForStatus(status), code)
 	typeName := "invalid_request_error"
 	if status == http.StatusTooManyRequests {
 		typeName = "rate_limit_error"
@@ -595,16 +597,7 @@ func imageDeclaredMIMEMatches(header *multipart.FileHeader, actual string) bool 
 }
 
 func imageMIME(data []byte) (string, bool) {
-	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
-		return "image/png", true
-	}
-	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
-		return "image/jpeg", true
-	}
-	if len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")) {
-		return "image/webp", true
-	}
-	return "", false
+	return artifactImageMIME(data)
 }
 
 func imageEditInputs(dataURLs []string) []codex.CodexImageEditInput {

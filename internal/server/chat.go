@@ -245,6 +245,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
+		setTransportOutcome(ctx, "http")
 		result, err := transport.Do(requestContext, privateRequest)
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
@@ -299,6 +300,7 @@ func writeChatDecodeError(ctx iris.Context, err error) {
 }
 
 func writeChatError(ctx iris.Context, status int, typ, code, message string) {
+	setRequestError(ctx, errorClassForStatus(status), code)
 	if _, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue); !ok {
 		recordJournalRejection(ctx, status, "audit.rejected."+code)
 	}
@@ -1105,6 +1107,7 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 	}
 
 	state := newChatStreamState(model, includeUsage, writer, flusher)
+	setTransportOutcome(ctx, "websocket")
 	state.lease = lease
 	streamErr := transport.Stream(requestContext, privateRequest, state.event)
 	if requestContext.Err() != nil {
