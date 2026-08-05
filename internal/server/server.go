@@ -17,6 +17,7 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 	"gorm.io/gorm"
 )
 
@@ -40,6 +41,7 @@ type Config struct {
 	AdminCookieSecure    bool
 	PayloadKeys          envelope.KeySet
 	ResponsesTransport   *codex.ResponsesTransport
+	StartupLock          *storage.ApplicationLock
 	ImagesClient         *codex.ImagesClient
 	ArtifactStore        *ArtifactStore
 	ArtifactRequired     bool
@@ -53,26 +55,28 @@ type Config struct {
 	DataTLS              config.TLSConfig
 	AdminTLS             config.TLSConfig
 	Logger               *slog.Logger
+	CleanupTimeout       time.Duration
 	Telemetry            *Telemetry
 }
 
 type Servers struct {
-	dataServer    *http.Server
-	adminServer   *http.Server
-	dataListener  net.Listener
-	adminListener net.Listener
-	dataAddr      string
-	adminAddr     string
-	errors        chan error
-	waitGroup     sync.WaitGroup
-	journal       *Journal
-	retention     *RetentionRunner
-	artifacts     *ArtifactStore
-	telemetry     *Telemetry
-	logger        *slog.Logger
-	shutdownMu    sync.Mutex
-	shutdownDone  bool
-	shutdownErr   error
+	dataServer     *http.Server
+	adminServer    *http.Server
+	dataListener   net.Listener
+	adminListener  net.Listener
+	dataAddr       string
+	adminAddr      string
+	errors         chan error
+	waitGroup      sync.WaitGroup
+	journal        *Journal
+	retention      *RetentionRunner
+	artifacts      *ArtifactStore
+	telemetry      *Telemetry
+	logger         *slog.Logger
+	shutdownMu     sync.Mutex
+	shutdownDone   bool
+	shutdownErr    error
+	cleanupTimeout time.Duration
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
@@ -293,16 +297,25 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			IdleTimeout:       idleTimeout,
 			MaxHeaderBytes:    64 * 1024,
 		},
-		dataListener:  dataListener,
-		adminListener: adminListener,
-		dataAddr:      dataListener.Addr().String(),
-		adminAddr:     adminListener.Addr().String(),
-		errors:        errorsChannel,
-		journal:       journal,
-		retention:     retention,
-		artifacts:     cfg.ArtifactStore,
-		telemetry:     cfg.Telemetry,
-		logger:        cfg.Logger,
+		dataListener:   dataListener,
+		adminListener:  adminListener,
+		dataAddr:       dataListener.Addr().String(),
+		adminAddr:      adminListener.Addr().String(),
+		errors:         errorsChannel,
+		journal:        journal,
+		retention:      retention,
+		artifacts:      cfg.ArtifactStore,
+		cleanupTimeout: cfg.CleanupTimeout,
+		telemetry:      cfg.Telemetry,
+		logger:         cfg.Logger,
+	}
+	if cfg.StartupLock != nil {
+		if err := cfg.StartupLock.DowngradeShared(); err != nil {
+			_ = dataListener.Close()
+			_ = adminListener.Close()
+			closeStarted()
+			return nil, fmt.Errorf("downgrade startup application lock: %w", err)
+		}
 	}
 	servers.waitGroup.Add(2)
 	go servers.serve(servers.dataServer, dataListener)
@@ -353,42 +366,44 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 		shutdownErrors <- s.adminServer.Shutdown(ctx)
 	}()
 	var errs []error
-	timedOut := false
-	for range 2 {
+	callerErr := error(nil)
+	completed := 0
+	for completed < 2 {
 		select {
 		case err := <-shutdownErrors:
+			completed++
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errs = append(errs, err)
 			}
 		case <-ctx.Done():
-			timedOut = true
-			errs = append(errs, ctx.Err())
+			if callerErr == nil {
+				callerErr = ctx.Err()
+				errs = append(errs, callerErr)
+			}
 			s.forceClose()
-		}
-		if timedOut {
-			break
+			for completed < 2 {
+				err := <-shutdownErrors
+				completed++
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
+					errs = append(errs, err)
+				}
+			}
 		}
 	}
-	if !timedOut {
-		serveDone := make(chan struct{})
-		go func() {
-			s.waitGroup.Wait()
-			close(serveDone)
-		}()
-		select {
-		case <-serveDone:
-		case <-ctx.Done():
-			s.forceClose()
-			errs = append(errs, ctx.Err())
-		}
+	s.forceClose()
+	s.waitGroup.Wait()
+	cleanupTimeout := s.cleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = 10 * time.Second
 	}
-	if err := s.closeResources(ctx); err != nil {
-		errs = append(errs, err)
+	cleanupContext, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	cleanupErr := s.closeResources(cleanupContext)
+	cancel()
+	if cleanupErr != nil {
+		errs = append(errs, cleanupErr)
 	}
 	s.shutdownErr = errors.Join(errs...)
-	if s.shutdownErr == nil {
-		s.shutdownDone = true
-	}
+	s.shutdownDone = true
 	if s.logger != nil {
 		s.logger.Info("server_stopped", "listener", "data")
 		s.logger.Info("server_stopped", "listener", "admin")
@@ -400,6 +415,9 @@ func (s *Servers) closeResources(ctx context.Context) error {
 	var errs []error
 	if s.retention != nil {
 		if err := s.retention.Close(ctx); err != nil {
+			if retryErr := s.retention.Close(context.Background()); retryErr != nil {
+				err = errors.Join(err, fmt.Errorf("retry retention cleanup: %w", retryErr))
+			}
 			errs = append(errs, err)
 		}
 	}
@@ -408,13 +426,13 @@ func (s *Servers) closeResources(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
-	if s.telemetry != nil {
-		if err := s.telemetry.Shutdown(ctx); err != nil {
+	if s.artifacts != nil && (s.retention == nil || s.retention.workerDone()) {
+		if err := s.artifacts.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if s.artifacts != nil && (s.retention == nil || s.retention.workerDone()) {
-		if err := s.artifacts.Close(); err != nil {
+	if s.telemetry != nil {
+		if err := s.telemetry.Shutdown(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}

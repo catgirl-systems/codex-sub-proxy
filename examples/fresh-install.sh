@@ -120,8 +120,12 @@ if [ -z "$API_KEY" ]; then
 fi
 RESPONSE=$(curl -fsS --max-time 15 -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
 	-d '{"model":"gpt-4.1","input":"hello"}' "http://$DATA_LISTEN/v1/responses")
-case "$RESPONSE" in
-	*"dry-run-response"*) ;;
-	*) echo "Responses validation failed" >&2; exit 1 ;;
-esac
+if ! printf '%s' "$RESPONSE" | go run ./scripts/validate-response; then
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry-run Responses validation failed" >&2
+	else
+		echo "Responses response validation failed" >&2
+	fi
+	exit 1
+fi
 printf '%s\n' "fresh install complete"

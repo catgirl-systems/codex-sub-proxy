@@ -17,13 +17,12 @@ esac
 case "$SOURCE_DATE_EPOCH" in
 	''|*[!0-9]*) echo "SOURCE_DATE_EPOCH must be a non-negative integer" >&2; exit 1 ;;
 esac
+if [ "${OUT_DIR#/}" = "$OUT_DIR" ]; then
+	OUT_DIR="$ROOT/$OUT_DIR"
+fi
 case "$OUT_DIR" in
 	/|"$ROOT"|*"/../"*|*"/..") echo "unsafe output path" >&2; exit 1 ;;
 esac
-if [ -L "$OUT_DIR" ]; then
-	echo "output path must not be a symlink" >&2
-	exit 1
-fi
 if [ -z "$COMMIT" ]; then
 	if ! COMMIT=$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null); then
 		echo "COMMIT is required outside a git work tree" >&2
@@ -44,8 +43,7 @@ if ! (cd "$ROOT" && go mod verify); then
 	exit 1
 fi
 
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR"
+go run ./scripts/release-output -path "$OUT_DIR"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/csp-release.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 mkdir -p "$WORK/bin"

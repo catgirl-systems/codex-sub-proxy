@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,8 @@ const (
 	restoreMarkerSuffix      = ".restore-marker"
 )
 
+var restoreRenamePath = os.Rename
+
 type BackupEntry struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
@@ -52,14 +55,12 @@ type BackupManifest struct {
 }
 
 type RestoreOptions struct {
-	DatabasePath          string
-	ArtifactRoot          string
-	Input                 string
-	Force                 bool
-	PayloadKeyVersions    []uint32
-	CredentialKeyVersions []uint32
-	JournalKeyVersions    []uint32
-	BusyTimeout           time.Duration
+	DatabasePath       string
+	ArtifactRoot       string
+	Input              string
+	Force              bool
+	PayloadKeyVersions []uint32
+	BusyTimeout        time.Duration
 }
 
 type restoreMarker struct {
@@ -69,6 +70,9 @@ type restoreMarker struct {
 	OldArtifacts string `json:"old_artifacts"`
 	NewDatabase  string `json:"new_database"`
 	NewArtifacts string `json:"new_artifacts"`
+	State        string `json:"state"`
+	HadDatabase  bool   `json:"had_database"`
+	HadArtifacts bool   `json:"had_artifacts"`
 }
 
 type backupArtifact struct {
@@ -78,6 +82,27 @@ type backupArtifact struct {
 
 // CreateBackup writes one online SQLite snapshot and its referenced ciphertext.
 func CreateBackup(ctx context.Context, db *gorm.DB, artifacts *ArtifactStore, destination, principal string) error {
+	var barrier *ArtifactBarrier
+	var err error
+	if artifacts != nil {
+		barrier, err = AcquireArtifactBarrier(ctx, artifacts.rootPath, ArtifactBarrierExclusive)
+		if err != nil {
+			return err
+		}
+		defer barrier.Close()
+	}
+	return createBackup(ctx, db, artifacts, destination, principal, barrier)
+}
+
+// CreateBackupWithBarrier writes a backup while the caller owns the artifact barrier.
+func CreateBackupWithBarrier(ctx context.Context, db *gorm.DB, artifacts *ArtifactStore, destination, principal string, barrier *ArtifactBarrier) error {
+	if artifacts != nil && barrier == nil {
+		return errors.New("backup artifact barrier is nil")
+	}
+	return createBackup(ctx, db, artifacts, destination, principal, barrier)
+}
+
+func createBackup(ctx context.Context, db *gorm.DB, artifacts *ArtifactStore, destination, principal string, barrier *ArtifactBarrier) error {
 	if ctx == nil {
 		return errors.New("backup context is nil")
 	}
@@ -129,8 +154,17 @@ func CreateBackup(ctx context.Context, db *gorm.DB, artifacts *ArtifactStore, de
 	if err != nil {
 		return fmt.Errorf("hash backup snapshot: %w", err)
 	}
+	snapshotDB, err := storage.Open(ctx, snapshotPath, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("open backup snapshot: %w", err)
+	}
+	snapshotSQL, err := snapshotDB.DB()
+	if err != nil {
+		return fmt.Errorf("get backup snapshot database: %w", err)
+	}
+	defer snapshotSQL.Close()
 
-	artifactFiles, keyVersions, totalSize, err := collectBackupArtifacts(artifacts, ctx)
+	artifactFiles, keyVersions, totalSize, err := collectBackupArtifacts(snapshotDB, artifacts, ctx)
 	if err != nil {
 		return err
 	}
@@ -192,13 +226,16 @@ func vacuumInto(ctx context.Context, db *gorm.DB, destination string) error {
 	return nil
 }
 
-func collectBackupArtifacts(artifacts *ArtifactStore, ctx context.Context) ([]backupArtifact, map[string][]uint32, int64, error) {
-	keyVersions := map[string][]uint32{}
+func collectBackupArtifacts(db *gorm.DB, artifacts *ArtifactStore, ctx context.Context) ([]backupArtifact, map[string][]uint32, int64, error) {
+	keyVersions, err := inventoryBackupKeyVersions(db, ctx)
+	if err != nil {
+		return nil, nil, 0, err
+	}
 	if artifacts == nil {
 		return nil, keyVersions, 0, nil
 	}
 	var records []ArtifactRecord
-	if err := artifacts.db.WithContext(ctx).Where("state = ? AND deleted_at IS NULL", artifactStateReady).Order("relative_path ASC").Find(&records).Error; err != nil {
+	if err := db.WithContext(ctx).Where("state = ? AND deleted_at IS NULL", artifactStateReady).Order("relative_path ASC").Find(&records).Error; err != nil {
 		return nil, nil, 0, fmt.Errorf("load backup artifact records: %w", err)
 	}
 	if len(records) > backupMaxEntries {
@@ -228,6 +265,58 @@ func collectBackupArtifacts(artifacts *ArtifactStore, ctx context.Context) ([]ba
 	}
 	keyVersions["artifact"] = uniqueSortedVersions(keyVersions["artifact"])
 	return files, keyVersions, total, nil
+}
+
+func inventoryBackupKeyVersions(db *gorm.DB, ctx context.Context) (map[string][]uint32, error) {
+	if db == nil {
+		return nil, errors.New("backup database is nil")
+	}
+	result := map[string][]uint32{"payload": []uint32{}, "journal": []uint32{}, "artifact": []uint32{}}
+	for domain, table := range map[string]string{
+		"payload":  "encrypted_payloads",
+		"journal":  "journal_records",
+		"artifact": "artifacts",
+	} {
+		rows, err := db.WithContext(ctx).Raw("SELECT DISTINCT key_version FROM " + table + " ORDER BY key_version").Rows()
+		if err != nil {
+			return nil, fmt.Errorf("scan %s key versions: %w", domain, err)
+		}
+		for rows.Next() {
+			var value sql.NullInt64
+			if err := rows.Scan(&value); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("read %s key version: %w", domain, err)
+			}
+			if !value.Valid || value.Int64 <= 0 || value.Int64 > int64(^uint32(0)) {
+				_ = rows.Close()
+				return nil, fmt.Errorf("%s key version is invalid", domain)
+			}
+			result[domain] = append(result[domain], uint32(value.Int64))
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan %s key versions: %w", domain, err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close %s key versions: %w", domain, err)
+		}
+		result[domain] = uniqueSortedVersions(result[domain])
+	}
+	return result, nil
+}
+
+func keyVersionsEqual(left, right map[string][]uint32) bool {
+	for _, domain := range []string{"payload", "journal", "artifact"} {
+		if len(left[domain]) != len(right[domain]) {
+			return false
+		}
+		for index := range left[domain] {
+			if left[domain][index] != right[domain][index] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func uniqueSortedVersions(values []uint32) []uint32 {
@@ -430,12 +519,9 @@ func validateBackupDestination(destination string) (string, error) {
 	if strings.TrimSpace(destination) == "" {
 		return "", errors.New("backup destination is empty")
 	}
-	absolute, err := filepath.Abs(destination)
+	absolute, err := absoluteCleanPath(destination)
 	if err != nil {
 		return "", fmt.Errorf("resolve backup destination: %w", err)
-	}
-	if filepath.Clean(absolute) != absolute || absolute == string(filepath.Separator) {
-		return "", errors.New("backup destination path is unsafe")
 	}
 	parent := filepath.Dir(absolute)
 	info, err := os.Stat(parent)
@@ -488,18 +574,34 @@ func Restore(ctx context.Context, options RestoreOptions) error {
 	if err := validateRestoreInput(input); err != nil {
 		return err
 	}
-	lock, err := storage.AcquireApplicationLock(ctx, databasePath)
+	lock, err := storage.AcquireApplicationLock(ctx, databasePath, storage.ApplicationLockExclusive)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	workParent, err := os.MkdirTemp(filepath.Dir(databasePath), ".csp-restore-*")
+	artifactBarrier, err := AcquireArtifactBarrier(ctx, artifactRoot, ArtifactBarrierExclusive)
 	if err != nil {
-		return fmt.Errorf("create restore workspace: %w", err)
+		return err
 	}
-	defer os.RemoveAll(workParent)
-	stagedDB := filepath.Join(workParent, backupDatabaseName)
-	stagedRoot := filepath.Join(workParent, "artifacts")
+	defer artifactBarrier.Close()
+	if err := recoverRestoreLocked(databasePath); err != nil {
+		return err
+	}
+	if err := preflightRestoreParents(databasePath, artifactRoot); err != nil {
+		return err
+	}
+	dbStageDir, err := os.MkdirTemp(filepath.Dir(databasePath), ".csp-restore-db-*")
+	if err != nil {
+		return fmt.Errorf("create restore database workspace: %w", err)
+	}
+	defer os.RemoveAll(dbStageDir)
+	rootStageDir, err := os.MkdirTemp(filepath.Dir(artifactRoot), ".csp-restore-artifacts-*")
+	if err != nil {
+		return fmt.Errorf("create restore artifact workspace: %w", err)
+	}
+	defer os.RemoveAll(rootStageDir)
+	stagedDB := filepath.Join(dbStageDir, backupDatabaseName)
+	stagedRoot := filepath.Join(rootStageDir, "artifacts")
 	if err := os.Mkdir(stagedRoot, 0o700); err != nil {
 		return fmt.Errorf("create restore artifact root: %w", err)
 	}
@@ -519,7 +621,10 @@ func Restore(ctx context.Context, options RestoreOptions) error {
 	if err := syncDirectory(stagedRoot); err != nil {
 		return err
 	}
-	if err := syncDirectory(workParent); err != nil {
+	if err := syncDirectory(rootStageDir); err != nil {
+		return err
+	}
+	if err := syncDirectory(dbStageDir); err != nil {
 		return err
 	}
 	if err := installRestoreSet(databasePath, artifactRoot, stagedDB, stagedRoot, options.Force); err != nil {
@@ -719,26 +824,41 @@ func validateRestoreManifest(manifest BackupManifest, options RestoreOptions) er
 			return errors.New("restore manifest has unknown entry")
 		}
 	}
-	if !versionsSortedUnique(manifest.KeyVersions["artifact"]) {
-		return errors.New("restore manifest key versions are invalid")
+	if manifest.KeyVersions == nil {
+		return errors.New("restore manifest key versions are missing")
 	}
-	if err := requireConfiguredVersions(manifest.KeyVersions["artifact"], options.PayloadKeyVersions); err != nil {
-		return err
+	for domain := range manifest.KeyVersions {
+		if domain != "payload" && domain != "journal" && domain != "artifact" {
+			return fmt.Errorf("restore manifest key domain %q is unsupported", domain)
+		}
+	}
+	for _, domain := range []string{"payload", "journal", "artifact"} {
+		versions, ok := manifest.KeyVersions[domain]
+		if !ok {
+			return fmt.Errorf("restore manifest %s key versions are missing", domain)
+		}
+		if !versionsSortedUnique(versions) {
+			return fmt.Errorf("restore manifest %s key versions are invalid", domain)
+		}
+		if err := requireConfiguredVersions(domain, versions, options.PayloadKeyVersions); err != nil {
+			return err
+		}
 	}
 	return nil
 }
-
-func requireConfiguredVersions(required, configured []uint32) error {
+func requireConfiguredVersions(domain string, required, configured []uint32) error {
 	if len(required) == 0 {
 		return nil
 	}
 	allowed := make(map[uint32]struct{}, len(configured))
 	for _, version := range configured {
-		allowed[version] = struct{}{}
+		if version != 0 {
+			allowed[version] = struct{}{}
+		}
 	}
 	for _, version := range required {
 		if _, ok := allowed[version]; !ok {
-			return fmt.Errorf("restore requires unavailable encryption key version %d", version)
+			return fmt.Errorf("restore %s data requires unavailable encryption key version %d", domain, version)
 		}
 	}
 	return nil
@@ -774,6 +894,14 @@ func validateRestoredDatabase(ctx context.Context, databasePath, artifactRoot st
 		return err
 	}
 	defer sqlDB.Close()
+	actualKeyVersions, err := inventoryBackupKeyVersions(db, ctx)
+	if err != nil {
+		return fmt.Errorf("scan restored key versions: %w", err)
+	}
+	if !keyVersionsEqual(actualKeyVersions, manifest.KeyVersions) {
+		return errors.New("restored database key versions do not match manifest")
+	}
+
 	var check string
 	if err := sqlDB.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&check); err != nil {
 		return fmt.Errorf("check restored SQLite integrity: %w", err)
@@ -848,78 +976,249 @@ func absoluteCleanPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	absolute = canonicalSystemPath(absolute)
 	if filepath.Clean(absolute) != absolute || absolute == string(filepath.Separator) {
 		return "", errors.New("path is unsafe")
 	}
 	return absolute, nil
 }
 
+func canonicalSystemPath(path string) string {
+	for _, prefix := range []string{"/tmp", "/var"} {
+		if path != prefix && !strings.HasPrefix(path, prefix+string(filepath.Separator)) {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(prefix)
+		if err != nil {
+			continue
+		}
+		return filepath.Join(resolved, strings.TrimPrefix(path, prefix))
+	}
+	return path
+}
+
+func preflightRestoreParents(databasePath, artifactRoot string) error {
+	for _, parent := range []string{filepath.Dir(databasePath), filepath.Dir(artifactRoot)} {
+		info, err := os.Lstat(parent)
+		if err != nil {
+			return fmt.Errorf("inspect restore parent %q: %w", parent, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("restore parent %q is not a directory", parent)
+		}
+		probe, err := os.CreateTemp(parent, ".csp-restore-probe-*")
+		if err != nil {
+			return fmt.Errorf("create restore rename probe: %w", err)
+		}
+		probePath := probe.Name()
+		if err := probe.Close(); err != nil {
+			_ = os.Remove(probePath)
+			return fmt.Errorf("close restore rename probe: %w", err)
+		}
+		renamedPath := probePath + ".renamed"
+		if err := os.Rename(probePath, renamedPath); err != nil {
+			_ = os.Remove(probePath)
+			return fmt.Errorf("preflight restore rename: %w", err)
+		}
+		if err := os.Remove(renamedPath); err != nil {
+			return fmt.Errorf("remove restore rename probe: %w", err)
+		}
+		if err := syncDirectory(parent); err != nil {
+			return fmt.Errorf("sync restore parent: %w", err)
+		}
+	}
+	return nil
+}
+
 func installRestoreSet(databasePath, artifactRoot, stagedDB, stagedRoot string, force bool) error {
-	for _, path := range []string{databasePath, artifactRoot} {
-		if info, err := os.Lstat(path); err == nil {
-			if info.Mode()&os.ModeSymlink != 0 {
-				return errors.New("restore target is a symlink")
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+	databaseExists, err := validateRestoreTarget(databasePath, false)
+	if err != nil {
+		return err
 	}
-	if !force {
-		if _, err := os.Lstat(databasePath); err == nil {
-			return errors.New("restore database exists; use --force")
-		}
-		if _, err := os.Lstat(artifactRoot); err == nil {
-			return errors.New("restore artifact root exists; use --force")
-		}
+	artifactsExist, err := validateRestoreTarget(artifactRoot, true)
+	if err != nil {
+		return err
 	}
-	marker := restoreMarker{DatabasePath: databasePath, ArtifactRoot: artifactRoot, OldDatabase: databasePath + ".restore-old", OldArtifacts: artifactRoot + ".restore-old", NewDatabase: stagedDB, NewArtifacts: stagedRoot}
+	if !force && (databaseExists || artifactsExist) {
+		return errors.New("restore targets exist; use --force")
+	}
+	marker := restoreMarker{
+		DatabasePath: databasePath,
+		ArtifactRoot: artifactRoot,
+		OldDatabase:  databasePath + ".restore-old",
+		OldArtifacts: artifactRoot + ".restore-old",
+		NewDatabase:  stagedDB,
+		NewArtifacts: stagedRoot,
+		State:        "prepared",
+		HadDatabase:  databaseExists,
+		HadArtifacts: artifactsExist,
+	}
+	if err := ensureRestoreBackupPathsAbsent(marker); err != nil {
+		return err
+	}
 	if err := writeRestoreMarker(marker); err != nil {
 		return err
 	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = recoverRestoreMarker(marker)
+	rollback := func(cause error) error {
+		if rollbackErr := rollbackRestoreSet(marker); rollbackErr != nil {
+			return errors.Join(cause, rollbackErr)
 		}
-	}()
-	if force {
-		if _, err := os.Lstat(databasePath); err == nil {
-			if err := os.Rename(databasePath, marker.OldDatabase); err != nil {
-				return fmt.Errorf("move old database: %w", err)
-			}
-		}
-		if _, err := os.Lstat(artifactRoot); err == nil {
-			if err := os.Rename(artifactRoot, marker.OldArtifacts); err != nil {
-				return fmt.Errorf("move old artifact root: %w", err)
-			}
+		return cause
+	}
+	if force && (databaseExists || artifactsExist) {
+		if err := updateRestoreMarker(&marker, "moving_old"); err != nil {
+			return rollback(err)
 		}
 	}
-	if err := os.Rename(stagedDB, databasePath); err != nil {
-		return fmt.Errorf("install restored database: %w", err)
+	if force && databaseExists {
+		if err := restoreRenamePath(databasePath, marker.OldDatabase); err != nil {
+			return rollback(fmt.Errorf("move old database: %w", err))
+		}
 	}
-	if err := os.Rename(stagedRoot, artifactRoot); err != nil {
-		return fmt.Errorf("install restored artifact root: %w", err)
+	if force && artifactsExist {
+		if err := restoreRenamePath(artifactRoot, marker.OldArtifacts); err != nil {
+			return rollback(fmt.Errorf("move old artifact root: %w", err))
+		}
+	}
+	if err := updateRestoreMarker(&marker, "old_moved"); err != nil {
+		return rollback(err)
+	}
+	if err := updateRestoreMarker(&marker, "installing_database"); err != nil {
+		return rollback(err)
+	}
+	if err := restoreRenamePath(stagedDB, databasePath); err != nil {
+		return rollback(fmt.Errorf("install restored database: %w", err))
+	}
+	if err := updateRestoreMarker(&marker, "database_installed"); err != nil {
+		return rollback(err)
+	}
+	if err := updateRestoreMarker(&marker, "installing_artifacts"); err != nil {
+		return rollback(err)
+	}
+	if err := restoreRenamePath(stagedRoot, artifactRoot); err != nil {
+		return rollback(fmt.Errorf("install restored artifact root: %w", err))
+	}
+	if err := updateRestoreMarker(&marker, "artifacts_installed"); err != nil {
+		return rollback(err)
 	}
 	if err := syncDirectory(filepath.Dir(databasePath)); err != nil {
-		return err
+		return rollback(err)
 	}
 	if err := syncDirectory(filepath.Dir(artifactRoot)); err != nil {
+		return rollback(err)
+	}
+	if err := updateRestoreMarker(&marker, "committed"); err != nil {
+		return rollback(err)
+	}
+	if err := removeRestorePath(marker.OldDatabase, false); err != nil {
+		return fmt.Errorf("remove old database: %w", err)
+	}
+	if err := removeRestorePath(marker.OldArtifacts, true); err != nil {
+		return fmt.Errorf("remove old artifact root: %w", err)
+	}
+	if err := removeRestoreMarker(marker); err != nil {
 		return err
 	}
-	for _, path := range []string{marker.OldDatabase, marker.OldArtifacts} {
+	return nil
+}
+
+func validateRestoreTarget(path string, directory bool) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect restore target %q: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || (directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
+		return false, fmt.Errorf("restore target %q has invalid type", path)
+	}
+	return true, nil
+}
+
+func ensureRestoreBackupPathsAbsent(marker restoreMarker) error {
+	for _, path := range []string{marker.OldDatabase, marker.OldArtifacts, marker.DatabasePath + restoreMarkerSuffix} {
 		if _, err := os.Lstat(path); err == nil {
-			if err := os.RemoveAll(path); err != nil {
-				return fmt.Errorf("remove restore backup: %w", err)
-			}
+			return fmt.Errorf("restore path already exists: %s", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect restore path %q: %w", path, err)
 		}
 	}
-	if err := os.Remove(databasePath + restoreMarkerSuffix); err == nil {
-		rollback = false
+	return nil
+}
+
+func updateRestoreMarker(marker *restoreMarker, state string) error {
+	marker.State = state
+	return writeRestoreMarker(*marker)
+}
+
+func rollbackRestoreSet(marker restoreMarker) error {
+	var errs []error
+	installed := marker.State == "installing_database" || marker.State == "database_installed" || marker.State == "installing_artifacts" || marker.State == "artifacts_installed" || marker.State == "committed"
+	if installed {
+		if err := removeRestorePath(marker.DatabasePath, false); err != nil {
+			errs = append(errs, fmt.Errorf("remove installed database: %w", err))
+		}
+		if err := removeRestorePath(marker.ArtifactRoot, true); err != nil {
+			errs = append(errs, fmt.Errorf("remove installed artifact root: %w", err))
+		}
+	}
+	if marker.HadDatabase && exists(marker.OldDatabase) {
+		if err := restoreRenamePath(marker.OldDatabase, marker.DatabasePath); err != nil {
+			errs = append(errs, fmt.Errorf("restore old database: %w", err))
+		}
+	}
+	if marker.HadArtifacts && exists(marker.OldArtifacts) {
+		if err := restoreRenamePath(marker.OldArtifacts, marker.ArtifactRoot); err != nil {
+			errs = append(errs, fmt.Errorf("restore old artifact root: %w", err))
+		}
+	}
+	if err := removeRestorePath(marker.NewDatabase, false); err != nil {
+		errs = append(errs, fmt.Errorf("remove staged database: %w", err))
+	}
+	if err := removeRestorePath(marker.NewArtifacts, true); err != nil {
+		errs = append(errs, fmt.Errorf("remove staged artifacts: %w", err))
+	}
+	if len(errs) == 0 {
+		if err := removeRestoreMarker(marker); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+func removeRestoreMarker(marker restoreMarker) error {
+	if err := os.Remove(marker.DatabasePath + restoreMarkerSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove restore marker: %w", err)
+	}
+	return syncRestoreParents(marker)
+}
+
+func syncRestoreParents(marker restoreMarker) error {
+	if err := syncDirectory(filepath.Dir(marker.DatabasePath)); err != nil {
+		return fmt.Errorf("sync restored database parent: %w", err)
+	}
+	if filepath.Dir(marker.ArtifactRoot) != filepath.Dir(marker.DatabasePath) {
+		if err := syncDirectory(filepath.Dir(marker.ArtifactRoot)); err != nil {
+			return fmt.Errorf("sync restored artifact parent: %w", err)
+		}
+	}
+	return nil
+}
+
+func removeRestorePath(path string, directory bool) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+	}
+	if err != nil {
 		return err
 	}
-	rollback = false
+	if info.Mode()&os.ModeSymlink != 0 || (directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
+		return fmt.Errorf("restore path %q has invalid type", path)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -928,37 +1227,74 @@ func writeRestoreMarker(marker restoreMarker) error {
 	if err != nil {
 		return err
 	}
-	path := marker.DatabasePath + restoreMarkerSuffix
-	return writeAtomicPrivate(path, data)
+	return writeAtomicPrivate(marker.DatabasePath+restoreMarkerSuffix, data)
 }
 
 func writeAtomicPrivate(path string, data []byte) error {
 	parent := filepath.Dir(path)
-	file, err := os.CreateTemp(parent, ".csp-marker-*")
+	existing := false
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return errors.New("atomic private destination is invalid")
+		}
+		existing = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	temporary, err := os.CreateTemp(parent, ".csp-marker-*")
 	if err != nil {
 		return err
 	}
-	temporary := file.Name()
-	defer os.Remove(temporary)
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
 		return err
 	}
-	if err := file.Close(); err != nil {
+	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, path); err != nil {
-		return err
+	if existing {
+		if err := os.Rename(temporaryPath, path); err != nil {
+			return err
+		}
+	} else {
+		if _, err := os.Lstat(path); err == nil {
+			return errors.New("atomic private destination already exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Link(temporaryPath, path); err != nil {
+			return err
+		}
+		if err := os.Remove(temporaryPath); err != nil {
+			return err
+		}
 	}
 	return syncDirectory(parent)
+}
+
+// RecoverRestoreWithLock converges a marker while the caller owns the lock.
+func RecoverRestoreWithLock(lock *storage.ApplicationLock, databasePath string) error {
+	if lock == nil {
+		return errors.New("restore application lock is nil")
+	}
+	if lock.Mode() != storage.ApplicationLockExclusive {
+		return errors.New("restore requires an exclusive application lock")
+	}
+	path, err := absoluteCleanPath(databasePath)
+	if err != nil {
+		return err
+	}
+	return recoverRestoreLocked(path)
 }
 
 // RecoverRestore converges an interrupted restore before the database opens.
@@ -967,6 +1303,15 @@ func RecoverRestore(databasePath string) error {
 	if err != nil {
 		return err
 	}
+	lock, err := storage.AcquireApplicationLock(context.Background(), path, storage.ApplicationLockExclusive)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return recoverRestoreLocked(path)
+}
+
+func recoverRestoreLocked(path string) error {
 	markerPath := path + restoreMarkerSuffix
 	data, err := os.ReadFile(markerPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -979,47 +1324,173 @@ func RecoverRestore(databasePath string) error {
 	if err := json.Unmarshal(data, &marker); err != nil {
 		return fmt.Errorf("decode restore marker: %w", err)
 	}
+	if err := canonicalizeRestoreMarkerPaths(&marker); err != nil {
+		return err
+	}
 	if marker.DatabasePath != path || marker.ArtifactRoot == "" || marker.NewDatabase == "" || marker.NewArtifacts == "" {
 		return errors.New("restore marker is invalid")
 	}
 	return recoverRestoreMarker(marker)
 }
+func canonicalizeRestoreMarkerPaths(marker *restoreMarker) error {
+	if marker == nil {
+		return errors.New("restore marker is nil")
+	}
+	for _, path := range []*string{
+		&marker.DatabasePath,
+		&marker.ArtifactRoot,
+		&marker.OldDatabase,
+		&marker.OldArtifacts,
+		&marker.NewDatabase,
+		&marker.NewArtifacts,
+	} {
+		if strings.TrimSpace(*path) == "" {
+			continue
+		}
+		canonical, err := absoluteCleanPath(*path)
+		if err != nil {
+			return fmt.Errorf("canonicalize restore marker path: %w", err)
+		}
+		*path = canonical
+	}
+	return nil
+}
 
 func recoverRestoreMarker(marker restoreMarker) error {
-	dbExists := exists(marker.DatabasePath)
-	rootExists := exists(marker.ArtifactRoot)
-	newDBExists := exists(marker.NewDatabase)
-	newRootExists := exists(marker.NewArtifacts)
-	if dbExists && rootExists {
-		if newDBExists {
-			_ = os.RemoveAll(marker.NewDatabase)
-		}
-		if newRootExists {
-			_ = os.RemoveAll(marker.NewArtifacts)
-		}
-		_ = os.RemoveAll(marker.OldDatabase)
-		_ = os.RemoveAll(marker.OldArtifacts)
-		return os.Remove(marker.DatabasePath + restoreMarkerSuffix)
+	targetDB := exists(marker.DatabasePath)
+	targetRoot := exists(marker.ArtifactRoot)
+	oldDB := exists(marker.OldDatabase)
+	oldRoot := exists(marker.OldArtifacts)
+	newDB := exists(marker.NewDatabase)
+	newRoot := exists(marker.NewArtifacts)
+
+	switch marker.State {
+	case "moving_old", "recovering_old", "old_database_restored", "old_artifacts_restored":
+		return recoverOldRestorePair(&marker)
+	case "recovering_new", "new_database_installed", "new_artifacts_installed":
+		return recoverNewRestorePair(&marker)
 	}
-	if !dbExists && exists(marker.OldDatabase) {
-		if err := os.Rename(marker.OldDatabase, marker.DatabasePath); err != nil {
+	if marker.State == "committed" || (targetDB && targetRoot && !oldDB && !oldRoot) {
+		if err := removeRestorePath(marker.OldDatabase, false); err != nil {
+			return err
+		}
+		if err := removeRestorePath(marker.OldArtifacts, true); err != nil {
+			return err
+		}
+		if err := removeRestorePath(marker.NewDatabase, false); err != nil {
+			return err
+		}
+		if err := removeRestorePath(marker.NewArtifacts, true); err != nil {
+			return err
+		}
+		return removeRestoreMarker(marker)
+	}
+	chooseNew := marker.State == "artifacts_installed" && targetDB && targetRoot
+	if chooseNew {
+		if err := removeRestorePath(marker.OldDatabase, false); err != nil {
+			return err
+		}
+		if err := removeRestorePath(marker.OldArtifacts, true); err != nil {
+			return err
+		}
+		if err := removeRestorePath(marker.NewDatabase, false); err != nil {
+			return err
+		}
+		if err := removeRestorePath(marker.NewArtifacts, true); err != nil {
+			return err
+		}
+		return removeRestoreMarker(marker)
+	}
+	if oldDB && oldRoot {
+		return recoverOldRestorePair(&marker)
+	}
+	if newDB && newRoot && !targetDB && !targetRoot && !oldDB && !oldRoot {
+		return recoverNewRestorePair(&marker)
+	}
+	return errors.New("restore marker has no complete old or new state")
+}
+
+func recoverOldRestorePair(marker *restoreMarker) error {
+	if marker.State != "recovering_old" && marker.State != "old_database_restored" && marker.State != "old_artifacts_restored" {
+		if err := updateRestoreMarker(marker, "recovering_old"); err != nil {
 			return err
 		}
 	}
-	if !rootExists && exists(marker.OldArtifacts) {
-		if err := os.Rename(marker.OldArtifacts, marker.ArtifactRoot); err != nil {
+	if exists(marker.OldDatabase) {
+		if err := removeRestorePath(marker.DatabasePath, false); err != nil {
+			return err
+		}
+		if err := restoreRenamePath(marker.OldDatabase, marker.DatabasePath); err != nil {
+			return err
+		}
+		if err := updateRestoreMarker(marker, "old_database_restored"); err != nil {
+			return err
+		}
+	}
+	if marker.HadDatabase && !exists(marker.DatabasePath) {
+		return errors.New("restore recovery lost the old database")
+	}
+	if exists(marker.OldArtifacts) {
+		if err := removeRestorePath(marker.ArtifactRoot, true); err != nil {
+			return err
+		}
+		if err := restoreRenamePath(marker.OldArtifacts, marker.ArtifactRoot); err != nil {
+			return err
+		}
+		if err := updateRestoreMarker(marker, "old_artifacts_restored"); err != nil {
+			return err
+		}
+	}
+	if marker.HadArtifacts && !exists(marker.ArtifactRoot) {
+		return errors.New("restore recovery lost the old artifact root")
+	}
+	if err := removeRestorePath(marker.NewDatabase, false); err != nil {
+		return err
+	}
+	if err := removeRestorePath(marker.NewArtifacts, true); err != nil {
+		return err
+	}
+	return removeRestoreMarker(*marker)
+}
+
+func recoverNewRestorePair(marker *restoreMarker) error {
+	if marker.State != "recovering_new" && marker.State != "new_database_installed" && marker.State != "new_artifacts_installed" {
+		if err := updateRestoreMarker(marker, "recovering_new"); err != nil {
 			return err
 		}
 	}
 	if exists(marker.NewDatabase) {
-		_ = os.RemoveAll(marker.NewDatabase)
+		if err := removeRestorePath(marker.DatabasePath, false); err != nil {
+			return err
+		}
+		if err := restoreRenamePath(marker.NewDatabase, marker.DatabasePath); err != nil {
+			return err
+		}
+		if err := updateRestoreMarker(marker, "new_database_installed"); err != nil {
+			return err
+		}
 	}
 	if exists(marker.NewArtifacts) {
-		_ = os.RemoveAll(marker.NewArtifacts)
+		if err := removeRestorePath(marker.ArtifactRoot, true); err != nil {
+			return err
+		}
+		if err := restoreRenamePath(marker.NewArtifacts, marker.ArtifactRoot); err != nil {
+			return err
+		}
+		if err := updateRestoreMarker(marker, "new_artifacts_installed"); err != nil {
+			return err
+		}
 	}
-	_ = os.RemoveAll(marker.OldDatabase)
-	_ = os.RemoveAll(marker.OldArtifacts)
-	return os.Remove(marker.DatabasePath + restoreMarkerSuffix)
+	if !exists(marker.DatabasePath) || !exists(marker.ArtifactRoot) {
+		return errors.New("restore recovery lost the new restore set")
+	}
+	if err := removeRestorePath(marker.OldDatabase, false); err != nil {
+		return err
+	}
+	if err := removeRestorePath(marker.OldArtifacts, true); err != nil {
+		return err
+	}
+	return removeRestoreMarker(*marker)
 }
 
 func exists(path string) bool {

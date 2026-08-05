@@ -101,22 +101,22 @@ func run(args []string) error {
 	readiness := server.NewReadiness()
 	var db *gorm.DB
 	var artifactStore *server.ArtifactStore
+	var applicationLock *storage.ApplicationLock
 	storageReady := false
 	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
 	if err != nil {
 		processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "path_unavailable")
 	} else {
-		if err := server.RecoverRestore(databasePath); err != nil {
-			return err
-		}
-		var applicationLock *storage.ApplicationLock
-		applicationLock, err = storage.AcquireApplicationLock(context.Background(), databasePath)
+		applicationLock, err = storage.AcquireApplicationLock(context.Background(), databasePath, storage.ApplicationLockExclusive)
 		if err != nil {
 			return err
 		}
 		defer func() {
 			_ = applicationLock.Close()
 		}()
+		if err := server.RecoverRestoreWithLock(applicationLock, databasePath); err != nil {
+			return err
+		}
 		db, err = storage.Open(context.Background(), databasePath, cfg.Storage.BusyTimeout)
 		if err != nil {
 			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "open")
@@ -181,10 +181,21 @@ func run(args []string) error {
 		}
 	}
 
+	cleanupTimeout := cfg.Retention.DrainDeadline
+	if cfg.Journal.DrainDeadline > cleanupTimeout {
+		cleanupTimeout = cfg.Journal.DrainDeadline
+	}
+	if cfg.Telemetry.ShutdownTimeout > cleanupTimeout {
+		cleanupTimeout = cfg.Telemetry.ShutdownTimeout
+	}
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = 10 * time.Second
+	}
 	readiness.Set(storageReady, keysReady, credentialSnapshot)
 	servers, err := server.Start(server.Config{
 		Listen:              cfg.Server.Listen,
 		AdminListen:         cfg.Server.AdminListen,
+		StartupLock:         applicationLock,
 		Database:            db,
 		APIKeyHMACKey:       apiKeyHMACKey,
 		AdminTokenHMACKey:   adminHMACKey,
@@ -206,6 +217,7 @@ func run(args []string) error {
 		JournalMode:          string(cfg.Journal.Mode),
 		JournalQueueCapacity: cfg.Journal.QueueCapacity,
 		JournalDrainDeadline: cfg.Journal.DrainDeadline,
+		CleanupTimeout:       cleanupTimeout,
 		Pricing:              cfg.Pricing,
 		CORS:                 cfg.CORS,
 		TrustedProxyCIDRs:    cfg.Server.TrustedProxyCIDRs,
@@ -310,6 +322,11 @@ func runAPIKeyCreate(args []string) error {
 	if err != nil {
 		return err
 	}
+	lock, err := storage.AcquireApplicationLock(context.Background(), databasePath, storage.ApplicationLockShared)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -486,6 +503,16 @@ func runBackup(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	applicationLock, err := storage.AcquireApplicationLock(ctx, databasePath, storage.ApplicationLockShared)
+	if err != nil {
+		return err
+	}
+	defer applicationLock.Close()
+	artifactBarrier, err := server.AcquireArtifactBarrier(ctx, artifactRoot, server.ArtifactBarrierExclusive)
+	if err != nil {
+		return err
+	}
+	defer artifactBarrier.Close()
 	db, err := storage.Open(ctx, databasePath, cfg.Storage.BusyTimeout)
 	if err != nil {
 		return err
@@ -495,13 +522,13 @@ func runBackup(args []string) error {
 		return fmt.Errorf("get sqlite database: %w", err)
 	}
 	defer sqlDB.Close()
-	artifacts, err := server.NewArtifactStore(db, artifactRoot, payloadKeys, cfg.Retention.ArtifactTTL)
+	artifacts, err := server.NewArtifactStoreWithBarrier(db, artifactRoot, payloadKeys, cfg.Retention.ArtifactTTL, artifactBarrier)
 	if err != nil {
 		return err
 	}
 	defer artifacts.Close()
 	principal := fmt.Sprintf("cli:%d", os.Getuid())
-	return server.CreateBackup(ctx, db, artifacts, *outputPath, principal)
+	return server.CreateBackupWithBarrier(ctx, db, artifacts, *outputPath, principal, artifactBarrier)
 }
 
 func runRestore(args []string) error {
@@ -530,21 +557,16 @@ func runRestore(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := server.RecoverRestore(databasePath); err != nil {
-		return err
-	}
 	payloadVersions := append([]uint32{cfg.Security.PayloadEncryptionKeyVersion}, cfg.Security.PayloadEncryptionPreviousKeyVersions...)
-	credentialVersions := append([]uint32{cfg.Security.CredentialEncryptionKeyVersion}, cfg.Security.CredentialEncryptionPreviousKeyVersions...)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	return server.Restore(ctx, server.RestoreOptions{
-		DatabasePath:          databasePath,
-		ArtifactRoot:          artifactRoot,
-		Input:                 *inputPath,
-		Force:                 *force,
-		PayloadKeyVersions:    payloadVersions,
-		CredentialKeyVersions: credentialVersions,
-		BusyTimeout:           cfg.Storage.BusyTimeout,
+		DatabasePath:       databasePath,
+		ArtifactRoot:       artifactRoot,
+		Input:              *inputPath,
+		Force:              *force,
+		PayloadKeyVersions: payloadVersions,
+		BusyTimeout:        cfg.Storage.BusyTimeout,
 	})
 }
 

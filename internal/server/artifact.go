@@ -69,16 +69,108 @@ type ArtifactRecord struct {
 
 func (ArtifactRecord) TableName() string { return "artifacts" }
 
-// ArtifactStore is the one concrete encrypted filesystem artifact store.
+// ArtifactStore owns encrypted files below one descriptor-anchored root.
 type ArtifactStore struct {
 	db          *gorm.DB
 	root        *os.Root
 	rootPath    string
+	barrierPath string
 	keys        envelope.KeySet
 	ttl         time.Duration
 	operationMu sync.RWMutex
 	closeOnce   sync.Once
 	closeErr    error
+}
+
+// ArtifactBarrierMode selects shared or exclusive artifact access.
+type ArtifactBarrierMode int
+
+const (
+	ArtifactBarrierShared ArtifactBarrierMode = iota + 1
+	ArtifactBarrierExclusive
+)
+
+const (
+	artifactBarrierShared    = ArtifactBarrierShared
+	artifactBarrierExclusive = ArtifactBarrierExclusive
+)
+
+type ArtifactBarrier struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+// ArtifactBarrierPath returns the lock file associated with an artifact root.
+func ArtifactBarrierPath(rootPath string) string {
+	return rootPath + ".artifact.lock"
+}
+
+// AcquireArtifactBarrier waits for a shared or exclusive artifact snapshot lock.
+func AcquireArtifactBarrier(ctx context.Context, rootPath string, mode ArtifactBarrierMode) (*ArtifactBarrier, error) {
+	if ctx == nil {
+		return nil, errors.New("artifact barrier context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if mode != artifactBarrierShared && mode != artifactBarrierExclusive {
+		return nil, errors.New("artifact barrier mode is invalid")
+	}
+	rootPath = strings.TrimSpace(rootPath)
+	if rootPath == "" || !filepath.IsAbs(rootPath) || filepath.Clean(rootPath) != rootPath || rootPath == string(filepath.Separator) {
+		return nil, errors.New("artifact barrier root is invalid")
+	}
+	parent := filepath.Dir(rootPath)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return nil, fmt.Errorf("create artifact barrier parent: %w", err)
+	}
+	file, err := os.OpenFile(ArtifactBarrierPath(rootPath), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open artifact barrier: %w", err)
+	}
+	flags := syscall.LOCK_NB
+	if mode == artifactBarrierExclusive {
+		flags |= syscall.LOCK_EX
+	} else {
+		flags |= syscall.LOCK_SH
+	}
+	for {
+		err = syscall.Flock(int(file.Fd()), flags)
+		if err == nil {
+			return &ArtifactBarrier{file: file}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = file.Close()
+			return nil, fmt.Errorf("acquire artifact barrier: %w", err)
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			_ = file.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (barrier *ArtifactBarrier) Close() error {
+	if barrier == nil {
+		return nil
+	}
+	barrier.mu.Lock()
+	defer barrier.mu.Unlock()
+	if barrier.file == nil {
+		return nil
+	}
+	file := barrier.file
+	barrier.file = nil
+	return errors.Join(syscall.Flock(int(file.Fd()), syscall.LOCK_UN), file.Close())
 }
 
 // MigrateArtifacts creates the artifact metadata table.
@@ -95,6 +187,18 @@ func MigrateArtifacts(db *gorm.DB) error {
 // NewArtifactStore validates the key set, adopts a private artifact root, and
 // reconciles durable metadata before the store can publish files.
 func NewArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl time.Duration) (*ArtifactStore, error) {
+	return newArtifactStore(db, rootPath, keys, ttl, nil)
+}
+
+// NewArtifactStoreWithBarrier adopts a root while the caller owns its barrier.
+func NewArtifactStoreWithBarrier(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl time.Duration, barrier *ArtifactBarrier) (*ArtifactStore, error) {
+	if barrier == nil {
+		return nil, errors.New("artifact barrier is nil")
+	}
+	return newArtifactStore(db, rootPath, keys, ttl, barrier)
+}
+
+func newArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl time.Duration, heldBarrier *ArtifactBarrier) (*ArtifactStore, error) {
 	if db == nil {
 		return nil, errors.New("artifact database is nil")
 	}
@@ -105,6 +209,16 @@ func NewArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl ti
 	if err != nil {
 		return nil, fmt.Errorf("validate artifact encryption keys: %w", err)
 	}
+	var barrier *ArtifactBarrier
+	if heldBarrier == nil {
+		barrier, err = AcquireArtifactBarrier(context.Background(), rootPath, artifactBarrierShared)
+		if err != nil {
+			return nil, err
+		}
+		defer barrier.Close()
+	} else {
+		barrier = heldBarrier
+	}
 	root, err := prepareArtifactRoot(rootPath)
 	if err != nil {
 		return nil, err
@@ -113,8 +227,8 @@ func NewArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl ti
 		_ = root.Close()
 		return nil, err
 	}
-	store := &ArtifactStore{db: db, root: root, rootPath: rootPath, keys: validatedKeys, ttl: ttl}
-	if err := store.Reconcile(context.Background()); err != nil {
+	store := &ArtifactStore{db: db, root: root, rootPath: rootPath, barrierPath: ArtifactBarrierPath(rootPath), keys: validatedKeys, ttl: ttl}
+	if err := store.reconcileWithBarrier(context.Background(), barrier); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
@@ -133,20 +247,42 @@ func (s *ArtifactStore) Close() error {
 	}
 	s.closeOnce.Do(func() {
 		s.closeErr = s.root.Close()
+		s.root = nil
 	})
 	return s.closeErr
+}
+func (s *ArtifactStore) acquireOperation(ctx context.Context) (*ArtifactBarrier, error) {
+	if s == nil {
+		return nil, errors.New("artifact store is closed")
+	}
+	if ctx == nil {
+		return nil, errors.New("artifact operation context is nil")
+	}
+	barrier, err := AcquireArtifactBarrier(ctx, s.rootPath, ArtifactBarrierShared)
+	if err != nil {
+		return nil, err
+	}
+	s.operationMu.Lock()
+	if s.root == nil {
+		s.operationMu.Unlock()
+		_ = barrier.Close()
+		return nil, errors.New("artifact store is closed")
+	}
+	return barrier, nil
+}
+
+func (s *ArtifactStore) releaseOperation(barrier *ArtifactBarrier) {
+	_ = barrier.Close()
+	s.operationMu.Unlock()
 }
 
 // Save encrypts one image and atomically records its ciphertext path.
 func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultIndex int, mimeType string, plaintext []byte) (ArtifactRecord, error) {
-	if s == nil || s.root == nil {
-		return ArtifactRecord{}, errors.New("artifact store is closed")
+	barrier, err := s.acquireOperation(ctx)
+	if err != nil {
+		return ArtifactRecord{}, err
 	}
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	if ctx == nil {
-		return ArtifactRecord{}, errors.New("artifact save context is nil")
-	}
+	defer s.releaseOperation(barrier)
 	if err := ctx.Err(); err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -174,7 +310,7 @@ func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultInd
 		return ArtifactRecord{}, errors.New("artifact MIME type does not match content")
 	}
 	var existing ArtifactRecord
-	err := s.db.WithContext(ctx).Where("request_id = ? AND conversation_id = ? AND api_key_id = ? AND result_index = ?", owner.RequestID, owner.ConversationID, owner.APIKeyID, resultIndex).First(&existing).Error
+	err = s.db.WithContext(ctx).Where("request_id = ? AND conversation_id = ? AND api_key_id = ? AND result_index = ?", owner.RequestID, owner.ConversationID, owner.APIKeyID, resultIndex).First(&existing).Error
 	if err == nil {
 		if existing.MIME != mimeType || existing.PlaintextSize != int64(len(plaintext)) || existing.State != artifactStateReady {
 			return ArtifactRecord{}, errors.New("artifact replay conflicts with existing record")
@@ -297,16 +433,12 @@ func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultInd
 	return record, nil
 }
 
-// Read verifies and decrypts one artifact using the DB-recorded bounds and metadata.
 func (s *ArtifactStore) Read(ctx context.Context, id string) ([]byte, error) {
-	if s == nil || s.root == nil {
-		return nil, errors.New("artifact store is closed")
+	barrier, err := s.acquireOperation(ctx)
+	if err != nil {
+		return nil, err
 	}
-	s.operationMu.RLock()
-	defer s.operationMu.RUnlock()
-	if ctx == nil {
-		return nil, errors.New("artifact read context is nil")
-	}
+	defer s.releaseOperation(barrier)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -372,13 +504,13 @@ func (s *ArtifactStore) readArtifactFile(record ArtifactRecord) ([]byte, error) 
 
 // MarkDeleting claims a bounded set of artifacts before filesystem I/O.
 func (s *ArtifactStore) MarkDeleting(ctx context.Context, ids []string) ([]ArtifactRecord, error) {
-	if s == nil || s.root == nil {
-		return nil, errors.New("artifact store is closed")
+	barrier, err := s.acquireOperation(ctx)
+	if err != nil {
+		return nil, err
 	}
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	if ctx == nil {
-		return nil, errors.New("artifact delete context is nil")
+	defer s.releaseOperation(barrier)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if len(ids) == 0 || len(ids) > artifactMaxChunks*artifactMaxChunks {
 		return nil, errors.New("artifact delete batch is invalid")
@@ -409,13 +541,13 @@ func (s *ArtifactStore) MarkDeleting(ctx context.Context, ids []string) ([]Artif
 
 // RemoveMarked deletes ciphertext first and finalizes the DB rows afterward.
 func (s *ArtifactStore) RemoveMarked(ctx context.Context, records []ArtifactRecord) error {
-	if s == nil || s.root == nil {
-		return errors.New("artifact store is closed")
+	barrier, err := s.acquireOperation(ctx)
+	if err != nil {
+		return err
 	}
-	s.operationMu.Lock()
-	defer s.operationMu.Unlock()
-	if ctx == nil {
-		return errors.New("artifact remove context is nil")
+	defer s.releaseOperation(barrier)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
@@ -680,11 +812,34 @@ func (s *ArtifactStore) checkArtifactOwner(ctx context.Context, owner ArtifactOw
 
 // Reconcile removes only recognized crash remnants and repairs durable phases.
 func (s *ArtifactStore) Reconcile(ctx context.Context) error {
-	if s == nil || s.root == nil {
+	barrier, err := s.acquireOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.releaseOperation(barrier)
+	return s.reconcileLocked(ctx)
+}
+
+func (s *ArtifactStore) reconcileWithBarrier(ctx context.Context, barrier *ArtifactBarrier) error {
+	if s == nil {
 		return errors.New("artifact store is closed")
+	}
+	if barrier == nil {
+		return errors.New("artifact barrier is nil")
 	}
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
+	if s.root == nil {
+		return errors.New("artifact store is closed")
+	}
+	return s.reconcileBody(ctx)
+}
+
+func (s *ArtifactStore) reconcileLocked(ctx context.Context) error {
+	return s.reconcileBody(ctx)
+}
+
+func (s *ArtifactStore) reconcileBody(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("artifact reconciliation context is nil")
 	}

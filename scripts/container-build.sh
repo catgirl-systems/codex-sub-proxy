@@ -31,6 +31,30 @@ if [ -z "$REVISION" ]; then
 		exit 1
 	fi
 fi
+validate_containerfile() {
+	if ! grep -Eq '^FROM golang:1\.25\.0-bookworm@sha256:[0-9a-f]{64} AS build$' "$ROOT/Containerfile"; then
+		echo "container: build base is not pinned" >&2
+		exit 1
+	fi
+	if ! grep -Eq '^FROM gcr\.io/distroless/static-debian12:nonroot@sha256:[0-9a-f]{64}$' "$ROOT/Containerfile"; then
+		echo "container: runtime base is not pinned" >&2
+		exit 1
+	fi
+	for required in \
+		'USER 65532:65532' \
+		'VOLUME ["/var/lib/codex-sub-proxy"]' \
+		'CSP_STORAGE_SQLITE_PATH=/var/lib/codex-sub-proxy/csp.sqlite3' \
+		'CSP_STORAGE_ARTIFACT_ROOT=/var/lib/codex-sub-proxy/artifacts' \
+		'CSP_CODEX_CREDENTIAL_FILE=/var/lib/codex-sub-proxy/credential.enc' \
+		'GODEBUG=netdns=go' \
+		'ENTRYPOINT ["/usr/local/bin/codex-sub-proxy"]'; do
+		if ! grep -Fq "$required" "$ROOT/Containerfile"; then
+			echo "container: missing contract $required" >&2
+			exit 1
+		fi
+	done
+}
+validate_containerfile
 ENGINE=${CONTAINER_ENGINE-}
 if [ -z "$ENGINE" ]; then
 	if command -v podman >/dev/null 2>&1; then
@@ -61,6 +85,21 @@ CREATED=$(go run ./scripts/created -epoch "$SOURCE_DATE_EPOCH")
 	--label org.opencontainers.image.created="$CREATED" \
 	--tag "$IMAGE" .
 IMAGE_ID=$("$ENGINE" image inspect --format '{{.Id}}' "$IMAGE")
+IMAGE_USER=$("$ENGINE" image inspect --format '{{.Config.User}}' "$IMAGE")
+IMAGE_ENV=$("$ENGINE" image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$IMAGE")
+IMAGE_ENTRYPOINT=$("$ENGINE" image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")
+IMAGE_VOLUME=$("$ENGINE" image inspect --format '{{json .Config.Volumes}}' "$IMAGE")
+if [ "$IMAGE_USER" != "65532:65532" ] ||
+	! printf '%s\n' "$IMAGE_ENV" | grep -Fxq 'HOME=/var/lib/codex-sub-proxy' ||
+	! printf '%s\n' "$IMAGE_ENV" | grep -Fxq 'CSP_STORAGE_SQLITE_PATH=/var/lib/codex-sub-proxy/csp.sqlite3' ||
+	! printf '%s\n' "$IMAGE_ENV" | grep -Fxq 'CSP_STORAGE_ARTIFACT_ROOT=/var/lib/codex-sub-proxy/artifacts' ||
+	! printf '%s\n' "$IMAGE_ENV" | grep -Fxq 'CSP_CODEX_CREDENTIAL_FILE=/var/lib/codex-sub-proxy/credential.enc' ||
+	! printf '%s\n' "$IMAGE_ENV" | grep -Fxq 'GODEBUG=netdns=go' ||
+	[ "$IMAGE_ENTRYPOINT" != '["/usr/local/bin/codex-sub-proxy"]' ] ||
+	! printf '%s\n' "$IMAGE_VOLUME" | grep -Fq '/var/lib/codex-sub-proxy'; then
+	echo "container: image contract inspection failed" >&2
+	exit 1
+fi
 IMAGE_DIGEST=$("$ENGINE" image inspect --format '{{.Digest}}' "$IMAGE" 2>/dev/null || true)
 if [ -z "$IMAGE_DIGEST" ]; then
 	IMAGE_DIGEST=$IMAGE_ID
