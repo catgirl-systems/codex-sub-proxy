@@ -38,6 +38,12 @@ func TestLoadEmptyFileAndEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestDataListenerAllowsPlainHTTPOutsideLoopback(t *testing.T) {
+	if err := ValidateListenerTLS("0.0.0.0:4000", TLSConfig{}, false); err != nil {
+		t.Fatalf("validate plain HTTP data listener: %v", err)
+	}
+}
+
 func TestInsecureAdminCookiesRequireExplicitLoopbackListener(t *testing.T) {
 	tests := []struct {
 		name     string

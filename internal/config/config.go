@@ -582,7 +582,7 @@ func validateTelemetryConfig(telemetry *TelemetryConfig) error {
 	return nil
 }
 
-// ValidateListenerTLS enforces TLS and cookie policy for listener addresses.
+// ValidateListenerTLS validates listener addresses, TLS pairs, and admin transport policy.
 func ValidateListenerTLS(listen string, tlsConfig TLSConfig, admin bool) error {
 	if listen == "" {
 		return errors.New("listener address is empty")
@@ -602,9 +602,6 @@ func ValidateListenerTLS(listen string, tlsConfig TLSConfig, admin bool) error {
 	}
 	if host == "" || host == "*" {
 		loopback = false
-	}
-	if !loopback && !hasCertificate {
-		return errors.New("non-loopback listener requires TLS")
 	}
 	if admin && !loopback && !hasCertificate {
 		return errors.New("non-loopback admin listener requires TLS and secure cookies")
