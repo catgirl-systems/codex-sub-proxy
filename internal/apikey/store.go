@@ -49,6 +49,18 @@ func (s *Store) Transaction(ctx context.Context, fn func(*gorm.DB) error) error 
 	return s.DB().WithContext(ctx).Transaction(fn)
 }
 
+// Create generates and stores one API key in one transaction.
+func (s *Store) Create(ctx context.Context, policy Policy) (rawKey string, record Record, err error) {
+	err = s.Transaction(ctx, func(tx *gorm.DB) error {
+		rawKey, record, err = s.CreateTx(tx, policy)
+		return err
+	})
+	if err != nil {
+		return "", Record{}, err
+	}
+	return rawKey, record, nil
+}
+
 // CreateTx generates and inserts a key. The caller owns transaction scope.
 func (s *Store) CreateTx(tx *gorm.DB, policy Policy) (string, Record, error) {
 	if err := validatePolicy(policy); err != nil {
@@ -87,36 +99,11 @@ func Migrate(db *gorm.DB) error {
 
 // Create generates and stores one API key in one transaction.
 func Create(ctx context.Context, db *gorm.DB, hmacKey []byte, policy Policy) (string, Record, error) {
-	if ctx == nil {
-		return "", Record{}, errors.New("API key context is nil")
-	}
-	if db == nil {
+	store := NewStore(db, hmacKey)
+	if store == nil {
 		return "", Record{}, fmt.Errorf("create API key: %w", ErrUnavailable)
 	}
-	if err := validatePolicy(policy); err != nil {
-		return "", Record{}, err
-	}
-	if policy.ExpiresAt != nil && !policy.ExpiresAt.After(time.Now().UTC()) {
-		return "", Record{}, fmt.Errorf("create API key: %w", ErrInvalidExpiry)
-	}
-
-	var rawKey string
-	var record Record
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var buildErr error
-		rawKey, record, buildErr = generateRecord(hmacKey, policy)
-		if buildErr != nil {
-			return buildErr
-		}
-		if err := tx.Create(&record).Error; err != nil {
-			return fmt.Errorf("store API key: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return "", Record{}, err
-	}
-	return rawKey, record, nil
+	return store.Create(ctx, policy)
 }
 
 // Principal contains the identity and current policy needed by request handlers.
