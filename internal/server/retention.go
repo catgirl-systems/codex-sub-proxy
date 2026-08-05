@@ -222,13 +222,35 @@ func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
 	if err := r.sweepMetadata(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
+	if err := r.sweepSessionAffinities(sweepCtx, now); err != nil {
+		errs = append(errs, err)
+	}
 	if err := r.sweepStandaloneAudits(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
 	if err := r.sweepAdminSessions(sweepCtx, now); err != nil {
 		errs = append(errs, err)
 	}
+
 	return errors.Join(errs...)
+}
+func (r *RetentionRunner) sweepSessionAffinities(ctx context.Context, now time.Time) error {
+	if !r.db.Migrator().HasTable(&SessionAffinityRecord{}) {
+		return nil
+	}
+	var affinities []SessionAffinityRecord
+	if err := r.db.WithContext(ctx).Where("expires_at > ? AND expires_at <= ?", time.Time{}, now).Order("expires_at ASC, api_key_id ASC, session_hash ASC").Limit(r.batchSize).Find(&affinities).Error; err != nil {
+		return fmt.Errorf("load expired session affinities: %w", err)
+	}
+	for _, affinity := range affinities {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.db.WithContext(ctx).Where("api_key_id = ? AND session_hash = ? AND expires_at > ? AND expires_at <= ?", affinity.APIKeyID, affinity.SessionHash, time.Time{}, now).Delete(&SessionAffinityRecord{}).Error; err != nil {
+			return fmt.Errorf("delete expired session affinity: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *RetentionRunner) sweepAdminSessions(ctx context.Context, now time.Time) error {
@@ -463,6 +485,9 @@ func (r *RetentionRunner) deleteExpiredRequest(ctx context.Context, request Requ
 		}
 		if err := tx.Where("request_id = ?", request.ID).Delete(&JournalRecord{}).Error; err != nil {
 			return fmt.Errorf("delete request journal records: %w", err)
+		}
+		if err := tx.Where("request_id = ?", request.ID).Delete(&ResponseLinkRecord{}).Error; err != nil {
+			return fmt.Errorf("delete request response links: %w", err)
 		}
 		if err := tx.Where("request_id = ?", request.ID).Delete(&JournalRequestRecord{}).Error; err != nil {
 			return fmt.Errorf("delete request journal metadata: %w", err)
@@ -723,6 +748,9 @@ func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conver
 			if err := tx.Where("request_id IN ?", ids).Delete(&JournalReceipt{}).Error; err != nil {
 				return fmt.Errorf("delete conversation receipts: %w", err)
 			}
+			if err := tx.Where("request_id IN ?", ids).Delete(&ResponseLinkRecord{}).Error; err != nil {
+				return fmt.Errorf("delete conversation response links: %w", err)
+			}
 			if err := tx.Where("request_id IN ?", ids).Delete(&JournalRecord{}).Error; err != nil {
 				return fmt.Errorf("delete conversation journal records: %w", err)
 			}
@@ -788,6 +816,9 @@ func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conver
 			if err := tx.Where("request_id IN ?", orphanRequestIDs).Delete(&JournalRecord{}).Error; err != nil {
 				return fmt.Errorf("delete orphan conversation journal records: %w", err)
 			}
+			if err := tx.Where("request_id IN ?", orphanRequestIDs).Delete(&ResponseLinkRecord{}).Error; err != nil {
+				return fmt.Errorf("delete orphan conversation response links: %w", err)
+			}
 			if len(payloadIDs) > 0 {
 				if err := tx.Where("id IN ?", payloadIDs).Delete(&EncryptedPayloadRecord{}).Error; err != nil {
 					return fmt.Errorf("delete orphan conversation payloads: %w", err)
@@ -807,6 +838,17 @@ func (r *RetentionRunner) finalizeConversationDelete(ctx context.Context, conver
 		var requests int64
 		if err := tx.Model(&RequestRecord{}).Where("conversation_id = ?", conversationID).Count(&requests).Error; err != nil {
 			return fmt.Errorf("check final conversation requests: %w", err)
+		}
+		if conversation.AccountID != "" {
+			var otherConversations int64
+			if err := tx.Model(&ConversationRecord{}).Where("id <> ? AND account_id = ?", conversationID, conversation.AccountID).Count(&otherConversations).Error; err != nil {
+				return fmt.Errorf("check account conversations: %w", err)
+			}
+			if otherConversations == 0 {
+				if err := tx.Where("account_id = ?", conversation.AccountID).Delete(&SessionAffinityRecord{}).Error; err != nil {
+					return fmt.Errorf("delete conversation session affinities: %w", err)
+				}
+			}
 		}
 		if requests != 0 {
 			return errors.New("conversation requests remain")

@@ -102,15 +102,43 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
-		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+		journalMetadata := JournalRequestMetadata{
 			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-			ConversationHint: publicRequest.PreviousResponseID,
-		}, journalInput)
+		}
+		if publicRequest.PreviousResponseID != "" {
+			if journal == nil {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+				return
+			}
+			resolved, resolveErr := journal.ResolvePreviousResponse(requestContext, publicRequest.PreviousResponseID, principal.ID)
+			if resolveErr != nil {
+				if errors.Is(resolveErr, ErrPreviousResponseNotFound) {
+					writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+				} else {
+					writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				}
+				return
+			}
+			journalMetadata.ConversationID = resolved.ConversationID
+			journalMetadata.AccountID = resolved.AccountID
+			journalMetadata.PreviousResponseID = publicRequest.PreviousResponseID
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
 		if err != nil {
-			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			if errors.Is(err, ErrPreviousResponseNotFound) {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+			} else {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			}
 			return
 		}
 		defer finishJournalRequest(ctx, journal, journalRequestID)
+		if journalMetadata.AccountID != "" && journal != nil {
+			if err := journal.BindAccount(requestContext, journalRequestID.ID, journalMetadata.AccountID, ""); err != nil {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				return
+			}
+		}
 		privateRequest, err := privateResponseRequest(publicRequest)
 		if err != nil {
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")

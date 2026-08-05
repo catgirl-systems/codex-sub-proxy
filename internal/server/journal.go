@@ -7,13 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
-
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 	"gorm.io/gorm"
+	"sort"
+	"sync"
+	"time"
 )
 
 const (
@@ -42,6 +43,7 @@ type JournalRequestRecord struct {
 	Endpoint       string    `gorm:"column:endpoint;not null;size:128;index"`
 	Model          string    `gorm:"column:model;not null;size:256;index"`
 	APIKeyID       string    `gorm:"column:api_key_id;size:255;index"`
+	AccountID      string    `gorm:"column:account_id;size:255;index"`
 	CreatedAt      time.Time `gorm:"column:created_at;not null"`
 }
 
@@ -90,6 +92,7 @@ type JournalRequest struct {
 	ConversationID string
 	Endpoint       string
 	Model          string
+	AccountID      string
 	APIKeyID       string
 }
 
@@ -105,6 +108,13 @@ type journalRequestState struct {
 type journalWork struct {
 	records []JournalRecord
 }
+
+const (
+	maxConversationInputItems    = 1024
+	maxConversationInputBytes    = 4 * 1024 * 1024
+	maxConversationJournalEvents = maxConversationInputItems*2 + 2
+	maxConversationJournalBytes  = maxConversationInputBytes + 1024*1024
+)
 
 // Journal appends encrypted records and owns one bounded materializer worker.
 type Journal struct {
@@ -263,6 +273,212 @@ func (j *Journal) beginOperation() error {
 
 func (j *Journal) endOperation() { j.inFlight.Done() }
 
+// ErrPreviousResponseNotFound hides expired and cross-key response identities.
+var ErrPreviousResponseNotFound = errors.New("previous response not found")
+
+// ResolvePreviousResponse resolves a terminal response ID to the request metadata
+// needed to continue its conversation.
+func (j *Journal) ResolvePreviousResponse(ctx context.Context, responseID, apiKeyID string) (JournalRequestMetadata, error) {
+	if ctx == nil {
+		return JournalRequestMetadata{}, errors.New("previous response context is nil")
+	}
+	if responseID == "" || len(responseID) > 256 || apiKeyID == "" {
+		return JournalRequestMetadata{}, ErrPreviousResponseNotFound
+	}
+	var link ResponseLinkRecord
+	err := j.db.WithContext(ctx).Where("response_id = ? AND api_key_id = ? AND expires_at > ?", responseID, apiKeyID, time.Now().UTC()).First(&link).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return JournalRequestMetadata{}, ErrPreviousResponseNotFound
+	}
+	if err != nil {
+		return JournalRequestMetadata{}, fmt.Errorf("resolve previous response: %w", err)
+	}
+	var request RequestRecord
+	err = j.db.WithContext(ctx).Where("request_id = ?", link.RequestID).First(&request).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		var journalRequest JournalRequestRecord
+		if err := j.db.WithContext(ctx).Where("request_id = ?", link.RequestID).First(&journalRequest).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return JournalRequestMetadata{}, ErrPreviousResponseNotFound
+			}
+			return JournalRequestMetadata{}, fmt.Errorf("load previous response journal request: %w", err)
+		}
+		request = RequestRecord{
+			ID: journalRequest.RequestID, ConversationID: journalRequest.ConversationID,
+			Endpoint: journalRequest.Endpoint, Model: journalRequest.Model,
+			APIKeyID: journalRequest.APIKeyID, AccountID: journalRequest.AccountID,
+		}
+	} else if err != nil {
+		return JournalRequestMetadata{}, fmt.Errorf("load previous response request: %w", err)
+	}
+	if request.DeletingAt != nil {
+		return JournalRequestMetadata{}, ErrPreviousResponseNotFound
+	}
+	var conversation ConversationRecord
+	conversationErr := j.db.WithContext(ctx).Where("id = ?", link.ConversationID).First(&conversation).Error
+	if conversationErr == nil {
+		if conversation.DeletingAt != nil {
+			return JournalRequestMetadata{}, ErrPreviousResponseNotFound
+		}
+	} else if !errors.Is(conversationErr, gorm.ErrRecordNotFound) {
+		return JournalRequestMetadata{}, fmt.Errorf("load previous response conversation: %w", conversationErr)
+	}
+	if request.ConversationID != link.ConversationID || request.APIKeyID != link.APIKeyID || request.AccountID != link.AccountID {
+		return JournalRequestMetadata{}, ErrPreviousResponseNotFound
+	}
+	return JournalRequestMetadata{
+		Endpoint: request.Endpoint, Model: request.Model, APIKeyID: link.APIKeyID,
+		ConversationID: link.ConversationID, AccountID: link.AccountID,
+	}, nil
+}
+
+// LoadConversationInput reconstructs bounded input and output items from the
+// encrypted journal records for one conversation.
+func (j *Journal) LoadConversationInput(ctx context.Context, conversationID string) ([]json.RawMessage, error) {
+	if ctx == nil {
+		return nil, errors.New("conversation input context is nil")
+	}
+	if conversationID == "" {
+		return nil, errors.New("conversation ID is empty")
+	}
+	var requestCount int64
+	if err := j.db.WithContext(ctx).Model(&RequestRecord{}).Where("conversation_id = ?", conversationID).Count(&requestCount).Error; err != nil {
+		return nil, fmt.Errorf("count conversation requests: %w", err)
+	}
+	if requestCount > maxConversationInputItems {
+		return nil, errors.New("conversation input item limit exceeded")
+	}
+	var requests []RequestRecord
+	if err := j.db.WithContext(ctx).Model(&RequestRecord{}).Where("conversation_id = ?", conversationID).Order("accepted_at ASC, request_id ASC").Limit(maxConversationInputItems + 1).Find(&requests).Error; err != nil {
+		return nil, fmt.Errorf("load conversation requests: %w", err)
+	}
+	if len(requests) > maxConversationInputItems {
+		return nil, errors.New("conversation input item limit exceeded")
+	}
+	var records []json.RawMessage
+	totalBytes := 0
+	appendItem := func(item []byte) error {
+		item = bytes.TrimSpace(item)
+		if len(item) == 0 || !json.Valid(item) {
+			return errors.New("conversation input item is invalid JSON")
+		}
+		if len(records) >= maxConversationInputItems || totalBytes+len(item) > maxConversationInputBytes {
+			return errors.New("conversation input bounds exceeded")
+		}
+		records = append(records, append(json.RawMessage(nil), item...))
+		totalBytes += len(item)
+		return nil
+	}
+	eventCount := 0
+	eventBytes := 0
+	for _, request := range requests {
+		rows, err := j.db.WithContext(ctx).Model(&JournalRecord{}).Where("request_id = ? AND event_type IN ?", request.ID, []string{"request.input", "response.json", "response.output_item.done"}).Order("sequence ASC").Rows()
+		if err != nil {
+			return nil, fmt.Errorf("load conversation journal events: %w", err)
+		}
+		for rows.Next() {
+			eventCount++
+			var event JournalRecord
+			if err := j.db.ScanRows(rows, &event); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan conversation journal event: %w", err)
+			}
+			if err := validateJournalRecord(event); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("validate conversation journal event %q: %w", event.ReplayID, err)
+			}
+			eventBytes += len(event.Payload)
+			if eventCount > maxConversationJournalEvents || eventBytes > maxConversationJournalBytes {
+				_ = rows.Close()
+				return nil, errors.New("conversation journal bounds exceeded")
+			}
+			plain, err := j.decryptJournalPayload(event)
+			if err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("decrypt conversation journal event %q: %w", event.ReplayID, err)
+			}
+			switch event.EventType {
+			case "request.input":
+				var envelope struct {
+					Input json.RawMessage `json:"input"`
+				}
+				if len(bytes.TrimSpace(plain)) > 0 && bytes.TrimSpace(plain)[0] == '{' {
+					if err := json.Unmarshal(plain, &envelope); err != nil {
+						_ = rows.Close()
+						return nil, fmt.Errorf("decode conversation request input: %w", err)
+					}
+					plain = envelope.Input
+				}
+				if len(bytes.TrimSpace(plain)) == 0 || bytes.Equal(bytes.TrimSpace(plain), []byte("null")) {
+					continue
+				}
+				var items []json.RawMessage
+				if err := json.Unmarshal(plain, &items); err == nil {
+					for _, item := range items {
+						if err := appendItem(item); err != nil {
+							_ = rows.Close()
+							return nil, err
+						}
+					}
+					continue
+				}
+				if err := appendItem(plain); err != nil {
+					_ = rows.Close()
+					return nil, err
+				}
+			case "response.json":
+				var response struct {
+					Status string            `json:"status"`
+					Output []json.RawMessage `json:"output"`
+				}
+				if err := json.Unmarshal(plain, &response); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("decode conversation response: %w", err)
+				}
+				if response.Status != "completed" && response.Status != "incomplete" {
+					continue
+				}
+				for _, item := range response.Output {
+					if err := appendItem(item); err != nil {
+						_ = rows.Close()
+						return nil, err
+					}
+				}
+			case "response.output_item.done":
+				if request.Status != requestStatusSucceeded {
+					continue
+				}
+				data := bytes.TrimSpace(plain)
+				if bytes.HasPrefix(data, []byte("data:")) {
+					data = bytes.TrimSpace(bytes.TrimPrefix(data, []byte("data:")))
+					if index := bytes.IndexByte(data, '\n'); index >= 0 {
+						data = bytes.TrimSpace(data[:index])
+					}
+				}
+				var event struct {
+					Item json.RawMessage `json:"item"`
+				}
+				if err := json.Unmarshal(data, &event); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("decode conversation output event: %w", err)
+				}
+				if err := appendItem(event.Item); err != nil {
+					_ = rows.Close()
+					return nil, err
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate conversation journal events: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close conversation journal events: %w", err)
+		}
+	}
+	return records, nil
+}
+
 // BeginRequest creates an identity for one accepted request.
 func (j *Journal) BeginRequest(ctx context.Context) (JournalRequest, error) {
 	return j.BeginRequestWithMetadata(ctx, JournalRequestMetadata{Endpoint: "unknown", Model: "unknown"}, nil)
@@ -271,6 +487,7 @@ func (j *Journal) BeginRequest(ctx context.Context) (JournalRequest, error) {
 // BeginRequestWithMetadata appends accepted, running, and input lifecycle events.
 func (j *Journal) BeginRequestWithMetadata(ctx context.Context, metadata JournalRequestMetadata, input []byte) (JournalRequest, error) {
 	if ctx == nil {
+
 		return JournalRequest{}, errors.New("journal request context is nil")
 	}
 	if err := validateJournalEvent("request.input", input); err != nil {
@@ -292,14 +509,20 @@ func (j *Journal) BeginRequestWithMetadata(ctx context.Context, metadata Journal
 	if model == "" {
 		model = "unknown"
 	}
-	conversationID := deriveConversationID(metadata.ConversationHint)
+	conversationID := metadata.ConversationID
+	if conversationID == "" {
+		conversationID = deriveConversationID(metadata.ConversationHint)
+	}
 	if conversationID == "" {
 		conversationID, err = newJournalUUID()
 		if err != nil {
 			return JournalRequest{}, fmt.Errorf("generate conversation ID: %w", err)
 		}
 	}
-	request := JournalRequest{ID: requestID, Mode: j.mode, ConversationID: conversationID, Endpoint: endpoint, Model: model, APIKeyID: metadata.APIKeyID}
+	request := JournalRequest{
+		ID: requestID, Mode: j.mode, ConversationID: conversationID,
+		Endpoint: endpoint, Model: model, APIKeyID: metadata.APIKeyID, AccountID: metadata.AccountID,
+	}
 	acceptedPayload, err := lifecycleAcceptedBytes(request)
 	if err != nil {
 		return JournalRequest{}, err
@@ -313,11 +536,53 @@ func (j *Journal) BeginRequestWithMetadata(ctx context.Context, metadata Journal
 		return JournalRequest{}, err
 	}
 	state := &journalRequestState{request: request, requestRecord: requestRecord, nextSequence: 1}
+	j.requestsMu.Lock()
 	if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var conversation ConversationRecord
+		conversationErr := tx.Select("deleting_at").Where("id = ?", conversationID).First(&conversation).Error
+		if conversationErr == nil && conversation.DeletingAt != nil {
+			return ErrPreviousResponseNotFound
+		}
+		if conversationErr != nil && !errors.Is(conversationErr, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("check journal conversation lifecycle: %w", conversationErr)
+		}
+		if metadata.PreviousResponseID != "" {
+			var link ResponseLinkRecord
+			linkErr := tx.Where("response_id = ? AND api_key_id = ? AND expires_at > ?", metadata.PreviousResponseID, metadata.APIKeyID, time.Now().UTC()).First(&link).Error
+			if errors.Is(linkErr, gorm.ErrRecordNotFound) {
+				return ErrPreviousResponseNotFound
+			}
+			if linkErr != nil {
+				return fmt.Errorf("load previous response link for journal request: %w", linkErr)
+			}
+			if link.ConversationID != conversationID || link.AccountID != metadata.AccountID {
+				return ErrPreviousResponseNotFound
+			}
+			var owner RequestRecord
+			ownerErr := tx.Where("request_id = ?", link.RequestID).First(&owner).Error
+			if errors.Is(ownerErr, gorm.ErrRecordNotFound) {
+				var ownerJournal JournalRequestRecord
+				ownerJournalErr := tx.Where("request_id = ?", link.RequestID).First(&ownerJournal).Error
+				if errors.Is(ownerJournalErr, gorm.ErrRecordNotFound) {
+					return ErrPreviousResponseNotFound
+				}
+				if ownerJournalErr != nil {
+					return fmt.Errorf("load previous response journal request: %w", ownerJournalErr)
+				}
+				if ownerJournal.ConversationID != link.ConversationID || ownerJournal.APIKeyID != link.APIKeyID || ownerJournal.AccountID != link.AccountID {
+					return ErrPreviousResponseNotFound
+				}
+			} else if ownerErr != nil {
+				return fmt.Errorf("load previous response owner: %w", ownerErr)
+			} else if owner.DeletingAt != nil || owner.ConversationID != link.ConversationID || owner.APIKeyID != link.APIKeyID || owner.AccountID != link.AccountID {
+				return ErrPreviousResponseNotFound
+			}
+		}
 		row := JournalRequestRecord{
 			RequestID: request.ID, Mode: request.Mode, NextSequence: 1,
 			ConversationID: request.ConversationID, Endpoint: request.Endpoint,
-			Model: request.Model, APIKeyID: request.APIKeyID, CreatedAt: requestRecord.CreatedAt,
+			Model: request.Model, APIKeyID: request.APIKeyID, AccountID: request.AccountID,
+			CreatedAt: requestRecord.CreatedAt,
 		}
 		if err := tx.Create(&row).Error; err != nil {
 			return fmt.Errorf("store journal request: %w", err)
@@ -330,9 +595,9 @@ func (j *Journal) BeginRequestWithMetadata(ctx context.Context, metadata Journal
 		}
 		return nil
 	}); err != nil {
+		j.requestsMu.Unlock()
 		return JournalRequest{}, err
 	}
-	j.requestsMu.Lock()
 	j.requests[request.ID] = state
 	j.requestsMu.Unlock()
 	if len(input) != 0 {
@@ -373,6 +638,283 @@ func (j *Journal) newEncryptedRecord(replayID, requestID string, sequence uint64
 	record.Checksum = journalChecksum(record)
 	return record, nil
 }
+func responseLinkPayload(eventType string, payload []byte) (string, bool, error) {
+	if eventType != "response.json" && eventType != "response.completed" && eventType != "response.incomplete" {
+		return "", false, nil
+	}
+	data := bytes.TrimSpace(payload)
+	if bytes.HasPrefix(data, []byte("data:")) {
+		data = bytes.TrimSpace(bytes.TrimPrefix(data, []byte("data:")))
+		if index := bytes.IndexByte(data, '\n'); index >= 0 {
+			data = bytes.TrimSpace(data[:index])
+		}
+	}
+	var envelope struct {
+		Type     string `json:"type"`
+		ID       string `json:"id"`
+		Status   string `json:"status"`
+		Response *struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"response,omitempty"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return "", false, nil
+	}
+	id, status := envelope.ID, envelope.Status
+	switch eventType {
+	case "response.completed", "response.incomplete":
+		if envelope.Response == nil {
+			return "", false, nil
+		}
+		if envelope.Type != "" && envelope.Type != eventType {
+			return "", false, nil
+		}
+		id, status = envelope.Response.ID, envelope.Response.Status
+		expectedStatus := "completed"
+		if eventType == "response.incomplete" {
+			expectedStatus = "incomplete"
+		}
+		if status != "" && status != expectedStatus {
+			return "", false, nil
+		}
+		status = expectedStatus
+	}
+	if id == "" || (status != "completed" && status != "incomplete") {
+		return "", false, nil
+	}
+	if len(id) > 256 {
+		return "", false, errors.New("terminal response link ID is too long")
+	}
+	return id, true, nil
+}
+func ensureResponseLink(tx *gorm.DB, request JournalRequest, responseID string, createdAt time.Time, metadataTTL time.Duration) error {
+	if responseID == "" {
+		return nil
+	}
+	link := ResponseLinkRecord{
+		ResponseID: responseID, RequestID: request.ID, ConversationID: request.ConversationID,
+		AccountID: request.AccountID, APIKeyID: request.APIKeyID,
+		CreatedAt: createdAt, ExpiresAt: createdAt.Add(metadataTTL),
+	}
+	var lifecycle RequestRecord
+	err := tx.Where("request_id = ?", request.ID).First(&lifecycle).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		var journalRow JournalRequestRecord
+		if err := tx.Where("request_id = ?", request.ID).First(&journalRow).Error; err != nil {
+			return fmt.Errorf("load journal request for response link: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("load response link request: %w", err)
+	}
+	var existing ResponseLinkRecord
+	err = tx.Where("response_id = ?", responseID).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if err := tx.Create(&link).Error; err != nil {
+			return fmt.Errorf("store response link: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load response link: %w", err)
+	}
+	if existing.RequestID != link.RequestID || existing.ConversationID != link.ConversationID || existing.AccountID != link.AccountID || existing.APIKeyID != link.APIKeyID {
+		return errors.New("response link identity conflicts")
+	}
+	if existing.ExpiresAt.Before(link.ExpiresAt) {
+		if err := tx.Model(&ResponseLinkRecord{}).Where("response_id = ?", responseID).Update("expires_at", link.ExpiresAt).Error; err != nil {
+			return fmt.Errorf("refresh response link expiry: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureSessionAffinity(tx *gorm.DB, apiKeyID, sessionHash, accountID string, createdAt, expiresAt time.Time) error {
+	if sessionHash == "" {
+		return nil
+	}
+	affinity := SessionAffinityRecord{
+		APIKeyID: apiKeyID, SessionHash: sessionHash, AccountID: accountID,
+		CreatedAt: createdAt, UpdatedAt: createdAt, ExpiresAt: expiresAt,
+	}
+	var existing SessionAffinityRecord
+	err := tx.Where("api_key_id = ? AND session_hash = ?", apiKeyID, sessionHash).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if err := tx.Create(&affinity).Error; err != nil {
+			return fmt.Errorf("store session affinity: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load session affinity: %w", err)
+	}
+	if existing.AccountID != accountID && existing.ExpiresAt.After(createdAt) {
+		return errors.New("session affinity account conflicts")
+	}
+	if err := tx.Model(&SessionAffinityRecord{}).Where("api_key_id = ? AND session_hash = ?", apiKeyID, sessionHash).Updates(map[string]any{
+		"account_id": accountID, "created_at": createdAt, "updated_at": createdAt, "expires_at": expiresAt,
+	}).Error; err != nil {
+		return fmt.Errorf("refresh session affinity: %w", err)
+	}
+	return nil
+}
+
+// BindAccount durably binds one accepted request and its conversation to an account.
+func (j *Journal) BindAccount(ctx context.Context, requestID, accountID, sessionHash string) error {
+	if ctx == nil {
+		return errors.New("journal bind context is nil")
+	}
+	if requestID == "" || accountID == "" || len(accountID) > lifecycleMaxString || len(sessionHash) > lifecycleMaxString {
+		return errors.New("journal account binding is invalid")
+	}
+	if sessionHash != "" {
+		if len(sessionHash) != sha256.Size*2 {
+			return errors.New("journal account binding session hash is invalid")
+		}
+		if _, err := hex.DecodeString(sessionHash); err != nil {
+			return errors.New("journal account binding session hash is invalid")
+		}
+	}
+	if err := j.beginOperation(); err != nil {
+		return err
+	}
+	defer j.endOperation()
+	j.requestsMu.Lock()
+	defer j.requestsMu.Unlock()
+	state := j.requests[requestID]
+	if state == nil {
+		return fmt.Errorf("journal request %q is unknown", requestID)
+	}
+	conversationStates := make([]*journalRequestState, 0, maxConversationInputItems+1)
+	for _, candidate := range j.requests {
+		if candidate.request.ConversationID != state.request.ConversationID {
+			continue
+		}
+		conversationStates = append(conversationStates, candidate)
+		if len(conversationStates) > maxConversationInputItems {
+			return errors.New("journal conversation request limit exceeded")
+		}
+	}
+	sort.Slice(conversationStates, func(left, right int) bool {
+		return conversationStates[left].request.ID < conversationStates[right].request.ID
+	})
+	for _, candidate := range conversationStates {
+		candidate.mu.Lock()
+	}
+	defer func() {
+		for index := len(conversationStates) - 1; index >= 0; index-- {
+			conversationStates[index].mu.Unlock()
+		}
+	}()
+	alreadyBound := state.request.AccountID == accountID && sessionHash == ""
+	if state.request.AccountID != "" && state.request.AccountID != accountID {
+		return errors.New("journal request account conflicts")
+	}
+	replayID, err := newJournalUUID()
+	if err != nil {
+		return fmt.Errorf("generate account binding replay ID: %w", err)
+	}
+	payload, err := json.Marshal(lifecycleAccountBoundPayload{
+		Version: lifecycleEventVersion, RequestID: requestID,
+		ConversationID: state.request.ConversationID, AccountID: accountID, SessionHash: sessionHash,
+	})
+	if err != nil {
+		return fmt.Errorf("encode account binding lifecycle event: %w", err)
+	}
+	record, err := j.newEncryptedRecord(replayID, requestID, state.nextSequence, state.request.Mode, "lifecycle.account_bound", payload, true)
+	if err != nil {
+		return err
+	}
+	if err := j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var journalRow JournalRequestRecord
+		if err := tx.Where("request_id = ?", requestID).First(&journalRow).Error; err != nil {
+			return fmt.Errorf("load journal request for account binding: %w", err)
+		}
+		if journalRow.AccountID != "" && journalRow.AccountID != accountID {
+			return errors.New("journal request account conflicts")
+		}
+		var lifecycle RequestRecord
+		lifecycleErr := tx.Where("request_id = ?", requestID).First(&lifecycle).Error
+		if errors.Is(lifecycleErr, gorm.ErrRecordNotFound) {
+			if err := j.materializeRecord(tx, state.requestRecord, state.request); err != nil {
+				return fmt.Errorf("materialize accepted request for account binding: %w", err)
+			}
+			var receipt JournalReceipt
+			receiptErr := tx.Where("replay_id = ?", state.requestRecord.ReplayID).First(&receipt).Error
+			if errors.Is(receiptErr, gorm.ErrRecordNotFound) {
+				now := time.Now().UTC()
+				receipt = JournalReceipt{
+					ReplayID: state.requestRecord.ReplayID, RequestID: state.requestRecord.RequestID,
+					Sequence: state.requestRecord.Sequence, Mode: state.requestRecord.Mode,
+					EventType: state.requestRecord.EventType, EventVersion: state.requestRecord.EventVersion,
+					KeyVersion: state.requestRecord.KeyVersion, Payload: append([]byte(nil), state.requestRecord.Payload...),
+					Checksum: append([]byte(nil), state.requestRecord.Checksum...), CreatedAt: state.requestRecord.CreatedAt,
+					Materialized: true, MaterializedAt: &now,
+				}
+				if err := tx.Create(&receipt).Error; err != nil {
+					return fmt.Errorf("store accepted account-binding receipt: %w", err)
+				}
+			} else if receiptErr != nil {
+				return fmt.Errorf("load accepted account-binding receipt: %w", receiptErr)
+			}
+			if err := tx.Where("request_id = ?", requestID).First(&lifecycle).Error; err != nil {
+				return fmt.Errorf("load materialized lifecycle request for account binding: %w", err)
+			}
+		} else if lifecycleErr != nil {
+			return fmt.Errorf("load lifecycle request for account binding: %w", lifecycleErr)
+		}
+		if lifecycle.AccountID != "" && lifecycle.AccountID != accountID {
+			return errors.New("lifecycle request account conflicts")
+		}
+		var conversation ConversationRecord
+		conversationErr := tx.Where("id = ?", state.request.ConversationID).First(&conversation).Error
+		if errors.Is(conversationErr, gorm.ErrRecordNotFound) {
+			conversation = ConversationRecord{
+				ID: state.request.ConversationID, AccountID: accountID,
+				CreatedAt: state.requestRecord.CreatedAt, UpdatedAt: state.requestRecord.CreatedAt,
+				ExpiresAt: state.requestRecord.CreatedAt.Add(j.metadataTTL), RequestCount: 1,
+			}
+			if err := tx.Create(&conversation).Error; err != nil {
+				return fmt.Errorf("create lifecycle conversation for account binding: %w", err)
+			}
+		} else if conversationErr != nil {
+			return fmt.Errorf("load lifecycle conversation for account binding: %w", conversationErr)
+		}
+		if err := propagateConversationAccount(tx, state.request.ConversationID, accountID, conversation); err != nil {
+			return err
+		}
+		if err := ensureSessionAffinity(tx, state.request.APIKeyID, sessionHash, accountID, time.Now().UTC(), conversation.ExpiresAt); err != nil {
+			return err
+		}
+		if !alreadyBound {
+			if err := tx.Model(&JournalRequestRecord{}).Where("request_id = ?", requestID).Update("next_sequence", journalRow.NextSequence+1).Error; err != nil {
+				return fmt.Errorf("advance journal request %q after account binding: %w", requestID, err)
+			}
+			record.Sequence = journalRow.NextSequence
+			record.Checksum = journalChecksum(record)
+			if err := validateJournalRecord(record); err != nil {
+				return err
+			}
+			if err := tx.Create(&record).Error; err != nil {
+				return fmt.Errorf("store account binding lifecycle event: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, candidate := range conversationStates {
+		if candidate.request.AccountID == "" {
+			candidate.request.AccountID = accountID
+		}
+	}
+	state.request.AccountID = accountID
+	if !alreadyBound {
+		state.nextSequence++
+		j.enqueueReplay(replayID)
+	}
+	return nil
+}
 
 // Forward appends an encrypted event before invoking its live receiver.
 func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType string, payload []byte, apply func(context.Context, string) error) error {
@@ -392,6 +934,11 @@ func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	request = state.request
+	responseID, responseLinkOK, err := responseLinkPayload(eventType, payload)
+	if err != nil {
+		return err
+	}
 	replayID, err := newJournalUUID()
 	if err != nil {
 		return fmt.Errorf("generate journal replay ID: %w", err)
@@ -400,7 +947,10 @@ func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType
 	if err != nil {
 		return err
 	}
-	if err := j.appendRecord(ctx, state, record); err != nil {
+	if !responseLinkOK {
+		responseID = ""
+	}
+	if err := j.appendRecord(ctx, state, record, responseID); err != nil {
 		return err
 	}
 	state.nextSequence++
@@ -416,7 +966,7 @@ func (j *Journal) Forward(ctx context.Context, request JournalRequest, eventType
 	return nil
 }
 
-func (j *Journal) appendRecord(ctx context.Context, state *journalRequestState, record JournalRecord) error {
+func (j *Journal) appendRecord(ctx context.Context, state *journalRequestState, record JournalRecord, responseID string) error {
 	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var requestRow JournalRequestRecord
 		if err := tx.Where("request_id = ?", state.request.ID).First(&requestRow).Error; err != nil {
@@ -438,6 +988,11 @@ func (j *Journal) appendRecord(ctx context.Context, state *journalRequestState, 
 		if err := validateJournalRecord(record); err != nil {
 			return err
 		}
+		if responseID != "" {
+			if err := ensureResponseLink(tx, state.request, responseID, record.CreatedAt, j.metadataTTL); err != nil {
+				return err
+			}
+		}
 		if err := tx.Create(&record).Error; err != nil {
 			return fmt.Errorf("append journal record: %w", err)
 		}
@@ -456,7 +1011,7 @@ func (j *Journal) appendInternal(ctx context.Context, state *journalRequestState
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if err := j.appendRecord(ctx, state, record); err != nil {
+	if err := j.appendRecord(ctx, state, record, ""); err != nil {
 		return err
 	}
 	state.nextSequence++
@@ -545,7 +1100,7 @@ func (j *Journal) appendTerminalRecord(ctx context.Context, state *journalReques
 	if err != nil {
 		return err
 	}
-	if err := j.appendRecord(ctx, state, record); err != nil {
+	if err := j.appendRecord(ctx, state, record, ""); err != nil {
 		return err
 	}
 	state.nextSequence++
@@ -576,7 +1131,7 @@ func (j *Journal) forwardInternal(ctx context.Context, request JournalRequest, e
 	if err != nil {
 		return err
 	}
-	if err := j.appendRecord(ctx, state, record); err != nil {
+	if err := j.appendRecord(ctx, state, record, ""); err != nil {
 		return err
 	}
 	state.nextSequence++
@@ -787,7 +1342,7 @@ func (j *Journal) applyReceipt(ctx context.Context, record JournalRecord) error 
 		if err := tx.Where("request_id = ?", source.RequestID).First(&requestRow).Error; err != nil {
 			return fmt.Errorf("load journal request metadata: %w", err)
 		}
-		request := JournalRequest{ID: source.RequestID, Mode: source.Mode, ConversationID: requestRow.ConversationID, Endpoint: requestRow.Endpoint, Model: requestRow.Model, APIKeyID: requestRow.APIKeyID}
+		request := JournalRequest{ID: source.RequestID, Mode: source.Mode, ConversationID: requestRow.ConversationID, Endpoint: requestRow.Endpoint, Model: requestRow.Model, APIKeyID: requestRow.APIKeyID, AccountID: requestRow.AccountID}
 		var receipt JournalReceipt
 		receiptResult := tx.Where("replay_id = ?", source.ReplayID).First(&receipt).Error
 		if receiptResult == nil && receipt.Materialized {
@@ -993,7 +1548,7 @@ func validateJournalRecord(record JournalRecord) error {
 	if err := validateJournalEnvelope(record.Payload); err != nil {
 		return err
 	}
-	if record.EventVersion != lifecycleEventVersion || record.KeyVersion == 0 {
+	if !supportedLifecycleEventVersion(record.EventVersion) || record.KeyVersion == 0 {
 		return errors.New("journal record uses an unsupported legacy version")
 	}
 	if len(record.Payload) < 9 || binary.BigEndian.Uint32(record.Payload[5:9]) != record.KeyVersion {

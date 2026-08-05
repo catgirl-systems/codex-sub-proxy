@@ -3,7 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -856,7 +860,7 @@ func TestJournalTerminalConflictKeepsFirstState(t *testing.T) {
 		t.Fatal("request state missing")
 	}
 	requestState.mu.Lock()
-	if err := journal.appendRecord(context.Background(), requestState, conflict); err != nil {
+	if err := journal.appendRecord(context.Background(), requestState, conflict, ""); err != nil {
 		requestState.mu.Unlock()
 		t.Fatalf("append conflict record: %v", err)
 	}
@@ -1078,5 +1082,887 @@ func TestJournalCrashReopenDrainsPendingOnce(t *testing.T) {
 	}
 	if err := sqlDB.Close(); err != nil {
 		t.Fatalf("close database: %v", err)
+	}
+}
+
+func TestJournalResponseLinksResolveAndExpire(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"resp-json","status":"completed","output":[]}`), func(context.Context, string) error {
+		var count int64
+		if err := db.Model(&ResponseLinkRecord{}).Where("response_id = ?", "resp-json").Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("response link count before output = %d", count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("forward JSON terminal: %v", err)
+	}
+	var link ResponseLinkRecord
+	if err := db.Where("response_id = ?", "resp-json").First(&link).Error; err != nil {
+		t.Fatalf("load JSON response link: %v", err)
+	}
+	if link.RequestID != request.ID || link.ConversationID != request.ConversationID || link.APIKeyID != "key-1" {
+		t.Fatalf("response link = %+v", link)
+	}
+	resolved, err := journal.ResolvePreviousResponse(context.Background(), "resp-json", "key-1")
+	if err != nil {
+		t.Fatalf("resolve response link: %v", err)
+	}
+	if resolved.ConversationID != request.ConversationID || resolved.APIKeyID != "key-1" {
+		t.Fatalf("resolved metadata = %+v", resolved)
+	}
+	if _, err := journal.ResolvePreviousResponse(context.Background(), "resp-json", "other-key"); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("cross-key resolution error = %v", err)
+	}
+	if err := db.Model(&ResponseLinkRecord{}).Where("response_id = ?", "resp-json").Update("expires_at", time.Now().UTC().Add(-time.Second)).Error; err != nil {
+		t.Fatalf("expire response link: %v", err)
+	}
+	if _, err := journal.ResolvePreviousResponse(context.Background(), "resp-json", "key-1"); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("expired resolution error = %v", err)
+	}
+
+	request, err = journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin SSE request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.completed", []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-sse\",\"status\":\"completed\"}}\n\n"), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward SSE terminal: %v", err)
+	}
+	if err := db.Where("response_id = ?", "resp-sse").First(&ResponseLinkRecord{}).Error; err != nil {
+		t.Fatalf("load SSE response link: %v", err)
+	}
+
+	request, err = journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin failed request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.failed", []byte(`data: {"type":"response.failed","response":{"id":"resp-failed","status":"failed"}}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward failed terminal: %v", err)
+	}
+	var failedLinks int64
+	if err := db.Model(&ResponseLinkRecord{}).Where("response_id = ?", "resp-failed").Count(&failedLinks).Error; err != nil {
+		t.Fatalf("count failed response links: %v", err)
+	}
+	if failedLinks != 0 {
+		t.Fatalf("failed response link count = %d, want 0", failedLinks)
+	}
+}
+
+func TestJournalResolvePreviousResponseRejectsDeletingOwners(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"deleting-owner-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward response: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("materialize response: %v", err)
+	}
+	deletingAt := time.Now().UTC()
+	if err := db.Model(&RequestRecord{}).Where("request_id = ?", request.ID).Update("deleting_at", deletingAt).Error; err != nil {
+		t.Fatalf("mark request deleting: %v", err)
+	}
+	if _, err := journal.ResolvePreviousResponse(context.Background(), "deleting-owner-response", "key-1"); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("deleting request resolution error = %v", err)
+	}
+	if err := db.Model(&RequestRecord{}).Where("request_id = ?", request.ID).Update("deleting_at", nil).Error; err != nil {
+		t.Fatalf("clear request deletion: %v", err)
+	}
+	if err := db.Model(&ConversationRecord{}).Where("id = ?", request.ConversationID).Update("deleting_at", deletingAt).Error; err != nil {
+		t.Fatalf("mark conversation deleting: %v", err)
+	}
+	if _, err := journal.ResolvePreviousResponse(context.Background(), "deleting-owner-response", "key-1"); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("deleting conversation resolution error = %v", err)
+	}
+	if _, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: request.ConversationID,
+	}, nil); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("begin deleting conversation error = %v", err)
+	}
+}
+
+func TestJournalBeginRejectsConversationTombstoneAfterResolution(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	now := time.Now().UTC()
+	conversationID := "tombstone-race-conversation"
+	requestID := "tombstone-race-request"
+	if err := db.Create(&ConversationRecord{
+		ID: conversationID, CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour), RequestCount: 1,
+	}).Error; err != nil {
+		t.Fatalf("create tombstone conversation: %v", err)
+	}
+	if err := db.Create(&RequestRecord{
+		ID: requestID, ReplayID: "tombstone-accepted-replay", ConversationID: conversationID,
+		APIKeyID: "key-1", Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", Mode: journalModeDurable,
+		Status: requestStatusSucceeded, CreatedAt: now, AcceptedAt: now, StartedAt: now, UpdatedAt: now,
+		TerminalAt: &now, ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("create tombstone request: %v", err)
+	}
+	if err := db.Create(&ResponseLinkRecord{
+		ResponseID: "tombstone-race-response", RequestID: requestID, ConversationID: conversationID,
+		APIKeyID: "key-1", CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("create tombstone response link: %v", err)
+	}
+	if _, err := journal.ResolvePreviousResponse(context.Background(), "tombstone-race-response", "key-1"); err != nil {
+		t.Fatalf("resolve response before deletion: %v", err)
+	}
+	retention, err := NewRetentionRunner(db, nil, RetentionConfig{})
+	if err != nil {
+		t.Fatalf("new retention runner: %v", err)
+	}
+	type requestDeletionResult struct {
+		marked bool
+		err    error
+	}
+	requestDeletionResults := make(chan requestDeletionResult, 1)
+	go func() {
+		marked, markErr := retention.markRequestDeleting(context.Background(), requestID, AdminPrincipal{})
+		requestDeletionResults <- requestDeletionResult{marked: marked, err: markErr}
+	}()
+	requestDeadline := time.Now().Add(time.Second)
+	for {
+		var request RequestRecord
+		if err := db.Where("request_id = ?", requestID).First(&request).Error; err != nil {
+			t.Fatalf("load deleting request: %v", err)
+		}
+		if request.DeletingAt != nil {
+			break
+		}
+		if !time.Now().Before(requestDeadline) {
+			t.Fatal("request deletion did not commit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	requestDeletion := <-requestDeletionResults
+	if requestDeletion.err != nil || !requestDeletion.marked {
+		t.Fatalf("mark request deleting: marked=%t err=%v", requestDeletion.marked, requestDeletion.err)
+	}
+	if _, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+		ConversationID: conversationID, PreviousResponseID: "tombstone-race-response",
+	}, nil); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("begin request-tombstoned continuation error = %v", err)
+	}
+	type deletionResult struct {
+		marked bool
+		err    error
+	}
+	deletionResults := make(chan deletionResult, 1)
+	go func() {
+		marked, markErr := retention.markConversationDeleting(context.Background(), conversationID, AdminPrincipal{})
+		deletionResults <- deletionResult{marked: marked, err: markErr}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		var conversation ConversationRecord
+		if err := db.Where("id = ?", conversationID).First(&conversation).Error; err != nil {
+			t.Fatalf("load deleting conversation: %v", err)
+		}
+		if conversation.DeletingAt != nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("conversation deletion did not commit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	deletion := <-deletionResults
+	if deletion.err != nil || !deletion.marked {
+		t.Fatalf("mark conversation deleting: marked=%t err=%v", deletion.marked, deletion.err)
+	}
+	if _, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: conversationID,
+	}, nil); !errors.Is(err, ErrPreviousResponseNotFound) {
+		t.Fatalf("begin tombstoned continuation error = %v", err)
+	}
+}
+
+func TestJournalResponseLinkCollisionAndTerminalExpiry(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := db.Model(&RequestRecord{}).Where("request_id = ?", request.ID).Update("expires_at", time.Now().UTC().Add(-time.Hour)).Error; err != nil {
+		t.Fatalf("expire request metadata: %v", err)
+	}
+	before := time.Now().UTC()
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"collision-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward terminal response: %v", err)
+	}
+	var link ResponseLinkRecord
+	if err := db.Where("response_id = ?", "collision-response").First(&link).Error; err != nil {
+		t.Fatalf("load response link: %v", err)
+	}
+	if !link.ExpiresAt.After(before.Add(journal.metadataTTL / 2)) {
+		t.Fatalf("response link expiry = %s, want terminal-relative expiry after %s", link.ExpiresAt, before.Add(journal.metadataTTL/2))
+	}
+
+	other, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin colliding request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), other, "response.json", []byte(`{"id":"collision-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "response link identity conflicts") {
+		t.Fatalf("response link collision error = %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay after response link collision: %v", err)
+	}
+	oversizedID := strings.Repeat("x", 257)
+	if err := journal.Forward(context.Background(), other, "response.json", []byte(`{"id":"`+oversizedID+`","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "response link ID is too long") {
+		t.Fatalf("oversized response link error = %v", err)
+	}
+	if err := journal.Forward(context.Background(), other, "response.json", []byte(`{"id":"collision-response-next","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward after response link collision: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay after valid later response: %v", err)
+	}
+}
+
+func TestJournalLoadConversationInputUsesTerminalOutputsAndBounds(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	input := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationHint: "history",
+	}, input)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"history-response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"world"}]}]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward response: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay conversation: %v", err)
+	}
+	items, err := journal.LoadConversationInput(context.Background(), request.ConversationID)
+	if err != nil {
+		t.Fatalf("load conversation input: %v", err)
+	}
+	if len(items) != 2 || !strings.Contains(string(items[0]), `"hello"`) || !strings.Contains(string(items[1]), `"world"`) {
+		t.Fatalf("conversation items = %s", items)
+	}
+}
+
+func TestJournalLoadConversationInputCapsJournalRows(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Close(context.Background()); err != nil {
+		t.Fatalf("stop journal worker: %v", err)
+	}
+	for index := 0; index <= maxConversationJournalEvents; index++ {
+		replayID, err := newJournalUUID()
+		if err != nil {
+			t.Fatalf("generate journal replay ID: %v", err)
+		}
+		record, err := journal.newEncryptedRecord(replayID, request.ID, uint64(index+100), journalModeDurable, "response.json", []byte(`{"status":"in_progress"}`), true)
+		if err != nil {
+			t.Fatalf("encrypt journal event %d: %v", index, err)
+		}
+		if err := db.Create(&record).Error; err != nil {
+			t.Fatalf("store journal event %d: %v", index, err)
+		}
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("materialize bounded journal rows: %v", err)
+	}
+	if _, err := journal.LoadConversationInput(context.Background(), request.ConversationID); err == nil || !strings.Contains(err.Error(), "conversation journal bounds exceeded") {
+		t.Fatalf("conversation journal bounds error = %v", err)
+	}
+}
+
+func TestJournalBindAccountCapsInMemoryConversationStates(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	target, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin target request: %v", err)
+	}
+	journal.requestsMu.Lock()
+	for index := range maxConversationInputItems {
+		id := fmt.Sprintf("synthetic-request-%04d", index)
+		journal.requests[id] = &journalRequestState{
+			request: JournalRequest{ID: id, Mode: journalModeDurable, ConversationID: target.ConversationID},
+		}
+	}
+	journal.requestsMu.Unlock()
+	if err := journal.BindAccount(context.Background(), target.ID, "account-1", ""); err == nil ||
+		!strings.Contains(err.Error(), "journal conversation request limit exceeded") {
+		t.Fatalf("in-memory conversation state limit error = %v", err)
+	}
+}
+
+func TestJournalLoadConversationInputRejectsTamperedRecord(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"tampered-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward response: %v", err)
+	}
+	if err := journal.Close(context.Background()); err != nil {
+		t.Fatalf("stop journal worker: %v", err)
+	}
+	if err := db.Model(&JournalRecord{}).Where("request_id = ? AND event_type = ?", request.ID, "response.json").Update("sequence", 999999).Error; err != nil {
+		t.Fatalf("tamper journal sequence: %v", err)
+	}
+	if _, err := journal.LoadConversationInput(context.Background(), request.ConversationID); err == nil || !strings.Contains(err.Error(), "validate conversation journal event") {
+		t.Fatalf("tampered journal validation error = %v", err)
+	}
+}
+
+func TestJournalBindAccountBindsConversationAndSessionAffinity(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	sessionDigest := sha256.Sum256([]byte("session-1"))
+	sessionHash := hex.EncodeToString(sessionDigest[:])
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"unbound-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward unbound response: %v", err)
+	}
+	sibling, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: request.ConversationID,
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin sibling request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), sibling, "response.json", []byte(`{"id":"sibling-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward sibling response: %v", err)
+	}
+	if err := journal.BindAccount(context.Background(), request.ID, "account-1", sessionHash); err != nil {
+		t.Fatalf("bind account: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.output_text.delta", []byte(`{"type":"response.output_text.delta","delta":"after"}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward bound response: %v", err)
+	}
+	resolved, err := journal.ResolvePreviousResponse(context.Background(), "unbound-response", "key-1")
+	if err != nil {
+		t.Fatalf("resolve bound response link: %v", err)
+	}
+	if resolved.AccountID != "account-1" {
+		t.Fatalf("resolved response account = %q", resolved.AccountID)
+	}
+	siblingResolved, err := journal.ResolvePreviousResponse(context.Background(), "sibling-response", "key-1")
+	if err != nil {
+		t.Fatalf("resolve sibling response link: %v", err)
+	}
+	if siblingResolved.AccountID != "account-1" {
+		t.Fatalf("resolved sibling response account = %q", siblingResolved.AccountID)
+	}
+	var siblingJournal JournalRequestRecord
+	if err := db.Where("request_id = ?", sibling.ID).First(&siblingJournal).Error; err != nil {
+		t.Fatalf("load bound sibling journal request: %v", err)
+	}
+	if siblingJournal.AccountID != "account-1" {
+		t.Fatalf("sibling journal account = %q", siblingJournal.AccountID)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay conversation account binding: %v", err)
+	}
+	var siblingLifecycle RequestRecord
+	if err := db.Where("request_id = ?", sibling.ID).First(&siblingLifecycle).Error; err != nil {
+		t.Fatalf("load replayed sibling request: %v", err)
+	}
+	if siblingLifecycle.AccountID != "account-1" {
+		t.Fatalf("replayed sibling account = %q", siblingLifecycle.AccountID)
+	}
+	var lifecycle RequestRecord
+	if err := db.Where("request_id = ?", request.ID).First(&lifecycle).Error; err != nil {
+		t.Fatalf("load bound lifecycle request: %v", err)
+	}
+	if lifecycle.AccountID != "account-1" {
+		t.Fatalf("lifecycle account = %q", lifecycle.AccountID)
+	}
+	var conversation ConversationRecord
+	if err := db.Where("id = ?", request.ConversationID).First(&conversation).Error; err != nil {
+		t.Fatalf("load bound conversation: %v", err)
+	}
+	if conversation.AccountID != "account-1" {
+		t.Fatalf("conversation account = %q", conversation.AccountID)
+	}
+	var affinity SessionAffinityRecord
+	if err := db.Where("api_key_id = ? AND session_hash = ?", "key-1", sessionHash).First(&affinity).Error; err != nil {
+		t.Fatalf("load session affinity: %v", err)
+	}
+	if affinity.AccountID != "account-1" || affinity.ExpiresAt.IsZero() {
+		t.Fatalf("session affinity = %+v", affinity)
+	}
+	var bound JournalRecord
+	if err := db.Where("request_id = ? AND event_type = ?", request.ID, "lifecycle.account_bound").First(&bound).Error; err != nil {
+		t.Fatalf("load account bound event: %v", err)
+	}
+	if bound.EventVersion != lifecycleEventVersion {
+		t.Fatalf("account bound event version = %d, want %d", bound.EventVersion, lifecycleEventVersion)
+	}
+	if err := journal.BindAccount(context.Background(), request.ID, "account-2", ""); err == nil {
+		t.Fatal("conflicting account binding succeeded")
+	}
+
+	other, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin competing request: %v", err)
+	}
+	if err := journal.BindAccount(context.Background(), other.ID, "account-2", sessionHash); err == nil {
+		t.Fatal("conflicting session affinity binding succeeded")
+	}
+}
+
+func TestJournalBindAccountRepairsPartialProjectionWhenAlreadyBound(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	first, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", AccountID: "account-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin account-bound request: %v", err)
+	}
+	sibling, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: first.ConversationID,
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin partial sibling request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), sibling, "response.json", []byte(`{"id":"partial-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward partial sibling response: %v", err)
+	}
+	if err := journal.BindAccount(context.Background(), first.ID, "account-1", ""); err != nil {
+		t.Fatalf("repair account-bound projections: %v", err)
+	}
+	var siblingJournal JournalRequestRecord
+	if err := db.Where("request_id = ?", sibling.ID).First(&siblingJournal).Error; err != nil {
+		t.Fatalf("load repaired sibling journal request: %v", err)
+	}
+	if siblingJournal.AccountID != "account-1" {
+		t.Fatalf("repaired sibling journal account = %q", siblingJournal.AccountID)
+	}
+	var link ResponseLinkRecord
+	if err := db.Where("response_id = ?", "partial-response").First(&link).Error; err != nil {
+		t.Fatalf("load repaired sibling response link: %v", err)
+	}
+	if link.AccountID != "account-1" {
+		t.Fatalf("repaired sibling response account = %q", link.AccountID)
+	}
+	resolved, err := journal.ResolvePreviousResponse(context.Background(), "partial-response", "key-1")
+	if err != nil {
+		t.Fatalf("resolve repaired sibling response: %v", err)
+	}
+	if resolved.AccountID != "account-1" {
+		t.Fatalf("resolved repaired sibling account = %q", resolved.AccountID)
+	}
+}
+
+func TestJournalBindAccountRebindsExpiredSessionAffinity(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	sessionDigest := sha256.Sum256([]byte("expired-session"))
+	sessionHash := hex.EncodeToString(sessionDigest[:])
+	first, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin first request: %v", err)
+	}
+	if err := journal.BindAccount(context.Background(), first.ID, "account-1", sessionHash); err != nil {
+		t.Fatalf("bind first account: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay first account binding: %v", err)
+	}
+	if err := db.Model(&SessionAffinityRecord{}).Where("api_key_id = ? AND session_hash = ?", "key-1", sessionHash).
+		Update("expires_at", time.Now().UTC().Add(-time.Minute)).Error; err != nil {
+		t.Fatalf("expire session affinity: %v", err)
+	}
+	second, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin second request: %v", err)
+	}
+	if err := journal.BindAccount(context.Background(), second.ID, "account-2", sessionHash); err != nil {
+		t.Fatalf("rebind expired session affinity: %v", err)
+	}
+	var affinity SessionAffinityRecord
+	if err := db.Where("api_key_id = ? AND session_hash = ?", "key-1", sessionHash).First(&affinity).Error; err != nil {
+		t.Fatalf("load rebound session affinity: %v", err)
+	}
+	if affinity.AccountID != "account-2" || !affinity.ExpiresAt.After(time.Now().UTC()) {
+		t.Fatalf("rebound session affinity = %+v", affinity)
+	}
+}
+
+func TestJournalBeginRegistrationSynchronizedWithBind(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	target, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin target request: %v", err)
+	}
+	journal.requestsMu.Lock()
+	beginStarted := make(chan struct{})
+	beginResult := make(chan struct {
+		request JournalRequest
+		err     error
+	}, 1)
+	go func() {
+		close(beginStarted)
+		request, beginErr := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+			Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: target.ConversationID,
+		}, nil)
+		beginResult <- struct {
+			request JournalRequest
+			err     error
+		}{request, beginErr}
+	}()
+	<-beginStarted
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		var count int64
+		if err := db.Model(&JournalRequestRecord{}).Where("conversation_id = ?", target.ConversationID).Count(&count).Error; err != nil {
+			journal.requestsMu.Unlock()
+			t.Fatalf("count concurrent begin rows: %v", err)
+		}
+		if count != 1 {
+			journal.requestsMu.Unlock()
+			t.Fatalf("begin registered a row while binding lock held: count=%d", count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	journal.requestsMu.Unlock()
+	var sibling JournalRequest
+	select {
+	case result := <-beginResult:
+		if result.err != nil {
+			t.Fatalf("begin synchronized sibling request: %v", result.err)
+		}
+		sibling = result.request
+	case <-time.After(time.Second):
+		t.Fatal("synchronized sibling begin timed out")
+	}
+	if err := journal.BindAccount(context.Background(), target.ID, "account-1", ""); err != nil {
+		t.Fatalf("bind synchronized conversation: %v", err)
+	}
+	var siblingRow JournalRequestRecord
+	if err := db.Where("request_id = ?", sibling.ID).First(&siblingRow).Error; err != nil {
+		t.Fatalf("load synchronized sibling row: %v", err)
+	}
+	if siblingRow.AccountID != "account-1" {
+		t.Fatalf("synchronized sibling account = %q", siblingRow.AccountID)
+	}
+}
+func TestJournalBindAccountConcurrentSameConversation(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	first, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin first request: %v", err)
+	}
+	second, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: first.ConversationID,
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin second request: %v", err)
+	}
+	hashFor := func(value string) string {
+		digest := sha256.Sum256([]byte(value))
+		return hex.EncodeToString(digest[:])
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		errs <- journal.BindAccount(context.Background(), first.ID, "account-1", hashFor("first"))
+	}()
+	go func() {
+		<-start
+		errs <- journal.BindAccount(context.Background(), second.ID, "account-1", hashFor("second"))
+	}()
+	close(start)
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for range 2 {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("concurrent account bind: %v", err)
+			}
+		case <-timeout.C:
+			t.Fatal("concurrent account bind timed out")
+		}
+	}
+}
+
+func TestJournalBindAccountHandlesLegacyNullAccounts(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	if err := journal.Forward(context.Background(), request, "response.json", []byte(`{"id":"legacy-null-response","status":"completed","output":[]}`), func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward response: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("materialize response: %v", err)
+	}
+	for _, table := range []string{"journal_requests", "requests", "response_links"} {
+		if err := db.Exec("UPDATE "+table+" SET account_id = NULL WHERE "+map[string]string{
+			"journal_requests": "request_id = ?",
+			"requests":         "request_id = ?",
+			"response_links":   "response_id = ?",
+		}[table], map[string]string{
+			"journal_requests": request.ID,
+			"requests":         request.ID,
+			"response_links":   "legacy-null-response",
+		}[table]).Error; err != nil {
+			t.Fatalf("clear legacy %s account: %v", table, err)
+		}
+	}
+	if err := db.Exec("UPDATE conversations SET account_id = NULL WHERE id = ?", request.ConversationID).Error; err != nil {
+		t.Fatalf("clear legacy conversation account: %v", err)
+	}
+	if err := journal.BindAccount(context.Background(), request.ID, "account-legacy", ""); err != nil {
+		t.Fatalf("bind legacy null account: %v", err)
+	}
+	var link ResponseLinkRecord
+	if err := db.Where("response_id = ?", "legacy-null-response").First(&link).Error; err != nil {
+		t.Fatalf("load legacy response link: %v", err)
+	}
+	if link.AccountID != "account-legacy" {
+		t.Fatalf("legacy response link account = %q", link.AccountID)
+	}
+	if _, err := journal.ResolvePreviousResponse(context.Background(), "legacy-null-response", "key-1"); err != nil {
+		t.Fatalf("resolve legacy response link: %v", err)
+	}
+}
+
+func TestJournalReplayAcceptsUnmaterializedV1AcceptedRecord(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	var accepted JournalRecord
+	if err := db.Where("request_id = ? AND event_type = ?", request.ID, journalRequestEventType).First(&accepted).Error; err != nil {
+		t.Fatalf("load accepted record: %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"version": 1, "request_id": request.ID, "conversation_id": request.ConversationID,
+		"endpoint": request.Endpoint, "model": request.Model, "api_key_id": request.APIKeyID, "mode": request.Mode,
+	})
+	if err != nil {
+		t.Fatalf("encode v1 accepted payload: %v", err)
+	}
+	encrypted, err := envelope.Encrypt(payload, envelope.PayloadDomain, journal.keys)
+	if err != nil {
+		t.Fatalf("encrypt v1 accepted payload: %v", err)
+	}
+	accepted.EventVersion = 1
+	accepted.Payload = encrypted
+	accepted.Checksum = journalChecksum(accepted)
+	if err := db.Model(&JournalRecord{}).Where("replay_id = ?", accepted.ReplayID).Updates(map[string]any{
+		"event_version": accepted.EventVersion, "payload": accepted.Payload, "checksum": accepted.Checksum,
+	}).Error; err != nil {
+		t.Fatalf("replace accepted record: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay v1 accepted record: %v", err)
+	}
+	var lifecycle RequestRecord
+	if err := db.Where("request_id = ?", request.ID).First(&lifecycle).Error; err != nil {
+		t.Fatalf("load replayed lifecycle request: %v", err)
+	}
+	if lifecycle.AccountID != "" {
+		t.Fatalf("v1 lifecycle account = %q, want empty", lifecycle.AccountID)
+	}
+}
+
+func TestSchemaMigratesLegacyAccountsAndContinuationTables(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "schema.sqlite3")
+	db, err := storage.Open(context.Background(), databasePath, time.Second)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer func() {
+		sqlDB, closeErr := db.DB()
+		if closeErr == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+	if err := db.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)`).Error; err != nil {
+		t.Fatalf("create schema migrations: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO schema_migrations(version, name) VALUES (1, 'initial')`).Error; err != nil {
+		t.Fatalf("insert schema version: %v", err)
+	}
+	if err := db.Exec(`
+		CREATE TABLE accounts (
+			id TEXT PRIMARY KEY NOT NULL,
+			provider TEXT NOT NULL,
+			account_id TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			expires_at DATETIME NOT NULL
+		)`).Error; err != nil {
+		t.Fatalf("create legacy accounts: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := db.Exec(`INSERT INTO accounts(id, provider, account_id, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`, "profile-1", "codex", "provider-1", now, now, now.Add(time.Hour)).Error; err != nil {
+		t.Fatalf("insert legacy account: %v", err)
+	}
+	if err := MigrateSchema(db); err != nil {
+		t.Fatalf("migrate schema: %v", err)
+	}
+	var account AccountRecord
+	if err := db.Where("id = ?", "profile-1").First(&account).Error; err != nil {
+		t.Fatalf("load migrated account: %v", err)
+	}
+	if account.Provider != "codex" || account.ProviderAccountID != "provider-1" || account.CredentialPath != "" || account.Enabled {
+		t.Fatalf("migrated account = %+v", account)
+	}
+	var accountColumns []struct {
+		Name string `gorm:"column:name"`
+	}
+	if err := db.Raw("PRAGMA table_info(accounts)").Scan(&accountColumns).Error; err != nil {
+		t.Fatalf("inspect migrated accounts: %v", err)
+	}
+	for _, column := range accountColumns {
+		if column.Name == "account_id" || column.Name == "expires_at" {
+			t.Fatalf("legacy account column %q remains", column.Name)
+		}
+	}
+	if !db.Migrator().HasTable(&ResponseLinkRecord{}) || !db.Migrator().HasTable(&SessionAffinityRecord{}) {
+		t.Fatal("continuation tables were not migrated")
+	}
+	var migration schemaMigration
+	if err := db.Order("version DESC").First(&migration).Error; err != nil {
+		t.Fatalf("load schema migration: %v", err)
+	}
+	if migration.Version != currentSchemaVersion || migration.Name != "accounts_and_continuations" {
+		t.Fatalf("schema migration = %+v", migration)
+	}
+}
+
+func TestRetentionSweepsExpiredSessionAffinities(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+	now := time.Now().UTC()
+	affinity := SessionAffinityRecord{
+		APIKeyID: "key-1", SessionHash: strings.Repeat("a", sha256.Size*2), AccountID: "account-1",
+		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(-time.Minute),
+	}
+	if err := db.Create(&affinity).Error; err != nil {
+		t.Fatalf("create expired session affinity: %v", err)
+	}
+	runner, err := NewRetentionRunner(db, nil, RetentionConfig{PayloadTTL: time.Hour, MetadataTTL: time.Hour, SweepInterval: time.Hour, BatchSize: 8, DrainDeadline: time.Second})
+	if err != nil {
+		t.Fatalf("new retention runner: %v", err)
+	}
+	if err := runner.RunOnce(context.Background(), now); err != nil {
+		t.Fatalf("run retention sweep: %v", err)
+	}
+	var count int64
+	if err := db.Model(&SessionAffinityRecord{}).Where("api_key_id = ? AND session_hash = ?", affinity.APIKeyID, affinity.SessionHash).Count(&count).Error; err != nil {
+		t.Fatalf("count expired session affinity: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expired session affinity count = %d, want 0", count)
 	}
 }

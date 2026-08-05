@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	lifecycleEventVersion  uint16 = 1
+	lifecycleEventVersion  uint16 = 2
 	lifecycleMaxString            = 512
 	lifecycleMaxDetail            = envelope.MaxPlaintextSize
 	requestStatusRunning          = "running"
@@ -26,30 +26,42 @@ const (
 	requestStatusCanceled         = "canceled"
 )
 
-var (
-	terminalStates = map[string]struct{}{
-		requestStatusSucceeded: {},
-		requestStatusFailed:    {},
-		requestStatusCanceled:  {},
-	}
-)
+func supportedLifecycleEventVersion(version uint16) bool {
+	return version == 1 || version == lifecycleEventVersion
+}
+
+var terminalStates = map[string]struct{}{
+	requestStatusSucceeded: {},
+	requestStatusFailed:    {},
+	requestStatusCanceled:  {},
+}
 
 // JournalRequestMetadata contains safe request metadata. It never contains a secret.
 type JournalRequestMetadata struct {
-	Endpoint         string
-	Model            string
-	APIKeyID         string
-	ConversationHint string
+	Endpoint           string
+	Model              string
+	APIKeyID           string
+	ConversationHint   string
+	ConversationID     string
+	AccountID          string
+	PreviousResponseID string
 }
 
 // AccountRecord stores provider identity without credentials.
 type AccountRecord struct {
-	ID        string    `gorm:"column:id;primaryKey;size:255"`
-	Provider  string    `gorm:"column:provider;not null;size:128;index"`
-	AccountID string    `gorm:"column:account_id;not null;size:255;index"`
-	CreatedAt time.Time `gorm:"column:created_at;not null"`
-	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
-	ExpiresAt time.Time `gorm:"column:expires_at;not null;index"`
+	ID                string     `gorm:"column:id;primaryKey;size:255"`
+	Provider          string     `gorm:"column:provider;not null;size:128;index"`
+	ProviderAccountID string     `gorm:"column:provider_account_id;not null;size:255;uniqueIndex"`
+	CredentialPath    string     `gorm:"column:credential_path;not null;size:1024"`
+	Enabled           bool       `gorm:"column:enabled;not null;default:false;index"`
+	IsDefault         bool       `gorm:"column:is_default;not null;default:false;index"`
+	PlanType          string     `gorm:"column:plan_type;size:128"`
+	Email             string     `gorm:"column:email;size:320"`
+	CreatedAt         time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt         time.Time  `gorm:"column:updated_at;not null"`
+	LastSeenAt        *time.Time `gorm:"column:last_seen_at"`
+	CooldownUntil     *time.Time `gorm:"column:cooldown_until;index"`
+	LastErrorClass    string     `gorm:"column:last_error_class;size:128"`
 }
 
 func (AccountRecord) TableName() string { return "accounts" }
@@ -73,6 +85,7 @@ type RequestRecord struct {
 	ReplayID         string     `gorm:"column:accepted_replay_id;not null;uniqueIndex"`
 	ConversationID   string     `gorm:"column:conversation_id;not null;size:36;index"`
 	APIKeyID         string     `gorm:"column:api_key_id;size:255;index"`
+	AccountID        string     `gorm:"column:account_id;size:255;index"`
 	Endpoint         string     `gorm:"column:endpoint;not null;size:128;index"`
 	Model            string     `gorm:"column:model;not null;size:256;index"`
 	RequestedModel   string     `gorm:"column:requested_model;size:256;index"`
@@ -92,7 +105,31 @@ type RequestRecord struct {
 	DeletingAt       *time.Time `gorm:"column:deleting_at;index"`
 }
 
-func (RequestRecord) TableName() string { return "requests" }
+// ResponseLinkRecord maps an upstream response ID to its durable request identity.
+type ResponseLinkRecord struct {
+	ResponseID     string    `gorm:"column:response_id;primaryKey;size:256"`
+	RequestID      string    `gorm:"column:request_id;not null;uniqueIndex;size:36"`
+	ConversationID string    `gorm:"column:conversation_id;not null;index;size:36"`
+	AccountID      string    `gorm:"column:account_id;index;size:255"`
+	APIKeyID       string    `gorm:"column:api_key_id;index;size:255"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+	ExpiresAt      time.Time `gorm:"column:expires_at;not null;index"`
+}
+
+// SessionAffinityRecord binds one downstream session identity to an account.
+type SessionAffinityRecord struct {
+	APIKeyID    string    `gorm:"column:api_key_id;primaryKey;size:255"`
+	SessionHash string    `gorm:"column:session_hash;primaryKey;size:128"`
+	AccountID   string    `gorm:"column:account_id;not null;index;size:255"`
+	CreatedAt   time.Time `gorm:"column:created_at;not null"`
+	UpdatedAt   time.Time `gorm:"column:updated_at;not null"`
+	ExpiresAt   time.Time `gorm:"column:expires_at;not null;index"`
+}
+
+func (SessionAffinityRecord) TableName() string { return "session_affinities" }
+
+func (ResponseLinkRecord) TableName() string { return "response_links" }
+func (RequestRecord) TableName() string      { return "requests" }
 
 // EncryptedPayloadRecord stores one authenticated payload envelope.
 type EncryptedPayloadRecord struct {
@@ -165,10 +202,19 @@ type lifecycleAcceptedPayload struct {
 	Version        uint16 `json:"version"`
 	RequestID      string `json:"request_id"`
 	ConversationID string `json:"conversation_id"`
+	AccountID      string `json:"account_id,omitempty"`
 	Endpoint       string `json:"endpoint"`
 	Model          string `json:"model"`
 	APIKeyID       string `json:"api_key_id,omitempty"`
 	Mode           string `json:"mode"`
+}
+
+type lifecycleAccountBoundPayload struct {
+	Version        uint16 `json:"version"`
+	RequestID      string `json:"request_id"`
+	ConversationID string `json:"conversation_id"`
+	AccountID      string `json:"account_id"`
+	SessionHash    string `json:"session_hash,omitempty"`
 }
 
 type lifecycleTerminalPayload struct {
@@ -190,23 +236,91 @@ type lifecycleUsagePayload struct {
 	ResolvedModel          string `json:"resolved_model,omitempty"`
 }
 
+func migrateAccounts(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&AccountRecord{}) {
+		if err := db.Exec(`
+			CREATE TABLE accounts (
+				id TEXT PRIMARY KEY NOT NULL,
+				provider TEXT NOT NULL,
+				provider_account_id TEXT NOT NULL,
+				credential_path TEXT NOT NULL DEFAULT '',
+				enabled INTEGER NOT NULL DEFAULT 0,
+				is_default INTEGER NOT NULL DEFAULT 0,
+				plan_type TEXT NOT NULL DEFAULT '',
+				email TEXT NOT NULL DEFAULT '',
+				created_at DATETIME NOT NULL,
+				updated_at DATETIME NOT NULL,
+				last_seen_at DATETIME,
+				cooldown_until DATETIME,
+				last_error_class TEXT NOT NULL DEFAULT '',
+				CHECK (provider = 'codex')
+			)`).Error; err != nil {
+			return fmt.Errorf("create accounts table: %w", err)
+		}
+	} else if !db.Migrator().HasColumn(&AccountRecord{}, "provider_account_id") {
+		if err := db.Exec("ALTER TABLE accounts RENAME TO accounts_v1").Error; err != nil {
+			return fmt.Errorf("rename legacy accounts table: %w", err)
+		}
+		if err := db.Exec(`
+			CREATE TABLE accounts (
+				id TEXT PRIMARY KEY NOT NULL,
+				provider TEXT NOT NULL,
+				provider_account_id TEXT NOT NULL,
+				credential_path TEXT NOT NULL DEFAULT '',
+				enabled INTEGER NOT NULL DEFAULT 0,
+				is_default INTEGER NOT NULL DEFAULT 0,
+				plan_type TEXT NOT NULL DEFAULT '',
+				email TEXT NOT NULL DEFAULT '',
+				created_at DATETIME NOT NULL,
+				updated_at DATETIME NOT NULL,
+				last_seen_at DATETIME,
+				cooldown_until DATETIME,
+				last_error_class TEXT NOT NULL DEFAULT '',
+				CHECK (provider = 'codex')
+			)`).Error; err != nil {
+			return fmt.Errorf("create migrated accounts table: %w", err)
+		}
+		if err := db.Exec(`
+			INSERT INTO accounts
+				(id, provider, provider_account_id, credential_path, enabled, is_default,
+				 plan_type, email, created_at, updated_at, last_seen_at, cooldown_until, last_error_class)
+			SELECT id, provider, account_id, '', 0, 0, '', '', created_at, updated_at, NULL, NULL, ''
+			FROM accounts_v1`).Error; err != nil {
+			return fmt.Errorf("copy legacy accounts: %w", err)
+		}
+		if err := db.Exec("DROP TABLE accounts_v1").Error; err != nil {
+			return fmt.Errorf("drop legacy accounts table: %w", err)
+		}
+	}
+	if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_provider_account_id ON accounts(provider_account_id)").Error; err != nil {
+		return fmt.Errorf("index account identities: %w", err)
+	}
+	if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_default ON accounts(is_default) WHERE is_default = 1").Error; err != nil {
+		return fmt.Errorf("index default account: %w", err)
+	}
+	return nil
+}
+
 func migrateLifecycle(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("lifecycle database is nil")
+	}
+	if err := migrateAccounts(db); err != nil {
+		return err
 	}
 	if err := db.AutoMigrate(
 		&AccountRecord{},
 		&ConversationRecord{},
 		&RequestRecord{},
+		&ResponseLinkRecord{},
+		&SessionAffinityRecord{},
 		&EncryptedPayloadRecord{},
+		&ArtifactRecord{},
 		&StreamEventRecord{},
 		&UsageRecord{},
 		&AuditRecord{},
 	); err != nil {
 		return fmt.Errorf("migrate lifecycle projections: %w", err)
-	}
-	if err := MigrateArtifacts(db); err != nil {
-		return err
 	}
 	return nil
 }
@@ -216,6 +330,7 @@ func lifecycleAcceptedBytes(request JournalRequest) ([]byte, error) {
 		Version:        lifecycleEventVersion,
 		RequestID:      request.ID,
 		ConversationID: request.ConversationID,
+		AccountID:      request.AccountID,
 		Endpoint:       request.Endpoint,
 		Model:          request.Model,
 		APIKeyID:       request.APIKeyID,
@@ -278,10 +393,15 @@ func decodeLifecycleJSON(data []byte, target any, limit int) error {
 	}
 	return nil
 }
-
 func validateLifecycleAccepted(value lifecycleAcceptedPayload, request JournalRequest) error {
-	if value.Version != lifecycleEventVersion || value.RequestID != request.ID || value.ConversationID != request.ConversationID {
+	if !supportedLifecycleEventVersion(value.Version) || value.RequestID != request.ID || value.ConversationID != request.ConversationID {
 		return errors.New("accepted lifecycle payload identity is invalid")
+	}
+	if value.Version >= 2 && value.AccountID != "" && value.AccountID != request.AccountID {
+		return errors.New("accepted lifecycle payload account identity is invalid")
+	}
+	if value.Version == 1 && value.AccountID != "" {
+		return errors.New("accepted lifecycle payload account version is invalid")
 	}
 	if value.Endpoint != request.Endpoint || value.Model != request.Model || value.APIKeyID != request.APIKeyID || value.Mode != request.Mode {
 		return errors.New("accepted lifecycle payload metadata is invalid")
@@ -290,6 +410,7 @@ func validateLifecycleAccepted(value lifecycleAcceptedPayload, request JournalRe
 		"endpoint":   value.Endpoint,
 		"model":      value.Model,
 		"API key ID": value.APIKeyID,
+		"account ID": value.AccountID,
 	} {
 		if len(item) > lifecycleMaxString {
 			return fmt.Errorf("lifecycle %s is too long", name)
@@ -298,7 +419,7 @@ func validateLifecycleAccepted(value lifecycleAcceptedPayload, request JournalRe
 	return nil
 }
 func validateLifecycleTerminal(value lifecycleTerminalPayload) error {
-	if value.Version != lifecycleEventVersion {
+	if !supportedLifecycleEventVersion(value.Version) {
 		return errors.New("terminal lifecycle payload version is unsupported")
 	}
 	if _, ok := terminalStates[value.State]; !ok {
@@ -311,7 +432,7 @@ func validateLifecycleTerminal(value lifecycleTerminalPayload) error {
 }
 
 func validateLifecycleUsage(value lifecycleUsagePayload) error {
-	if value.Version != lifecycleEventVersion || value.InputTokens < 0 || value.CachedInputTokens < 0 || value.OutputTokens < 0 || value.ReasoningTokens < 0 || value.TotalTokens < 0 || value.ImageCount < 0 {
+	if !supportedLifecycleEventVersion(value.Version) || value.InputTokens < 0 || value.CachedInputTokens < 0 || value.OutputTokens < 0 || value.ReasoningTokens < 0 || value.TotalTokens < 0 || value.ImageCount < 0 {
 		return errors.New("usage lifecycle payload is invalid")
 	}
 	if value.CachedInputTokens > value.InputTokens || value.ReasoningTokens > value.OutputTokens {
@@ -341,7 +462,21 @@ func (j *Journal) materializeRecord(tx *gorm.DB, source JournalRecord, request J
 		if err := validateLifecycleAccepted(accepted, request); err != nil {
 			return err
 		}
+		if accepted.AccountID == "" {
+			accepted.AccountID = request.AccountID
+		}
 		if err := j.materializeAccepted(tx, source, accepted); err != nil {
+			return err
+		}
+	case source.EventType == "lifecycle.account_bound":
+		var bound lifecycleAccountBoundPayload
+		if err := decodeLifecycleJSON(plain, &bound, lifecycleMaxDetail); err != nil {
+			return err
+		}
+		if err := validateLifecycleAccountBound(bound, source.RequestID); err != nil {
+			return err
+		}
+		if err := j.materializeAccountBound(tx, source, bound); err != nil {
 			return err
 		}
 	case source.EventType == "request.running":
@@ -410,12 +545,22 @@ func (j *Journal) materializeRecord(tx *gorm.DB, source JournalRecord, request J
 		if err := j.ensureStreamEvent(tx, source); err != nil {
 			return err
 		}
+		if responseID, ok, err := responseLinkPayload(source.EventType, plain); err != nil {
+			return err
+		} else if ok {
+			if err := ensureResponseLink(tx, request, responseID, source.CreatedAt, j.metadataTTL); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
 func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepted lifecycleAcceptedPayload) error {
-	conversation := ConversationRecord{ID: accepted.ConversationID, CreatedAt: source.CreatedAt, UpdatedAt: source.CreatedAt, ExpiresAt: source.CreatedAt.Add(j.metadataTTL)}
+	conversation := ConversationRecord{
+		ID: accepted.ConversationID, AccountID: accepted.AccountID,
+		CreatedAt: source.CreatedAt, UpdatedAt: source.CreatedAt, ExpiresAt: source.CreatedAt.Add(j.metadataTTL),
+	}
 	var existingConversation ConversationRecord
 	err := tx.Where("id = ?", conversation.ID).First(&existingConversation).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -427,14 +572,23 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 	} else if existingConversation.DeletingAt != nil {
 		return errors.New("lifecycle conversation is deleting")
 	} else {
+		if accepted.AccountID != "" && existingConversation.AccountID != "" && existingConversation.AccountID != accepted.AccountID {
+			return errors.New("lifecycle conversation account conflicts")
+		}
 		conversation = existingConversation
+		if conversation.AccountID == "" && accepted.AccountID != "" {
+			conversation.AccountID = accepted.AccountID
+			if err := tx.Model(&ConversationRecord{}).Where("id = ?", conversation.ID).Update("account_id", accepted.AccountID).Error; err != nil {
+				return fmt.Errorf("bind lifecycle conversation account: %w", err)
+			}
+		}
 	}
 	var row RequestRecord
 	err = tx.Where("request_id = ?", accepted.RequestID).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		row = RequestRecord{
 			ID: accepted.RequestID, ReplayID: source.ReplayID, ConversationID: accepted.ConversationID,
-			APIKeyID: accepted.APIKeyID, Endpoint: accepted.Endpoint, Model: accepted.Model,
+			AccountID: accepted.AccountID, APIKeyID: accepted.APIKeyID, Endpoint: accepted.Endpoint, Model: accepted.Model,
 			RequestedModel: accepted.Model, Mode: accepted.Mode, Status: requestStatusRunning,
 			CreatedAt: source.CreatedAt, AcceptedAt: source.CreatedAt,
 			StartedAt: source.CreatedAt, UpdatedAt: source.CreatedAt,
@@ -449,6 +603,8 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 		return errors.New("lifecycle request is deleting")
 	} else if row.ReplayID != source.ReplayID || row.ConversationID != accepted.ConversationID || row.Endpoint != accepted.Endpoint || row.Model != accepted.Model || row.APIKeyID != accepted.APIKeyID || row.Mode != accepted.Mode {
 		return errors.New("lifecycle request metadata conflicts")
+	} else if accepted.AccountID != "" && row.AccountID != accepted.AccountID {
+		return errors.New("lifecycle request account conflicts")
 	}
 	result := tx.Model(&ConversationRecord{}).Where("id = ? AND deleting_at IS NULL", conversation.ID).Updates(map[string]any{
 		"updated_at":    source.CreatedAt,
@@ -462,7 +618,6 @@ func (j *Journal) materializeAccepted(tx *gorm.DB, source JournalRecord, accepte
 	}
 	return nil
 }
-
 func (j *Journal) ensureLifecycleOwner(tx *gorm.DB, request JournalRequest) error {
 	var row RequestRecord
 	if err := tx.Where("request_id = ?", request.ID).First(&row).Error; err != nil {
@@ -474,8 +629,8 @@ func (j *Journal) ensureLifecycleOwner(tx *gorm.DB, request JournalRequest) erro
 	if row.DeletingAt != nil {
 		return errors.New("lifecycle request is deleting")
 	}
-	if row.ConversationID != request.ConversationID {
-		return errors.New("lifecycle request conversation conflicts")
+	if row.ConversationID != request.ConversationID || row.AccountID != request.AccountID {
+		return errors.New("lifecycle request identity conflicts")
 	}
 	var conversation ConversationRecord
 	if err := tx.Where("id = ?", request.ConversationID).First(&conversation).Error; err != nil {
@@ -486,6 +641,104 @@ func (j *Journal) ensureLifecycleOwner(tx *gorm.DB, request JournalRequest) erro
 	}
 	if conversation.DeletingAt != nil {
 		return errors.New("lifecycle conversation is deleting")
+	}
+	if conversation.AccountID != "" && conversation.AccountID != request.AccountID {
+		return errors.New("lifecycle conversation account conflicts")
+	}
+	return nil
+}
+
+func validateLifecycleAccountBound(value lifecycleAccountBoundPayload, requestID string) error {
+	if value.Version != lifecycleEventVersion || value.RequestID != requestID || value.ConversationID == "" || value.AccountID == "" {
+		return errors.New("account bound lifecycle payload identity is invalid")
+	}
+	if len(value.AccountID) > lifecycleMaxString || len(value.SessionHash) > lifecycleMaxString {
+		return errors.New("account bound lifecycle payload is too long")
+	}
+	return nil
+}
+
+func propagateConversationAccount(tx *gorm.DB, conversationID, accountID string, conversation ConversationRecord) error {
+	if conversation.ID != conversationID {
+		return errors.New("lifecycle conversation identity conflicts")
+	}
+	if conversation.AccountID != "" && conversation.AccountID != accountID {
+		return errors.New("lifecycle conversation account conflicts")
+	}
+	var journalRows []JournalRequestRecord
+	if err := tx.Where("conversation_id = ?", conversationID).Limit(maxConversationInputItems + 1).Find(&journalRows).Error; err != nil {
+		return fmt.Errorf("load conversation journal requests for account binding: %w", err)
+	}
+	if len(journalRows) > maxConversationInputItems {
+		return errors.New("conversation account binding request limit exceeded")
+	}
+	for _, row := range journalRows {
+		if row.AccountID != "" && row.AccountID != accountID {
+			return errors.New("conversation journal request account conflicts")
+		}
+	}
+	var requestRows []RequestRecord
+	if err := tx.Where("conversation_id = ?", conversationID).Limit(maxConversationInputItems + 1).Find(&requestRows).Error; err != nil {
+		return fmt.Errorf("load conversation requests for account binding: %w", err)
+	}
+	if len(requestRows) > maxConversationInputItems {
+		return errors.New("conversation account binding request limit exceeded")
+	}
+	for _, row := range requestRows {
+		if row.AccountID != "" && row.AccountID != accountID {
+			return errors.New("conversation request account conflicts")
+		}
+	}
+	var links []ResponseLinkRecord
+	if err := tx.Where("conversation_id = ?", conversationID).Limit(maxConversationInputItems + 1).Find(&links).Error; err != nil {
+		return fmt.Errorf("load conversation response links for account binding: %w", err)
+	}
+	if len(links) > maxConversationInputItems {
+		return errors.New("conversation response link limit exceeded")
+	}
+	for _, link := range links {
+		if link.AccountID != "" && link.AccountID != accountID {
+			return errors.New("response link account conflicts")
+		}
+	}
+	if err := tx.Model(&JournalRequestRecord{}).Where("conversation_id = ? AND (account_id IS NULL OR account_id = '')", conversationID).Update("account_id", accountID).Error; err != nil {
+		return fmt.Errorf("bind conversation journal request accounts: %w", err)
+	}
+	if err := tx.Model(&RequestRecord{}).Where("conversation_id = ? AND (account_id IS NULL OR account_id = '')", conversationID).Update("account_id", accountID).Error; err != nil {
+		return fmt.Errorf("bind conversation request accounts: %w", err)
+	}
+	if err := tx.Model(&ResponseLinkRecord{}).Where("conversation_id = ? AND (account_id IS NULL OR account_id = '')", conversationID).Update("account_id", accountID).Error; err != nil {
+		return fmt.Errorf("bind conversation response link accounts: %w", err)
+	}
+	if err := tx.Model(&ConversationRecord{}).Where("id = ? AND (account_id IS NULL OR account_id = '')", conversationID).Update("account_id", accountID).Error; err != nil {
+		return fmt.Errorf("bind lifecycle conversation account: %w", err)
+	}
+	return nil
+}
+
+func (j *Journal) materializeAccountBound(tx *gorm.DB, source JournalRecord, bound lifecycleAccountBoundPayload) error {
+	var request RequestRecord
+	if err := tx.Where("request_id = ?", bound.RequestID).First(&request).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("account bound lifecycle request is missing")
+		}
+		return fmt.Errorf("load account bound lifecycle request: %w", err)
+	}
+	if request.ConversationID != bound.ConversationID {
+		return errors.New("account bound lifecycle conversation conflicts")
+	}
+	if request.AccountID != "" && request.AccountID != bound.AccountID {
+		return errors.New("account bound lifecycle account conflicts")
+	}
+	var conversation ConversationRecord
+	if err := tx.Where("id = ?", bound.ConversationID).First(&conversation).Error; err != nil {
+		return fmt.Errorf("load account bound lifecycle conversation: %w", err)
+	}
+	if err := propagateConversationAccount(tx, bound.ConversationID, bound.AccountID, conversation); err != nil {
+		return err
+	}
+	if err := ensureSessionAffinity(tx, request.APIKeyID, bound.SessionHash, bound.AccountID, source.CreatedAt, conversation.ExpiresAt); err != nil {
+		return err
 	}
 	return nil
 }
@@ -673,11 +926,11 @@ func (j *Journal) ensureLifecycleOwnerByID(tx *gorm.DB, requestID string) error 
 		}
 		return fmt.Errorf("load lifecycle request: %w", err)
 	}
-	return j.ensureLifecycleOwner(tx, JournalRequest{ID: row.ID, ConversationID: row.ConversationID})
+	return j.ensureLifecycleOwner(tx, JournalRequest{ID: row.ID, ConversationID: row.ConversationID, AccountID: row.AccountID})
 }
 
 func (j *Journal) decryptJournalPayload(record JournalRecord) ([]byte, error) {
-	if record.KeyVersion == 0 || record.EventVersion != lifecycleEventVersion {
+	if record.KeyVersion == 0 || !supportedLifecycleEventVersion(record.EventVersion) {
 		return nil, errors.New("journal payload uses an unsupported legacy version")
 	}
 	if len(record.Payload) == 0 {

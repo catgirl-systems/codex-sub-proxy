@@ -180,6 +180,7 @@ func TestOfficialOpenAISDKReceivesTypedStreamError(t *testing.T) {
 }
 func TestOfficialOpenAISDKComputerCallRoundTrip(t *testing.T) {
 	fixture := []byte("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"computer-response\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}}\n\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"computer-response\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[{\"id\":\"computer-item\",\"type\":\"computer_call\",\"call_id\":\"computer-call\",\"status\":\"completed\",\"action\":{\"type\":\"click\",\"button\":\"left\",\"x\":4,\"y\":5},\"pending_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}],\"acknowledged_safety_checks\":[{\"id\":\"safety-check\",\"code\":\"confirm\",\"message\":\"confirm action\"}]}]}}\n\ndata: [DONE]\n\n")
+	fixture = bytes.ReplaceAll(fixture, []byte("computer-response"), []byte("resp_fixture_001"))
 	upstream := newResponseFixtureUpstream(t, fixture)
 	defer upstream.Close()
 	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
@@ -486,6 +487,7 @@ func TestOfficialOpenAISDKReceivesTypedPrivateEventError(t *testing.T) {
 
 func newResponseFixtureUpstream(t *testing.T, fixture []byte) *httptest.Server {
 	t.Helper()
+	var call int32
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost || request.URL.Path != "/" {
 			t.Errorf("upstream request = %s %s, want POST /", request.Method, request.URL.Path)
@@ -513,6 +515,6 @@ func newResponseFixtureUpstream(t *testing.T, fixture []byte) *httptest.Server {
 			t.Error("upstream body omitted model")
 		}
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write(fixture)
+		_, _ = writer.Write(responsesFixtureForCall(fixture, atomic.AddInt32(&call, 1)))
 	}))
 }

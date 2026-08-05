@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
@@ -20,6 +21,10 @@ import (
 	"testing"
 	"time"
 )
+
+func responsesFixtureForCall(fixture []byte, call int32) []byte {
+	return bytes.ReplaceAll(fixture, []byte(`resp_fixture_001`), []byte(fmt.Sprintf("resp_fixture_%03d", call)))
+}
 
 func TestResponsesJSONPreservesImageAndUsage(t *testing.T) {
 	var upstreamCalls atomic.Int32
@@ -321,12 +326,12 @@ func TestResponsesLiteMarkers(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	var liteHeaders atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		upstreamCalls.Add(1)
+		call := upstreamCalls.Add(1)
 		if request.Header.Get(codex.ResponsesLiteHeader) == "true" {
 			liteHeaders.Add(1)
 		}
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write(fixture)
+		_, _ = writer.Write(responsesFixtureForCall(fixture, call))
 	}))
 	defer upstream.Close()
 
@@ -517,9 +522,9 @@ func TestResponsesCollectionLimitsRejectBeforeUpstream(t *testing.T) {
 	}
 	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		upstreamCalls.Add(1)
+		call := upstreamCalls.Add(1)
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write(fixture)
+		_, _ = writer.Write(responsesFixtureForCall(fixture, call))
 	}))
 	defer upstream.Close()
 
@@ -1001,5 +1006,77 @@ func TestBusyRetentionDoesNotInterruptActiveSSE(t *testing.T) {
 	stream := firstLine + string(body)
 	if response.StatusCode != http.StatusOK || !strings.Contains(stream, `"response.completed"`) || !strings.Contains(stream, "[DONE]") {
 		t.Fatalf("active SSE after busy retention = status %d body %s", response.StatusCode, stream)
+	}
+}
+
+func TestResponsesContinuationResolvesPreviousResponse(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBodies := make(chan string, 2)
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			return
+		}
+		requestBodies <- string(body)
+		call := upstreamCalls.Add(1)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(responsesFixtureForCall(fixture, call))
+	}))
+	defer upstream.Close()
+
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+	first := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true}`, "application/json")
+	firstBody, err := io.ReadAll(first.Body)
+	if err != nil {
+		t.Fatalf("read first response: %v", err)
+	}
+	_ = first.Body.Close()
+	if first.StatusCode != http.StatusOK || !bytes.Contains(firstBody, []byte(`"id":"resp_fixture_001"`)) {
+		t.Fatalf("first response status=%d body=%s", first.StatusCode, firstBody)
+	}
+	second := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true,"previous_response_id":"resp_fixture_001"}`, "application/json")
+	secondBody, err := io.ReadAll(second.Body)
+	if err != nil {
+		t.Fatalf("read continuation response: %v", err)
+	}
+	if second.StatusCode != http.StatusOK || !bytes.Contains(secondBody, []byte(`"id":"resp_fixture_002"`)) {
+		t.Fatalf("continuation response status=%d body=%s", second.StatusCode, secondBody)
+	}
+	firstRequest := <-requestBodies
+	secondRequest := <-requestBodies
+	if strings.Contains(firstRequest, "previous_response_id") {
+		t.Fatalf("first upstream request unexpectedly contained continuation: %s", firstRequest)
+	}
+	if !strings.Contains(secondRequest, `"previous_response_id":"resp_fixture_001"`) {
+		t.Fatalf("continuation upstream request = %s", secondRequest)
+	}
+}
+
+func TestResponsesUnknownPreviousResponseReturnsBoundedError(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","previous_response_id":"missing-response"}`, "application/json")
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read previous response error: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest || !bytes.Contains(body, []byte(`"code":"previous_response_not_found"`)) {
+		t.Fatalf("previous response error status=%d body=%s", response.StatusCode, body)
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls.Load())
 	}
 }
