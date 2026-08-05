@@ -71,12 +71,14 @@ func (ArtifactRecord) TableName() string { return "artifacts" }
 
 // ArtifactStore is the one concrete encrypted filesystem artifact store.
 type ArtifactStore struct {
-	db        *gorm.DB
-	root      *os.Root
-	keys      envelope.KeySet
-	ttl       time.Duration
-	closeOnce sync.Once
-	closeErr  error
+	db          *gorm.DB
+	root        *os.Root
+	rootPath    string
+	keys        envelope.KeySet
+	ttl         time.Duration
+	operationMu sync.RWMutex
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 // MigrateArtifacts creates the artifact metadata table.
@@ -111,7 +113,7 @@ func NewArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl ti
 		_ = root.Close()
 		return nil, err
 	}
-	store := &ArtifactStore{db: db, root: root, keys: validatedKeys, ttl: ttl}
+	store := &ArtifactStore{db: db, root: root, rootPath: rootPath, keys: validatedKeys, ttl: ttl}
 	if err := store.Reconcile(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -121,7 +123,12 @@ func NewArtifactStore(db *gorm.DB, rootPath string, keys envelope.KeySet, ttl ti
 
 // Close releases the descriptor-anchored artifact root.
 func (s *ArtifactStore) Close() error {
-	if s == nil || s.root == nil {
+	if s == nil {
+		return nil
+	}
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	if s.root == nil {
 		return nil
 	}
 	s.closeOnce.Do(func() {
@@ -135,6 +142,8 @@ func (s *ArtifactStore) Save(ctx context.Context, owner ArtifactOwner, resultInd
 	if s == nil || s.root == nil {
 		return ArtifactRecord{}, errors.New("artifact store is closed")
 	}
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
 	if ctx == nil {
 		return ArtifactRecord{}, errors.New("artifact save context is nil")
 	}
@@ -293,6 +302,8 @@ func (s *ArtifactStore) Read(ctx context.Context, id string) ([]byte, error) {
 	if s == nil || s.root == nil {
 		return nil, errors.New("artifact store is closed")
 	}
+	s.operationMu.RLock()
+	defer s.operationMu.RUnlock()
 	if ctx == nil {
 		return nil, errors.New("artifact read context is nil")
 	}
@@ -364,6 +375,8 @@ func (s *ArtifactStore) MarkDeleting(ctx context.Context, ids []string) ([]Artif
 	if s == nil || s.root == nil {
 		return nil, errors.New("artifact store is closed")
 	}
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
 	if ctx == nil {
 		return nil, errors.New("artifact delete context is nil")
 	}
@@ -399,6 +412,8 @@ func (s *ArtifactStore) RemoveMarked(ctx context.Context, records []ArtifactReco
 	if s == nil || s.root == nil {
 		return errors.New("artifact store is closed")
 	}
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
 	if ctx == nil {
 		return errors.New("artifact remove context is nil")
 	}
@@ -668,6 +683,8 @@ func (s *ArtifactStore) Reconcile(ctx context.Context) error {
 	if s == nil || s.root == nil {
 		return errors.New("artifact store is closed")
 	}
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
 	if ctx == nil {
 		return errors.New("artifact reconciliation context is nil")
 	}

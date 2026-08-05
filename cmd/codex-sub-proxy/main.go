@@ -8,9 +8,9 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/payload"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/server"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/version"
 	"gorm.io/gorm"
 	"log/slog"
 	"os"
@@ -38,12 +38,28 @@ func run(args []string) error {
 			return runImport(args[1:])
 		case "login":
 			return runLogin(args[1:])
+		case "backup":
+			return runBackup(args[1:])
+		case "restore":
+			return runRestore(args[1:])
+		case "version":
+			fmt.Fprintln(os.Stdout, version.String())
+			return nil
+		}
+		if args[0] == "--version" {
+			fmt.Fprintln(os.Stdout, version.String())
+			return nil
 		}
 	}
 	flags := flag.NewFlagSet("codex-sub-proxy", flag.ContinueOnError)
 	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
+	showVersion := flags.Bool("version", false, "print version information")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *showVersion {
+		fmt.Fprintln(os.Stdout, version.String())
+		return nil
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected command-line argument")
@@ -90,15 +106,22 @@ func run(args []string) error {
 	if err != nil {
 		processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "path_unavailable")
 	} else {
+		if err := server.RecoverRestore(databasePath); err != nil {
+			return err
+		}
+		var applicationLock *storage.ApplicationLock
+		applicationLock, err = storage.AcquireApplicationLock(context.Background(), databasePath)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_ = applicationLock.Close()
+		}()
 		db, err = storage.Open(context.Background(), databasePath, cfg.Storage.BusyTimeout)
 		if err != nil {
 			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "open")
-		} else if err := payload.Migrate(db); err != nil {
-			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "payload_migrate")
-		} else if err := apikey.Migrate(db); err != nil {
-			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "apikey_migrate")
-		} else if err := server.MigrateJournal(db); err != nil {
-			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "journal_migrate")
+		} else if err := server.MigrateSchema(db); err != nil {
+			processLogger.Error("storage_unavailable", "error_class", "storage", "error_code", "schema_migrate")
 		} else if payloadErr != nil {
 			processLogger.Error("artifact_unavailable", "error_class", "storage", "error_code", "payload_key")
 		} else {
@@ -139,9 +162,10 @@ func run(args []string) error {
 					}
 				}
 				responsesTransport, err = codex.NewResponsesTransport(codex.ResponsesTransportOptions{
-					Policy:    codex.ResponsesTransportPolicy(cfg.Codex.ResponsesTransport),
-					Refresher: refresher,
-					Headers:   codex.HeaderConfig{},
+					Policy:       codex.ResponsesTransportPolicy(cfg.Codex.ResponsesTransport),
+					ResponsesURL: cfg.Codex.ResponsesURL,
+					Refresher:    refresher,
+					Headers:      codex.HeaderConfig{},
 				})
 				if err != nil {
 					return fmt.Errorf("build Responses transport: %w", err)
@@ -407,6 +431,7 @@ func runLogin(args []string) error {
 		return err
 	}
 	if err := config.RequireDistinctActiveKeys(payloadKeys, credentialKeys); err != nil {
+
 		return err
 	}
 	destinationPath, err := config.ExpandPath(cfg.Codex.CredentialFile)
@@ -429,6 +454,98 @@ func runLogin(args []string) error {
 		},
 	}, destinationPath, credentialKeys)
 	return err
+}
+func runBackup(args []string) error {
+	flags := flag.NewFlagSet("codex-sub-proxy backup", flag.ContinueOnError)
+	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
+	outputPath := flags.String("output", "", "new local backup archive path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected command-line argument")
+	}
+	if strings.TrimSpace(*outputPath) == "" {
+		return errors.New("backup output path is required")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
+	if err != nil {
+		return err
+	}
+	artifactRoot, err := config.ExpandPath(cfg.Storage.ArtifactRoot)
+	if err != nil {
+		return err
+	}
+	payloadKeys, err := cfg.Security.PayloadKeySet(os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	db, err := storage.Open(ctx, databasePath, cfg.Storage.BusyTimeout)
+	if err != nil {
+		return err
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("get sqlite database: %w", err)
+	}
+	defer sqlDB.Close()
+	artifacts, err := server.NewArtifactStore(db, artifactRoot, payloadKeys, cfg.Retention.ArtifactTTL)
+	if err != nil {
+		return err
+	}
+	defer artifacts.Close()
+	principal := fmt.Sprintf("cli:%d", os.Getuid())
+	return server.CreateBackup(ctx, db, artifacts, *outputPath, principal)
+}
+
+func runRestore(args []string) error {
+	flags := flag.NewFlagSet("codex-sub-proxy restore", flag.ContinueOnError)
+	configPath := flags.String("config", "config.toml", "path to the TOML configuration file")
+	inputPath := flags.String("input", "", "local backup archive path")
+	force := flags.Bool("force", false, "replace the current database and artifact root")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected command-line argument")
+	}
+	if strings.TrimSpace(*inputPath) == "" {
+		return errors.New("restore input path is required")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	databasePath, err := config.ExpandPath(cfg.Storage.SQLitePath)
+	if err != nil {
+		return err
+	}
+	artifactRoot, err := config.ExpandPath(cfg.Storage.ArtifactRoot)
+	if err != nil {
+		return err
+	}
+	if err := server.RecoverRestore(databasePath); err != nil {
+		return err
+	}
+	payloadVersions := append([]uint32{cfg.Security.PayloadEncryptionKeyVersion}, cfg.Security.PayloadEncryptionPreviousKeyVersions...)
+	credentialVersions := append([]uint32{cfg.Security.CredentialEncryptionKeyVersion}, cfg.Security.CredentialEncryptionPreviousKeyVersions...)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	return server.Restore(ctx, server.RestoreOptions{
+		DatabasePath:          databasePath,
+		ArtifactRoot:          artifactRoot,
+		Input:                 *inputPath,
+		Force:                 *force,
+		PayloadKeyVersions:    payloadVersions,
+		CredentialKeyVersions: credentialVersions,
+		BusyTimeout:           cfg.Storage.BusyTimeout,
+	})
 }
 
 func serverStoppedError(serveErr, shutdownErr error) error {

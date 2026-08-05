@@ -1,0 +1,43 @@
+[server]
+listen = "127.0.0.1:4000"
+admin_listen = "127.0.0.1:4001"
+
+[storage]
+sqlite_path = "~/.local/share/codex-sub-proxy/csp.sqlite3"
+artifact_root = "~/.local/share/codex-sub-proxy/artifacts"
+busy_timeout = "5s"
+
+[security]
+payload_encryption_key_env = "CSP_PAYLOAD_ENCRYPTION_KEY"
+payload_encryption_key_version = 1
+credential_encryption_key_env = "CSP_CREDENTIAL_ENCRYPTION_KEY"
+credential_encryption_key_version = 1
+api_key_hmac_key_env = "CSP_API_KEY_HMAC_KEY"
+admin_token_hmac_key_env = "CSP_ADMIN_TOKEN_HMAC_KEY"
+admin_bootstrap_token_env = "CSP_ADMIN_BOOTSTRAP_TOKEN"
+admin_cookie_secure = false
+
+[codex]
+credential_file = "~/.config/codex-sub-proxy/credential.enc"
+responses_transport = "sse"
+
+[journal]
+mode = "durable"
+queue_capacity = 64
+drain_deadline = "10s"
+
+[retention]
+artifact_ttl = "24h"
+payload_ttl = "24h"
+metadata_ttl = "168h"
+sweep_interval = "1m"
+batch_size = 64
+drain_deadline = "10s"
+
+[cors]
+max_age = "10m"
+
+[telemetry]
+enabled = false
+export_interval = "30s"
+shutdown_timeout = "5s"

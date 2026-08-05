@@ -70,6 +70,9 @@ type Servers struct {
 	artifacts     *ArtifactStore
 	telemetry     *Telemetry
 	logger        *slog.Logger
+	shutdownMu    sync.Mutex
+	shutdownDone  bool
+	shutdownErr   error
 }
 
 func Start(cfg Config, readiness *Readiness) (*Servers, error) {
@@ -127,7 +130,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		}
 	}
 	if cfg.Database != nil {
-		if err := MigrateJournal(cfg.Database); err != nil {
+		if err := MigrateSchema(cfg.Database); err != nil {
 			return nil, err
 		}
 		var pricingErr error
@@ -154,9 +157,6 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			readiness.SetAnalyticsSource(func() bool {
 				return pricing.Available()
 			})
-		}
-		if err := apikey.Migrate(cfg.Database); err != nil {
-			return nil, err
 		}
 		apiKeyStore = apikey.NewStore(cfg.Database, cfg.APIKeyHMACKey)
 		if cfg.ArtifactStore != nil {
@@ -219,8 +219,12 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		if err := MigrateAdminTokens(cfg.Database); err == nil {
 			adminStore = NewAdminTokenStore(cfg.Database, cfg.AdminTokenHMACKey)
 			if len(cfg.AdminBootstrapToken) > 0 {
-				_, _ = adminStore.MaterializeBootstrap(context.Background(), cfg.AdminBootstrapToken)
+				if _, materializeErr := adminStore.MaterializeBootstrap(context.Background(), cfg.AdminBootstrapToken); materializeErr != nil && cfg.Logger != nil {
+					cfg.Logger.Warn("admin_bootstrap_unavailable", "error_class", "admin", "error_code", "bootstrap", "error", materializeErr)
+				}
 			}
+		} else if cfg.Logger != nil {
+			cfg.Logger.Warn("admin_storage_unavailable", "error_class", "admin", "error_code", "migration", "error", err)
 		}
 	}
 	if readiness != nil && (cfg.Database != nil || cfg.AdminTokenHMACKey != nil || cfg.AdminBootstrapToken != nil) {
@@ -330,8 +334,16 @@ func (s *Servers) DeleteConversation(ctx context.Context, id string) error {
 	return s.retention.DeleteConversation(ctx, id)
 }
 func (s *Servers) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return errors.New("servers are nil")
+	}
 	if ctx == nil {
 		return errors.New("shutdown context is nil")
+	}
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	if s.shutdownDone {
+		return s.shutdownErr
 	}
 	shutdownErrors := make(chan error, 2)
 	go func() {
@@ -340,59 +352,51 @@ func (s *Servers) Shutdown(ctx context.Context) error {
 	go func() {
 		shutdownErrors <- s.adminServer.Shutdown(ctx)
 	}()
-
 	var errs []error
+	timedOut := false
 	for range 2 {
 		select {
 		case err := <-shutdownErrors:
-			if err != nil {
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errs = append(errs, err)
 			}
 		case <-ctx.Done():
+			timedOut = true
+			errs = append(errs, ctx.Err())
 			s.forceClose()
-			if err := s.closeResources(ctx); err != nil {
-				errs = append(errs, err)
-			}
-			return errors.Join(append(errs, ctx.Err())...)
+		}
+		if timedOut {
+			break
 		}
 	}
-	if len(errs) > 0 {
-		s.forceClose()
+	if !timedOut {
+		serveDone := make(chan struct{})
+		go func() {
+			s.waitGroup.Wait()
+			close(serveDone)
+		}()
+		select {
+		case <-serveDone:
+		case <-ctx.Done():
+			s.forceClose()
+			errs = append(errs, ctx.Err())
+		}
 	}
-
-	serveDone := make(chan struct{})
-	go func() {
-		s.waitGroup.Wait()
-		close(serveDone)
-	}()
-	select {
-	case <-serveDone:
-		if err := s.closeResources(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	case <-ctx.Done():
-		s.forceClose()
-		if err := s.closeResources(ctx); err != nil {
-			errs = append(errs, err)
-		}
-		errs = append(errs, ctx.Err())
+	if err := s.closeResources(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	s.shutdownErr = errors.Join(errs...)
+	if s.shutdownErr == nil {
+		s.shutdownDone = true
 	}
 	if s.logger != nil {
 		s.logger.Info("server_stopped", "listener", "data")
 		s.logger.Info("server_stopped", "listener", "admin")
 	}
-	return errors.Join(errs...)
+	return s.shutdownErr
 }
 
 func (s *Servers) closeResources(ctx context.Context) error {
-	err := s.closeJournal(ctx)
-	if s.telemetry != nil {
-		err = errors.Join(err, s.telemetry.Shutdown(ctx))
-	}
-	return err
-}
-
-func (s *Servers) closeJournal(ctx context.Context) error {
 	var errs []error
 	if s.retention != nil {
 		if err := s.retention.Close(ctx); err != nil {
@@ -401,6 +405,11 @@ func (s *Servers) closeJournal(ctx context.Context) error {
 	}
 	if s.journal != nil {
 		if err := s.journal.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.telemetry != nil {
+		if err := s.telemetry.Shutdown(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}

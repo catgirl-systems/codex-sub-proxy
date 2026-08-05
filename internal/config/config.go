@@ -229,6 +229,7 @@ const (
 type CodexConfig struct {
 	CredentialFile     string             `toml:"credential_file" validate:"required"`
 	ResponsesTransport ResponsesTransport `toml:"responses_transport" validate:"oneof=websocket_preferred sse"`
+	ResponsesURL       string             `toml:"responses_url"`
 }
 
 var configurationValidation = func() *validator.Validate {
@@ -1038,6 +1039,7 @@ func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Security.APIKeyHMACKeyEnv, "CSP_SECURITY_API_KEY_HMAC_KEY_ENV")
 	overrideString(&cfg.Security.AdminTokenHMACKeyEnv, "CSP_SECURITY_ADMIN_TOKEN_HMAC_KEY_ENV")
 	overrideString(&cfg.Security.AdminBootstrapTokenEnv, "CSP_SECURITY_ADMIN_BOOTSTRAP_TOKEN_ENV")
+	overrideString(&cfg.Codex.ResponsesURL, "CSP_CODEX_RESPONSES_URL")
 	overrideString(&cfg.Codex.CredentialFile, "CSP_CODEX_CREDENTIAL_FILE")
 	journalMode := string(cfg.Journal.Mode)
 	overrideString(&journalMode, "CSP_JOURNAL_MODE")
