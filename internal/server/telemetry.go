@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"io"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -14,16 +17,25 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 )
 
-const telemetryServiceName = "codex-sub-proxy"
+const (
+	telemetryServiceName     = "codex-sub-proxy"
+	telemetryResponseBodyCap = 64 << 10
+	telemetryHTTPTimeout     = time.Minute
+)
+
+var (
+	errTelemetrySetup    = errors.New("telemetry setup failed")
+	errTelemetryExport   = errors.New("telemetry export failed")
+	errTelemetryFlush    = errors.New("telemetry flush failed")
+	errTelemetryShutdown = errors.New("telemetry shutdown failed")
+)
 
 type Telemetry struct {
 	provider    *sdkmetric.MeterProvider
-	ready       bool
-	mu          sync.Mutex
-	closed      bool
 	shutdownErr error
 	shutdown    sync.Once
 
@@ -31,39 +43,28 @@ type Telemetry struct {
 	requestActive otelmetric.Int64UpDownCounter
 	requestTime   otelmetric.Float64Histogram
 	status        otelmetric.Int64Counter
-	tokens        otelmetric.Int64Counter
-	images        otelmetric.Int64Counter
-	quotaReject   otelmetric.Int64Counter
 	transport     otelmetric.Int64Counter
-	fallback      otelmetric.Int64Counter
-	journal       otelmetric.Int64Counter
 }
 
 // NewTelemetry builds one process-wide meter provider.
-func NewTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[string]string, buildVersion string) (*Telemetry, error) {
-	return newTelemetry(ctx, cfg, headers, buildVersion)
+func NewTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[string]string) (*Telemetry, error) {
+	return newTelemetry(ctx, cfg, headers)
 }
 
-func newTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[string]string, buildVersion string) (*Telemetry, error) {
+func newTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[string]string) (*Telemetry, error) {
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	if buildVersion == "" {
-		buildVersion = "dev"
 	}
 	telemetry := &Telemetry{}
 	resourceValue, err := resource.New(ctx, resource.WithAttributes(
 		attribute.String("service.name", telemetryServiceName),
-		attribute.String("service.version", buildVersion),
 	))
 	if err != nil {
 		telemetry.provider = sdkmetric.NewMeterProvider()
-		return telemetry, err
+		return telemetry, errTelemetrySetup
 	}
-	var providerOptions []sdkmetric.Option
 	if !cfg.Enabled {
 		telemetry.provider = sdkmetric.NewMeterProvider(sdkmetric.WithResource(resourceValue))
-		telemetry.ready = true
 		telemetry.createInstruments()
 		return telemetry, nil
 	}
@@ -73,10 +74,22 @@ func newTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[s
 		return telemetry, err
 	}
 	parsedEndpoint, _ := url.Parse(cfg.Endpoint)
+	transport := telemetryHTTPTransport()
+	timeout := cfg.ShutdownTimeout
+	if timeout <= 0 || timeout > telemetryHTTPTimeout {
+		timeout = telemetryHTTPTimeout
+	}
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	exporterOptions := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpoint(parsedEndpoint.Host),
 		otlpmetrichttp.WithHeaders(headers),
-		otlpmetrichttp.WithTimeout(cfg.ShutdownTimeout),
+		otlpmetrichttp.WithHTTPClient(httpClient),
 	}
 	if cfg.Insecure {
 		exporterOptions = append(exporterOptions, otlpmetrichttp.WithInsecure())
@@ -85,14 +98,90 @@ func newTelemetry(ctx context.Context, cfg config.TelemetryConfig, headers map[s
 	if err != nil {
 		telemetry.provider = sdkmetric.NewMeterProvider(sdkmetric.WithResource(resourceValue))
 		telemetry.createInstruments()
-		return telemetry, err
+		return telemetry, errTelemetrySetup
 	}
-	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))
-	providerOptions = append(providerOptions, sdkmetric.WithReader(reader), sdkmetric.WithResource(resourceValue))
-	telemetry.provider = sdkmetric.NewMeterProvider(providerOptions...)
-	telemetry.ready = true
+	reader := sdkmetric.NewPeriodicReader(&redactingMetricExporter{inner: exporter}, sdkmetric.WithInterval(cfg.ExportInterval))
+	telemetry.provider = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithResource(resourceValue))
 	telemetry.createInstruments()
 	return telemetry, nil
+}
+
+func telemetryHTTPTransport() http.RoundTripper {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		clone := transport.Clone()
+		if clone.TLSClientConfig == nil {
+			clone.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+			if clone.TLSClientConfig.MinVersion == 0 {
+				clone.TLSClientConfig.MinVersion = tls.VersionTLS12
+			}
+		}
+		return &telemetryResponseTransport{base: clone}
+	}
+	return &telemetryResponseTransport{base: http.DefaultTransport}
+}
+
+type telemetryResponseTransport struct {
+	base http.RoundTripper
+}
+
+func (transport *telemetryResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.base.RoundTrip(request)
+	if err != nil || response == nil || response.Body == nil {
+		return response, err
+	}
+	response.Body = &telemetryResponseBody{
+		reader: io.LimitReader(response.Body, telemetryResponseBodyCap),
+		closer: response.Body,
+	}
+	return response, nil
+}
+
+type telemetryResponseBody struct {
+	reader io.Reader
+	closer io.Closer
+}
+
+func (body *telemetryResponseBody) Read(p []byte) (int, error) {
+	return body.reader.Read(p)
+}
+
+func (body *telemetryResponseBody) Close() error {
+	return body.closer.Close()
+}
+
+type redactingMetricExporter struct {
+	inner sdkmetric.Exporter
+}
+
+func (exporter *redactingMetricExporter) Temporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	return exporter.inner.Temporality(kind)
+}
+
+func (exporter *redactingMetricExporter) Aggregation(kind sdkmetric.InstrumentKind) sdkmetric.Aggregation {
+	return exporter.inner.Aggregation(kind)
+}
+
+func (exporter *redactingMetricExporter) Export(ctx context.Context, data *metricdata.ResourceMetrics) error {
+	if err := exporter.inner.Export(ctx, data); err != nil {
+		return errTelemetryExport
+	}
+	return nil
+}
+
+func (exporter *redactingMetricExporter) ForceFlush(ctx context.Context) error {
+	if err := exporter.inner.ForceFlush(ctx); err != nil {
+		return errTelemetryFlush
+	}
+	return nil
+}
+
+func (exporter *redactingMetricExporter) Shutdown(ctx context.Context) error {
+	if err := exporter.inner.Shutdown(ctx); err != nil {
+		return errTelemetryShutdown
+	}
+	return nil
 }
 
 func validateTelemetryEndpoint(cfg config.TelemetryConfig) error {
@@ -129,16 +218,7 @@ func (t *Telemetry) createInstruments() {
 	t.requestActive, _ = meter.Int64UpDownCounter("csp.server.active_requests")
 	t.requestTime, _ = meter.Float64Histogram("csp.server.request_duration_ms")
 	t.status, _ = meter.Int64Counter("csp.server.responses")
-	t.tokens, _ = meter.Int64Counter("csp.server.tokens")
-	t.images, _ = meter.Int64Counter("csp.server.images")
-	t.quotaReject, _ = meter.Int64Counter("csp.server.quota_rejections")
 	t.transport, _ = meter.Int64Counter("csp.server.upstream_transport")
-	t.fallback, _ = meter.Int64Counter("csp.server.fallbacks")
-	t.journal, _ = meter.Int64Counter("csp.server.journal_events")
-}
-
-func (t *Telemetry) Ready() bool {
-	return t != nil && t.ready
 }
 
 func (t *Telemetry) beginRequest(ctx context.Context, listener, route, method string) {
@@ -152,7 +232,7 @@ func (t *Telemetry) beginRequest(ctx context.Context, listener, route, method st
 	))
 }
 
-func (t *Telemetry) observeRequest(ctx context.Context, listener, route, method string, status int, duration time.Duration, responseBytes int, transport string) {
+func (t *Telemetry) observeRequest(ctx context.Context, listener, route, method string, status int, duration time.Duration, transport string) {
 	if t == nil || t.requests == nil {
 		return
 	}
@@ -176,41 +256,6 @@ func (t *Telemetry) observeRequest(ctx context.Context, listener, route, method 
 	if transport != "" && transport != "none" && t.transport != nil {
 		t.transport.Add(ctx, 1, otelmetric.WithAttributes(attribute.String("transport", boundedEnum(transport, "http", "websocket", "sse", "none"))))
 	}
-	_ = responseBytes
-}
-func (t *Telemetry) RecordTokens(ctx context.Context, route, kind string, count int64) {
-	if t == nil || t.tokens == nil || count < 0 {
-		return
-	}
-	t.tokens.Add(ctx, count, otelmetric.WithAttributes(attribute.String("route", telemetryRoute(route)), attribute.String("kind", boundedEnum(kind, "input", "output", "cached", "reasoning"))))
-}
-
-func (t *Telemetry) RecordImages(ctx context.Context, route string, count int64) {
-	if t == nil || t.images == nil || count < 0 {
-		return
-	}
-	t.images.Add(ctx, count, otelmetric.WithAttributes(attribute.String("route", telemetryRoute(route))))
-}
-
-func (t *Telemetry) RecordQuotaRejection(ctx context.Context, route string) {
-	if t == nil || t.quotaReject == nil {
-		return
-	}
-	t.quotaReject.Add(ctx, 1, otelmetric.WithAttributes(attribute.String("route", telemetryRoute(route))))
-}
-
-func (t *Telemetry) RecordFallback(ctx context.Context, route string) {
-	if t == nil || t.fallback == nil {
-		return
-	}
-	t.fallback.Add(ctx, 1, otelmetric.WithAttributes(attribute.String("route", telemetryRoute(route))))
-}
-
-func (t *Telemetry) RecordJournal(ctx context.Context, event string) {
-	if t == nil || t.journal == nil {
-		return
-	}
-	t.journal.Add(ctx, 1, otelmetric.WithAttributes(attribute.String("event", boundedEnum(event, "pending", "sweep_failure"))))
 }
 
 func (t *Telemetry) Shutdown(ctx context.Context) error {
@@ -221,18 +266,9 @@ func (t *Telemetry) Shutdown(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	t.shutdown.Do(func() {
-		t.mu.Lock()
-		t.closed = true
-		t.mu.Unlock()
-		err := t.provider.Shutdown(ctx)
-		t.mu.Lock()
-		t.shutdownErr = err
-		t.mu.Unlock()
+		t.shutdownErr = t.provider.Shutdown(ctx)
 	})
-	t.mu.Lock()
-	err := t.shutdownErr
-	t.mu.Unlock()
-	return err
+	return t.shutdownErr
 }
 
 func telemetryRoute(route string) string {

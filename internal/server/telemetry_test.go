@@ -31,11 +31,10 @@ func TestTelemetryOTLPHTTPExporterCapture(t *testing.T) {
 		ExportInterval:  25 * time.Millisecond,
 		ShutdownTimeout: time.Second,
 	}
-	telemetry, err := NewTelemetry(context.Background(), telemetryConfig, nil, "test")
+	telemetry, err := NewTelemetry(context.Background(), telemetryConfig, nil)
 	if err != nil {
 		t.Fatalf("new telemetry: %v", err)
 	}
-	telemetry.RecordTokens(context.Background(), "/v1/responses", "input", 3)
 	if err := telemetry.Shutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown telemetry: %v", err)
 	}

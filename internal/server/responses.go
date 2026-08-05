@@ -372,7 +372,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
-	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Cache-Control", "no-cache, no-store")
 	writer.Header().Set("Connection", "keep-alive")
 	writer.Header().Set("X-Accel-Buffering", "no")
 	flusher, ok := writer.(http.Flusher)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -81,8 +82,15 @@ func (t TelemetryConfig) ResolveHeaders(lookup func(string) (string, bool)) (map
 	for header, envName := range t.HeadersEnv {
 		header = strings.TrimSpace(header)
 		envName = strings.TrimSpace(envName)
-		if header == "" || envName == "" || strings.ContainsAny(header, "\r\n") || strings.ContainsAny(envName, "\r\n") {
+		if !validTelemetryHeaderName(header) || envName == "" || strings.ContainsAny(envName, "\r\n") {
 			return nil, errors.New("telemetry header name or environment variable is invalid")
+		}
+		canonical := http.CanonicalHeaderKey(header)
+		if canonical == "" {
+			return nil, errors.New("telemetry header name is invalid")
+		}
+		if _, exists := headers[canonical]; exists {
+			return nil, errors.New("telemetry header names must be unique")
 		}
 		value, ok := lookup(envName)
 		if !ok || value == "" {
@@ -91,9 +99,27 @@ func (t TelemetryConfig) ResolveHeaders(lookup func(string) (string, bool)) (map
 		if len(value) > 4096 || strings.ContainsAny(value, "\r\n") {
 			return nil, errors.New("telemetry header value is invalid")
 		}
-		headers[header] = value
+		headers[canonical] = value
 	}
 	return headers, nil
+}
+
+func validTelemetryHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index := 0; index < len(name); index++ {
+		char := name[index]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		switch char {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 type Config struct {
@@ -503,6 +529,22 @@ func validateTelemetryConfig(telemetry *TelemetryConfig) error {
 	}
 	if len(telemetry.HeadersEnv) > maxTelemetryHeaderEnvs {
 		return errors.New("telemetry has too many header variables")
+	}
+	seenHeaders := make(map[string]struct{}, len(telemetry.HeadersEnv))
+	for header, envName := range telemetry.HeadersEnv {
+		header = strings.TrimSpace(header)
+		envName = strings.TrimSpace(envName)
+		if !validTelemetryHeaderName(header) || envName == "" || strings.ContainsAny(envName, "\r\n") {
+			return errors.New("telemetry header name or environment variable is invalid")
+		}
+		canonical := http.CanonicalHeaderKey(header)
+		if canonical == "" {
+			return errors.New("telemetry header name is invalid")
+		}
+		if _, exists := seenHeaders[canonical]; exists {
+			return errors.New("telemetry header names must be unique")
+		}
+		seenHeaders[canonical] = struct{}{}
 	}
 	if telemetry.ExportInterval <= 0 || telemetry.ExportInterval > maxTelemetryDuration {
 		return errors.New("telemetry export interval is out of bounds")
@@ -1235,10 +1277,17 @@ func parseTelemetryHeaderEnvList(value string) (map[string]string, error) {
 		}
 		name = strings.TrimSpace(name)
 		envName = strings.TrimSpace(envName)
-		if _, exists := headers[name]; exists {
+		if !validTelemetryHeaderName(name) || strings.ContainsAny(envName, "\r\n") {
+			return nil, errors.New("telemetry header environment mapping is invalid")
+		}
+		canonical := http.CanonicalHeaderKey(name)
+		if canonical == "" {
+			return nil, errors.New("telemetry header environment mapping is invalid")
+		}
+		if _, exists := headers[canonical]; exists {
 			return nil, errors.New("telemetry header environment mappings must be unique")
 		}
-		headers[name] = envName
+		headers[canonical] = envName
 	}
 	return headers, nil
 }

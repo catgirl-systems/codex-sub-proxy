@@ -54,6 +54,62 @@ type boundaryConfig struct {
 	corsMaxAge     time.Duration
 	trustedProxies []netip.Prefix
 }
+type boundaryRouteKey struct {
+	listener string
+	route    string
+	method   string
+}
+
+type boundaryRoutePolicy struct {
+	contentType  string
+	multipart    bool
+	maxBodyBytes int64
+}
+
+var boundaryRoutePolicies = map[boundaryRouteKey]boundaryRoutePolicy{
+	{listener: "data", route: "/healthz", method: http.MethodGet}:                                          {},
+	{listener: "data", route: "/readyz", method: http.MethodGet}:                                           {},
+	{listener: "data", route: modelsEndpoint, method: http.MethodGet}:                                      {},
+	{listener: "data", route: chatCompletionsEndpoint, method: http.MethodPost}:                            {contentType: "application/json", maxBodyBytes: maxChatBodyBytes},
+	{listener: "data", route: responsesEndpoint, method: http.MethodPost}:                                  {contentType: "application/json", maxBodyBytes: maxResponsesBodyBytes},
+	{listener: "data", route: imagesGenerationsEndpoint, method: http.MethodPost}:                          {contentType: "application/json", maxBodyBytes: maxImagesJSONBodyBytes},
+	{listener: "data", route: imagesEditsEndpoint, method: http.MethodPost}:                                {contentType: "multipart/form-data", multipart: true, maxBodyBytes: maxImagesMultipartBodyBytes},
+	{listener: "admin", route: "/healthz", method: http.MethodGet}:                                         {},
+	{listener: "admin", route: "/readyz", method: http.MethodGet}:                                          {},
+	{listener: "admin", route: "/admin/assets/app.js", method: http.MethodGet}:                             {},
+	{listener: "admin", route: "/admin/assets/app.css", method: http.MethodGet}:                            {},
+	{listener: "admin", route: adminLoginEndpoint, method: http.MethodGet}:                                 {},
+	{listener: "admin", route: adminLoginEndpoint, method: http.MethodPost}:                                {contentType: "application/x-www-form-urlencoded", maxBodyBytes: adminFormLimit},
+	{listener: "admin", route: adminDashboardEndpoint, method: http.MethodGet}:                             {},
+	{listener: "admin", route: adminLogoutEndpoint, method: http.MethodGet}:                                {},
+	{listener: "admin", route: adminLogoutEndpoint, method: http.MethodPost}:                               {contentType: "application/x-www-form-urlencoded", maxBodyBytes: adminFormLimit},
+	{listener: "admin", route: adminTokensEndpoint, method: http.MethodGet}:                                {},
+	{listener: "admin", route: adminTokensEndpoint, method: http.MethodPost}:                               {contentType: "application/json", maxBodyBytes: adminBodyLimit},
+	{listener: "admin", route: adminTokensEndpoint + "/{id:string}", method: http.MethodDelete}:            {},
+	{listener: "admin", route: adminAPIKeysEndpoint, method: http.MethodGet}:                               {},
+	{listener: "admin", route: adminAPIKeysEndpoint, method: http.MethodPost}:                              {contentType: "application/json", maxBodyBytes: adminBodyLimit},
+	{listener: "admin", route: adminAPIKeysEndpoint + "/{id:string}", method: http.MethodGet}:              {},
+	{listener: "admin", route: adminAPIKeysEndpoint + "/{id:string}", method: http.MethodPatch}:            {contentType: "application/json", maxBodyBytes: adminBodyLimit},
+	{listener: "admin", route: adminAPIKeysEndpoint + "/{id:string}", method: http.MethodDelete}:           {},
+	{listener: "admin", route: adminAPIKeysEndpoint + "/{id:string}/usage", method: http.MethodGet}:        {},
+	{listener: "admin", route: adminRequestsEndpoint, method: http.MethodGet}:                              {},
+	{listener: "admin", route: adminRequestsEndpoint + "/{id:string}", method: http.MethodGet}:             {},
+	{listener: "admin", route: adminRequestsEndpoint + "/{id:string}", method: http.MethodDelete}:          {},
+	{listener: "admin", route: adminRequestsEndpoint + "/{id:string}/export", method: http.MethodGet}:      {},
+	{listener: "admin", route: adminConversationsEndpoint, method: http.MethodGet}:                         {},
+	{listener: "admin", route: adminConversationsEndpoint + "/{id:string}", method: http.MethodGet}:        {},
+	{listener: "admin", route: adminConversationsEndpoint + "/{id:string}", method: http.MethodDelete}:     {},
+	{listener: "admin", route: adminConversationsEndpoint + "/{id:string}/export", method: http.MethodGet}: {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/overview", method: http.MethodGet}:               {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/models", method: http.MethodGet}:                 {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/keys", method: http.MethodGet}:                   {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/errors", method: http.MethodGet}:                 {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/quotas", method: http.MethodGet}:                 {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/latency", method: http.MethodGet}:                {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/usage", method: http.MethodGet}:                  {},
+	{listener: "admin", route: adminAnalyticsEndpoint + "/costs", method: http.MethodGet}:                  {},
+	{listener: "admin", route: "/{path:path}", method: http.MethodOptions}:                                 {},
+}
 
 func requestIDFromContext(ctx context.Context) string {
 	if ctx == nil {
@@ -72,21 +128,15 @@ func newBoundaryMiddleware(cfg boundaryConfig) (iris.Handler, error) {
 	}
 	return func(ctx iris.Context) {
 		request := ctx.Request()
+		route := matchedRouteTemplate(ctx, request)
 		requestID := safeRequestID(request.Header.Values("X-Request-ID"))
 		request.Header.Set("X-Request-ID", requestID)
 		ctx.Header("X-Request-ID", requestID)
 		setSecurityHeaders(ctx, cfg.listener, request)
-		corsHandled, corsAllowed := handleCORS(ctx, cfg, request)
-		if !corsAllowed {
-			writeBoundaryError(ctx, http.StatusForbidden, "cors_forbidden", "Cross-origin request is not allowed.")
-			return
-		}
-		if corsHandled {
-			return
-		}
 
 		if err := validateRequestShape(request); err != nil {
-			writeBoundaryError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
+			status, code := boundaryErrorStatus(err)
+			writeBoundaryError(ctx, status, code, boundaryMessage(status, code))
 			return
 		}
 		if err := validateRequestHeaders(request); err != nil {
@@ -97,22 +147,29 @@ func newBoundaryMiddleware(cfg boundaryConfig) (iris.Handler, error) {
 			writeBoundaryError(ctx, http.StatusUnsupportedMediaType, "unsupported_encoding", "Content-Encoding is not supported.")
 			return
 		}
-		if err := validateRouteBoundary(request); err != nil {
-			status := http.StatusBadRequest
-			code := "invalid_request"
-			if errors.Is(err, errBoundaryMethodNotAllowed) {
-				status = http.StatusMethodNotAllowed
-				code = "method_not_allowed"
-			} else if errors.Is(err, errBoundaryMediaType) {
-				status = http.StatusUnsupportedMediaType
-				code = "invalid_media_type"
+		if request.Method == http.MethodOptions {
+			if err := validatePreflightBody(request); err != nil {
+				status, code := boundaryErrorStatus(err)
+				writeBoundaryError(ctx, status, code, boundaryMessage(status, code))
+				return
 			}
-			if errors.Is(err, errBoundaryRequestTooLarge) {
-				status = http.StatusRequestEntityTooLarge
-				code = "request_too_large"
-			}
+		}
+		corsHandled, corsAllowed := handleCORS(ctx, cfg, request, route)
+		if !corsAllowed {
+			writeBoundaryError(ctx, http.StatusForbidden, "cors_forbidden", "Cross-origin request is not allowed.")
+			return
+		}
+		if corsHandled {
+			return
+		}
+
+		if err := validateRouteBoundary(request, cfg.listener, route); err != nil {
+			status, code := boundaryErrorStatus(err)
 			writeBoundaryError(ctx, status, code, boundaryMessage(status, code))
 			return
+		}
+		if policy, ok := boundaryRoutePolicyFor(cfg.listener, route, request.Method); ok && policy.maxBodyBytes > 0 && request.Body != nil {
+			request.Body = http.MaxBytesReader(ctx.ResponseWriter(), request.Body, policy.maxBodyBytes)
 		}
 
 		resolved, present, err := resolveTrustedClient(request, cfg.trustedProxies)
@@ -127,6 +184,7 @@ func newBoundaryMiddleware(cfg boundaryConfig) (iris.Handler, error) {
 		}
 		*request = *request.WithContext(requestContext)
 		ctx.Next()
+		enforceBoundaryCache(ctx, cfg.listener, request.URL.Path, route)
 	}, nil
 }
 
@@ -134,11 +192,51 @@ var (
 	errBoundaryMediaType        = errors.New("invalid media type")
 	errBoundaryRequestTooLarge  = errors.New("request is too large")
 	errBoundaryMethodNotAllowed = errors.New("method is not allowed")
+	errBoundaryBodyNotAllowed   = errors.New("request body is not allowed")
 )
+
+func matchedRouteTemplate(ctx iris.Context, request *http.Request) string {
+	if ctx != nil {
+		if route := ctx.GetCurrentRoute(); route != nil && route.Path() != "" {
+			return route.Path()
+		}
+	}
+	if request == nil || request.URL == nil {
+		return ""
+	}
+	return request.URL.Path
+}
+
+func boundaryRoutePolicyFor(listener, route, method string) (boundaryRoutePolicy, bool) {
+	policy, ok := boundaryRoutePolicies[boundaryRouteKey{listener: listener, route: route, method: method}]
+	return policy, ok
+}
+
+func boundaryRouteExists(listener, route string) bool {
+	for key := range boundaryRoutePolicies {
+		if key.listener == listener && key.route == route {
+			return true
+		}
+	}
+	return false
+}
+
+func boundaryErrorStatus(err error) (int, string) {
+	switch {
+	case errors.Is(err, errBoundaryMethodNotAllowed):
+		return http.StatusMethodNotAllowed, "method_not_allowed"
+	case errors.Is(err, errBoundaryMediaType):
+		return http.StatusUnsupportedMediaType, "invalid_media_type"
+	case errors.Is(err, errBoundaryRequestTooLarge):
+		return http.StatusRequestEntityTooLarge, "request_too_large"
+	default:
+		return http.StatusBadRequest, "invalid_request"
+	}
+}
 
 func setSecurityHeaders(ctx iris.Context, listener string, request *http.Request) {
 	ctx.Header("X-Content-Type-Options", "nosniff")
-	if listener == "data" && isAPIPath(request.URL.Path) {
+	if listener == "admin" || (listener == "data" && isAPIPath(request.URL.Path)) {
 		ctx.Header("Cache-Control", "no-store")
 	}
 	if request.TLS != nil {
@@ -172,6 +270,30 @@ func validRequestID(value string) bool {
 		}
 	}
 	return true
+}
+
+func enforceBoundaryCache(ctx iris.Context, listener, path, route string) {
+	asset := path == "/admin/assets/app.js" || path == "/admin/assets/app.css" || route == "/admin/assets/app.js" || route == "/admin/assets/app.css"
+	if listener == "admin" && !asset {
+		ensureNoStore(ctx)
+	}
+	if listener == "data" && isAPIPath(path) {
+		ensureNoStore(ctx)
+	}
+}
+
+func ensureNoStore(ctx iris.Context) {
+	value := ctx.GetHeader("Cache-Control")
+	for _, directive := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(directive), "no-store") {
+			return
+		}
+	}
+	if value == "" {
+		ctx.Header("Cache-Control", "no-store")
+		return
+	}
+	ctx.Header("Cache-Control", value+", no-store")
 }
 
 func validateRequestShape(request *http.Request) error {
@@ -212,54 +334,64 @@ func validateRequestHeaders(request *http.Request) error {
 
 func validateContentEncoding(request *http.Request) error {
 	values := request.Header.Values("Content-Encoding")
-	for _, value := range values {
-		for _, encoding := range strings.Split(value, ",") {
-			encoding = strings.ToLower(strings.TrimSpace(encoding))
-			if encoding != "" && encoding != "identity" {
-				return errors.New("content encoding is unsupported")
-			}
+	if len(values) > 1 {
+		return errors.New("content encoding is repeated")
+	}
+	if len(values) == 1 {
+		encoding := strings.TrimSpace(values[0])
+		if encoding != "" && !strings.EqualFold(encoding, "identity") {
+			return errors.New("content encoding is unsupported")
 		}
 	}
 	return nil
 }
 
-func validateRouteBoundary(request *http.Request) error {
-	path := request.URL.Path
+func validatePreflightBody(request *http.Request) error {
+	if request.ContentLength != 0 {
+		return errBoundaryBodyNotAllowed
+	}
+	if values := request.Header.Values("Content-Type"); len(values) > 1 || len(values) == 1 && strings.TrimSpace(values[0]) != "" {
+		return errBoundaryMediaType
+	}
+	return nil
+}
+
+func validateRouteBoundary(request *http.Request, listener, route string) error {
+	if request == nil || request.URL == nil {
+		return errors.New("request target is invalid")
+	}
 	if request.Method == http.MethodOptions {
 		return nil
 	}
-	if request.Method == http.MethodGet && (path == "/v1/models" || path == "/healthz" || path == "/readyz") {
-		if len(request.Header.Values("Content-Type")) != 0 {
-			if len(request.Header.Values("Content-Type")) != 1 || strings.TrimSpace(request.Header.Get("Content-Type")) != "" {
+	policy, ok := boundaryRoutePolicyFor(listener, route, request.Method)
+	if !ok {
+		if boundaryRouteExists(listener, route) {
+			if (route == "/healthz" || route == "/readyz") && request.ContentLength == 0 && (len(request.Header.Values("Content-Type")) == 0 || len(request.Header.Values("Content-Type")) == 1 && strings.TrimSpace(request.Header.Get("Content-Type")) == "") {
+				return nil
+			}
+			return errBoundaryMethodNotAllowed
+		}
+		return nil
+	}
+	if policy.maxBodyBytes > 0 {
+		if policy.multipart {
+			mediaType, params, err := parseRequestMediaType(request)
+			if err != nil || mediaType != policy.contentType || len(params) != 1 || params["boundary"] == "" || len(params["boundary"]) > 70 {
 				return errBoundaryMediaType
 			}
-		}
-		if request.ContentLength != 0 {
-			return errors.New("GET request has a body")
-		}
-		return nil
-	}
-	if path == "/v1/chat/completions" || path == "/v1/responses" || path == "/v1/images/generations" {
-		if request.Method != http.MethodPost {
-			return errBoundaryMethodNotAllowed
-		}
-		if err := requireMediaType(request, "application/json"); err != nil {
+		} else if err := requireMediaType(request, policy.contentType); err != nil {
 			return err
 		}
-		return nil
-	}
-	if path == "/v1/images/edits" {
-		if request.Method != http.MethodPost {
-			return errBoundaryMethodNotAllowed
-		}
-		mediaType, params, err := parseRequestMediaType(request)
-		if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" || len(params["boundary"]) > 70 {
-			return errBoundaryMediaType
-		}
-		if request.ContentLength > maxImagesMultipartBodyBytes {
+		if request.ContentLength > policy.maxBodyBytes {
 			return errBoundaryRequestTooLarge
 		}
 		return nil
+	}
+	if values := request.Header.Values("Content-Type"); len(values) > 1 || len(values) == 1 && strings.TrimSpace(values[0]) != "" {
+		return errBoundaryMediaType
+	}
+	if request.ContentLength != 0 {
+		return errBoundaryBodyNotAllowed
 	}
 	return nil
 }
@@ -270,16 +402,19 @@ func parseRequestMediaType(request *http.Request) (string, map[string]string, er
 		return "", nil, errBoundaryMediaType
 	}
 	value := values[0]
+	if strings.Contains(value, ",") {
+		return "", nil, errBoundaryMediaType
+	}
 	mediaType, params, err := mime.ParseMediaType(value)
-	if err != nil || strings.Contains(strings.TrimSpace(value), ",") {
+	if err != nil {
 		return "", nil, errBoundaryMediaType
 	}
 	return strings.ToLower(mediaType), params, nil
 }
 
 func requireMediaType(request *http.Request, expected string) error {
-	mediaType, _, err := parseRequestMediaType(request)
-	if err != nil || mediaType != expected {
+	mediaType, params, err := parseRequestMediaType(request)
+	if err != nil || mediaType != expected || len(params) != 0 {
 		return errBoundaryMediaType
 	}
 	return nil
@@ -319,9 +454,12 @@ func writeBoundaryError(ctx iris.Context, status int, code, message string) {
 	}
 }
 
-func handleCORS(ctx iris.Context, cfg boundaryConfig, request *http.Request) (bool, bool) {
+func handleCORS(ctx iris.Context, cfg boundaryConfig, request *http.Request, route string) (bool, bool) {
 	origins := request.Header.Values("Origin")
 	if len(origins) == 0 {
+		if request.Method == http.MethodOptions {
+			return true, false
+		}
 		return false, true
 	}
 	if len(origins) != 1 {
@@ -344,26 +482,72 @@ func handleCORS(ctx iris.Context, cfg boundaryConfig, request *http.Request) (bo
 		return true, false
 	}
 	if request.Method == http.MethodOptions {
-		requestedMethod := strings.ToUpper(strings.TrimSpace(request.Header.Get("Access-Control-Request-Method")))
-		if !corsMethodAllowed(request.URL.Path, requestedMethod) {
+		requestedMethods := request.Header.Values("Access-Control-Request-Method")
+		if len(requestedMethods) != 1 {
 			return true, false
 		}
-		if !corsHeadersAllowed(request.Header.Get("Access-Control-Request-Headers")) {
+		requestedMethod := strings.TrimSpace(requestedMethods[0])
+		if requestedMethod == "" {
+			return true, false
+		}
+		if _, ok := boundaryRoutePolicyFor(cfg.listener, route, requestedMethod); !ok {
+			return true, false
+		}
+		headers, ok := corsHeadersAllowed(request.Header.Get("Access-Control-Request-Headers"))
+		if !ok {
 			return true, false
 		}
 		ctx.Header("Access-Control-Allow-Origin", origin)
 		ctx.Header("Access-Control-Allow-Methods", requestedMethod)
-		if headers := strings.TrimSpace(request.Header.Get("Access-Control-Request-Headers")); headers != "" {
-			ctx.Header("Access-Control-Allow-Headers", strings.ToLower(headers))
+		if headers != "" {
+			ctx.Header("Access-Control-Allow-Headers", headers)
 		}
 		ctx.Header("Access-Control-Max-Age", fmt.Sprintf("%d", int(cfg.corsMaxAge/time.Second)))
-		ctx.Header("Vary", "Origin")
+		appendVary(ctx, "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers")
 		ctx.StatusCode(http.StatusNoContent)
 		return true, true
 	}
 	ctx.Header("Access-Control-Allow-Origin", origin)
-	ctx.Header("Vary", "Origin")
+	appendVary(ctx, "Origin")
 	return false, true
+}
+
+func appendVary(ctx iris.Context, values ...string) {
+	header := ctx.ResponseWriter().Header()
+	seen := make(map[string]struct{}, len(values))
+	var merged []string
+	for _, line := range header.Values("Vary") {
+		for _, value := range strings.Split(line, ",") {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if value == "*" {
+				return
+			}
+			key := strings.ToLower(value)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, value)
+		}
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, value)
+	}
+	if len(merged) > 0 {
+		header.Set("Vary", strings.Join(merged, ", "))
+	}
 }
 
 func requestOrigin(request *http.Request) string {
@@ -379,17 +563,6 @@ func requestOrigin(request *http.Request) string {
 	return origin
 }
 
-func corsMethodAllowed(path, method string) bool {
-	switch path {
-	case "/v1/models":
-		return method == http.MethodGet
-	case "/v1/chat/completions", "/v1/responses", "/v1/images/generations", "/v1/images/edits":
-		return method == http.MethodPost
-	default:
-		return false
-	}
-}
-
 var allowedCORSHeaders = map[string]struct{}{
 	"authorization":       {},
 	"content-type":        {},
@@ -399,23 +572,43 @@ var allowedCORSHeaders = map[string]struct{}{
 	"openai-project":      {},
 }
 
-func corsHeadersAllowed(raw string) bool {
+func corsHeadersAllowed(raw string) (string, bool) {
 	if strings.TrimSpace(raw) == "" {
-		return true
+		return "", true
 	}
 	seen := make(map[string]struct{}, 6)
+	headers := make([]string, 0, 6)
 	for _, value := range strings.Split(raw, ",") {
 		name := strings.ToLower(strings.TrimSpace(value))
-		if name == "" {
-			return false
+		if name == "" || !validHeaderToken(name) {
+			return "", false
 		}
 		if _, ok := allowedCORSHeaders[name]; !ok {
-			return false
+			return "", false
 		}
 		if _, duplicate := seen[name]; duplicate {
-			return false
+			return "", false
 		}
 		seen[name] = struct{}{}
+		headers = append(headers, name)
+	}
+	return strings.Join(headers, ", "), true
+}
+
+func validHeaderToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		switch char {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		default:
+			return false
+		}
 	}
 	return true
 }
@@ -468,10 +661,17 @@ func parseImmediatePeer(raw string) (netip.Addr, error) {
 	if raw == "" || strings.Contains(raw, "%") {
 		return netip.Addr{}, errors.New("peer is invalid")
 	}
-	if host, _, err := net.SplitHostPort(raw); err == nil {
-		return netip.ParseAddr(host)
+	var host string
+	if parsedHost, _, err := net.SplitHostPort(raw); err == nil {
+		host = parsedHost
+	} else {
+		host = raw
 	}
-	return netip.ParseAddr(raw)
+	addr, err := netip.ParseAddr(host)
+	if err != nil || addr.Zone() != "" {
+		return netip.Addr{}, errors.New("peer is invalid")
+	}
+	return addr.Unmap(), nil
 }
 
 func parseXForwardedFor(raw string) ([]netip.Addr, error) {
@@ -482,14 +682,14 @@ func parseXForwardedFor(raw string) ([]netip.Addr, error) {
 	chain := make([]netip.Addr, 0, len(parts))
 	for _, part := range parts {
 		value := strings.TrimSpace(part)
-		if value == "" || strings.ContainsAny(value, "[]:%") {
+		if value == "" || strings.ContainsAny(value, "[]%") {
 			return nil, errors.New("x-forwarded-for address is invalid")
 		}
 		addr, err := netip.ParseAddr(value)
-		if err != nil {
+		if err != nil || addr.Zone() != "" {
 			return nil, errors.New("x-forwarded-for address is invalid")
 		}
-		chain = append(chain, addr)
+		chain = append(chain, addr.Unmap())
 	}
 	return chain, nil
 }
@@ -501,25 +701,53 @@ func parseForwardedChain(raw string) ([]netip.Addr, error) {
 	}
 	chain := make([]netip.Addr, 0, len(parts))
 	for _, part := range parts {
-		pairs := strings.Split(part, ";")
-		var value string
-		for _, pair := range pairs {
-			name, candidate, ok := strings.Cut(strings.TrimSpace(pair), "=")
-			if !ok || !strings.EqualFold(name, "for") || value != "" {
-				return nil, errors.New("forwarded element is invalid")
+		pairs := strings.Split(strings.TrimSpace(part), ";")
+		if len(pairs) != 1 {
+			return nil, errors.New("forwarded element is invalid")
+		}
+		name, candidate, ok := strings.Cut(pairs[0], "=")
+		if !ok || name != strings.TrimSpace(name) || !strings.EqualFold(name, "for") {
+			return nil, errors.New("forwarded element is invalid")
+		}
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return nil, errors.New("forwarded address is invalid")
+		}
+		var addr netip.Addr
+		quoted := strings.HasPrefix(candidate, `"`)
+		if quoted {
+			if len(candidate) < 4 || candidate[len(candidate)-1] != '"' {
+				return nil, errors.New("forwarded address is invalid")
 			}
-			value = strings.TrimSpace(candidate)
+			candidate = candidate[1 : len(candidate)-1]
+			if strings.ContainsAny(candidate, `\"`) {
+				return nil, errors.New("forwarded address is invalid")
+			}
 		}
-		if value == "" || strings.ContainsAny(value, "[]:%\"") {
+		if strings.HasPrefix(candidate, "[") {
+			if !quoted || len(candidate) < 3 || candidate[len(candidate)-1] != ']' || strings.ContainsAny(candidate[1:len(candidate)-1], "[]%") {
+				return nil, errors.New("forwarded address is invalid")
+			}
+			addr, ok = parseForwardedIPv6(candidate[1 : len(candidate)-1])
+		} else {
+			addr, ok = parseForwardedIPv4(candidate)
+		}
+		if !ok {
 			return nil, errors.New("forwarded address is invalid")
 		}
-		addr, err := netip.ParseAddr(value)
-		if err != nil {
-			return nil, errors.New("forwarded address is invalid")
-		}
-		chain = append(chain, addr)
+		chain = append(chain, addr.Unmap())
 	}
 	return chain, nil
+}
+
+func parseForwardedIPv4(value string) (netip.Addr, bool) {
+	addr, err := netip.ParseAddr(value)
+	return addr, err == nil && addr.Is4()
+}
+
+func parseForwardedIPv6(value string) (netip.Addr, bool) {
+	addr, err := netip.ParseAddr(value)
+	return addr, err == nil && addr.Is6() && addr.Zone() == ""
 }
 
 func prefixContains(prefixes []netip.Prefix, address netip.Addr) bool {

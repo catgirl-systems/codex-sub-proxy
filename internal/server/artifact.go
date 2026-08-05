@@ -1095,7 +1095,7 @@ func artifactImageMIME(data []byte) (string, bool) {
 		return "", false
 	}
 	detected := strings.ToLower(strings.Split(http.DetectContentType(data), ";")[0])
-	if detected != actual && !(actual == "image/webp" && detected == "application/octet-stream") {
+	if detected != actual {
 		return "", false
 	}
 	return actual, true

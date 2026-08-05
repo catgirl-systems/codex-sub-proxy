@@ -584,20 +584,31 @@ func imageDeclaredMIMEMatches(header *multipart.FileHeader, actual string) bool 
 	if header == nil {
 		return false
 	}
-	declared := strings.TrimSpace(header.Header.Get("Content-Type"))
-	if declared == "" {
-		return true
-	}
-	mediaType, _, err := mime.ParseMediaType(declared)
-	if err != nil {
+	values := header.Header.Values("Content-Type")
+	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
 		return false
 	}
-	mediaType = strings.ToLower(mediaType)
-	return mediaType == "application/octet-stream" || mediaType == actual
+	mediaType, params, err := mime.ParseMediaType(values[0])
+	if err != nil || len(params) != 0 {
+		return false
+	}
+	return strings.EqualFold(mediaType, actual)
 }
 
 func imageMIME(data []byte) (string, bool) {
-	return artifactImageMIME(data)
+	var actual string
+	switch {
+	case len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n":
+		actual = "image/png"
+	case len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		actual = "image/jpeg"
+	case len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		actual = "image/webp"
+	default:
+		return "", false
+	}
+	detected := strings.ToLower(strings.Split(http.DetectContentType(data), ";")[0])
+	return actual, detected == actual
 }
 
 func imageEditInputs(dataURLs []string) []codex.CodexImageEditInput {

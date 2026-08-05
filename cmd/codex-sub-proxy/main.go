@@ -62,14 +62,14 @@ func run(args []string) error {
 		if telemetryErr != nil {
 			processLogger.Warn("telemetry_unavailable", "error_class", "telemetry", "error_code", "headers_invalid")
 		} else {
-			telemetry, telemetryErr = server.NewTelemetry(context.Background(), cfg.Telemetry, telemetryHeaders, "dev")
+			telemetry, telemetryErr = server.NewTelemetry(context.Background(), cfg.Telemetry, telemetryHeaders)
 			if telemetryErr != nil {
 				processLogger.Warn("telemetry_unavailable", "error_class", "telemetry", "error_code", "exporter_unavailable")
 				telemetry = nil
 			}
 		}
 	} else {
-		telemetry, _ = server.NewTelemetry(context.Background(), cfg.Telemetry, telemetryHeaders, "dev")
+		telemetry, _ = server.NewTelemetry(context.Background(), cfg.Telemetry, telemetryHeaders)
 	}
 	payloadKeys, payloadErr := cfg.Security.PayloadKeySet(os.LookupEnv)
 	credentialKeys, credentialErr := cfg.Security.CredentialKeySet(os.LookupEnv)
@@ -189,7 +189,6 @@ func run(args []string) error {
 		AdminTLS:             cfg.Server.AdminTLS,
 		Logger:               processLogger,
 		Telemetry:            telemetry,
-		BuildVersion:         "dev",
 	}, readiness)
 	if err != nil {
 		if telemetry != nil {
@@ -198,7 +197,7 @@ func run(args []string) error {
 		processLogger.Error("server_start_failed", "error_class", "server", "error_code", "startup")
 		return err
 	}
-	processLogger.Info("process_started", "service", "codex-sub-proxy", "build_version", "dev")
+	processLogger.Info("process_started", "service", "codex-sub-proxy")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	select {

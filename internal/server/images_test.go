@@ -26,6 +26,15 @@ import (
 	"github.com/openai/openai-go/packages/param"
 )
 
+type typedImageReader struct {
+	io.Reader
+	contentType string
+}
+
+func (reader typedImageReader) ContentType() string {
+	return reader.contentType
+}
+
 func TestImagesPublicValidationAndJSONLimits(t *testing.T) {
 	validation := validator.New()
 	zero := 0
@@ -327,7 +336,7 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 		t.Fatalf("generated usage = %#v, output details = %#v", generated.Usage, generatedOutput.OutputTokensDetails)
 	}
 	edited, err := client.Images.Edit(context.Background(), sdk.ImageEditParams{
-		Image:             sdk.ImageEditParamsImageUnion{OfFileArray: []io.Reader{bytes.NewReader(imageBytes), bytes.NewReader(imageBytes)}},
+		Image:             sdk.ImageEditParamsImageUnion{OfFileArray: []io.Reader{typedImageReader{Reader: bytes.NewReader(imageBytes), contentType: "image/png"}, typedImageReader{Reader: bytes.NewReader(imageBytes), contentType: "image/png"}}},
 		Model:             sdk.ImageModel("gpt-image-2"),
 		Prompt:            "edit",
 		N:                 param.NewOpt[int64](1),

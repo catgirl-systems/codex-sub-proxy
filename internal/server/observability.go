@@ -101,7 +101,7 @@ func requestLoggerMiddleware(observation requestObservation) iris.Handler {
 				"transport_outcome", safeLogValue(transport),
 			)
 			if observation.telemetry != nil {
-				observation.telemetry.observeRequest(request.Context(), observation.listener, route, safeMethod(request.Method), status, duration, written, transport)
+				observation.telemetry.observeRequest(request.Context(), observation.listener, route, safeMethod(request.Method), status, duration, transport)
 			}
 		}()
 		ctx.Next()

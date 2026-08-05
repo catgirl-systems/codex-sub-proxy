@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +25,10 @@ const (
 	writeTimeout      = 10 * time.Second
 	idleTimeout       = 60 * time.Second
 )
+
+func newServerErrorLogger() *log.Logger {
+	return log.New(io.Discard, "", 0)
+}
 
 type Config struct {
 	Listen               string
@@ -48,7 +54,6 @@ type Config struct {
 	AdminTLS             config.TLSConfig
 	Logger               *slog.Logger
 	Telemetry            *Telemetry
-	BuildVersion         string
 }
 
 type Servers struct {
@@ -270,6 +275,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	servers := &Servers{
 		dataServer: &http.Server{
 			Handler:           dataHandler,
+			ErrorLog:          newServerErrorLogger(),
 			ReadHeaderTimeout: readHeaderTimeout,
 			WriteTimeout:      serverWriteTimeout,
 			IdleTimeout:       idleTimeout,
@@ -277,6 +283,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 		},
 		adminServer: &http.Server{
 			Handler:           adminHandler,
+			ErrorLog:          newServerErrorLogger(),
 			ReadHeaderTimeout: readHeaderTimeout,
 			WriteTimeout:      serverWriteTimeout,
 			IdleTimeout:       idleTimeout,
