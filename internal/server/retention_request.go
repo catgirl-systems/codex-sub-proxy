@@ -25,9 +25,6 @@ func (r *RetentionRunner) DeleteRequestAsAdmin(ctx context.Context, id string, a
 }
 
 func (r *RetentionRunner) deleteRequest(ctx context.Context, id string, actor AdminPrincipal) error {
-	if r == nil {
-		return errors.New("retention runner is nil")
-	}
 	if ctx == nil {
 		return errors.New("request delete context is nil")
 	}

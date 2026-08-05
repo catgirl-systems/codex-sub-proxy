@@ -360,7 +360,7 @@ func registerAdminAPIKeyRoutes(app *iris.Application, adminStore *AdminTokenStor
 			writeAdminAuthError(ctx, err)
 			return
 		}
-		if store == nil || store.DB() == nil {
+		if store == nil {
 			writeAdminOperationError(ctx, apikey.ErrUnavailable)
 			return
 		}
@@ -407,7 +407,7 @@ func registerAdminAPIKeyRoutes(app *iris.Application, adminStore *AdminTokenStor
 			writeAdminOperationError(ctx, errAdminAPIKeyNotFound)
 			return
 		}
-		if store == nil || store.DB() == nil {
+		if store == nil {
 			writeAdminOperationError(ctx, apikey.ErrUnavailable)
 			return
 		}
@@ -437,7 +437,7 @@ func registerAdminAPIKeyRoutes(app *iris.Application, adminStore *AdminTokenStor
 			writeAdminOperationError(ctx, errAdminAPIKeyNotFound)
 			return
 		}
-		if store == nil || store.DB() == nil {
+		if store == nil {
 			writeAdminOperationError(ctx, apikey.ErrUnavailable)
 			return
 		}

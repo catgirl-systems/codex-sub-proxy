@@ -185,20 +185,18 @@ type AdminTokenStore struct {
 }
 
 func NewAdminTokenStore(db *gorm.DB, hmacKey []byte) *AdminTokenStore {
-	return &AdminTokenStore{db: db, hmacKey: append([]byte(nil), hmacKey...), now: func() time.Time { return time.Now().UTC() }, cookieSecure: true}
+	if db == nil || len(hmacKey) == 0 {
+		return nil
+	}
+	return newAdminTokenStoreWithClock(db, hmacKey, func() time.Time { return time.Now().UTC() })
 }
 
 func newAdminTokenStoreWithClock(db *gorm.DB, hmacKey []byte, now func() time.Time) *AdminTokenStore {
-	if now == nil {
-		now = func() time.Time { return time.Now().UTC() }
-	}
 	return &AdminTokenStore{db: db, hmacKey: append([]byte(nil), hmacKey...), now: now, cookieSecure: true}
 }
 
 func (s *AdminTokenStore) setCookieSecure(secure bool) {
-	if s != nil {
-		s.cookieSecure = secure
-	}
+	s.cookieSecure = secure
 }
 
 // MigrateAdminTokens creates admin token, session, nonce, and audit tables.
@@ -212,20 +210,11 @@ func MigrateAdminTokens(db *gorm.DB) error {
 	return nil
 }
 
-func (s *AdminTokenStore) configuredForAuth() error {
-	if s == nil || s.db == nil || len(s.hmacKey) == 0 {
-		return ErrAdminUnavailable
-	}
-	return nil
-}
-
 func (s *AdminTokenStore) availableForAuth(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("admin token context is nil")
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return err
-	}
+
 	var count int64
 	if err := s.silentDB().WithContext(ctx).Model(&AdminToken{}).
 		Where("revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", s.currentTime()).
@@ -240,9 +229,7 @@ func (s *AdminTokenStore) Available(ctx context.Context) bool {
 	if ctx == nil {
 		return false
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return false
-	}
+
 	var count int64
 	if err := s.silentDB().WithContext(ctx).Model(&AdminToken{}).
 		Where("revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", s.currentTime()).
@@ -260,9 +247,7 @@ func (s *AdminTokenStore) MaterializeBootstrap(ctx context.Context, raw []byte) 
 	if len(raw) == 0 {
 		return false, nil
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return false, err
-	}
+
 	parsed, err := parseAdminToken(raw)
 	if err != nil {
 		return false, err
@@ -532,15 +517,9 @@ func (s *AdminTokenStore) Authorize(ctx context.Context, principal AdminPrincipa
 
 }
 func (s *AdminTokenStore) currentTime() time.Time {
-	if s == nil || s.now == nil {
-		return time.Now().UTC()
-	}
 	return s.now().UTC()
 }
 func (s *AdminTokenStore) silentDB() *gorm.DB {
-	if s == nil || s.db == nil {
-		return nil
-	}
 	return s.db.Session(&gorm.Session{Logger: logger.Discard})
 }
 

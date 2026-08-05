@@ -97,9 +97,6 @@ func NewRetentionRunner(db *gorm.DB, artifacts *ArtifactStore, config RetentionC
 
 // Start performs one bounded startup sweep and then ticks at the configured interval.
 func (r *RetentionRunner) Start() error {
-	if r == nil {
-		return errors.New("retention runner is nil")
-	}
 	r.startMu.Lock()
 	defer r.startMu.Unlock()
 	if r.started {
@@ -137,9 +134,6 @@ func (r *RetentionRunner) run(ctx context.Context) {
 
 // Close stops intake, waits for the worker, and performs one final bounded drain.
 func (r *RetentionRunner) Close(ctx context.Context) error {
-	if r == nil {
-		return nil
-	}
 	if ctx == nil {
 		return errors.New("retention close context is nil")
 	}
@@ -172,9 +166,6 @@ func (r *RetentionRunner) Close(ctx context.Context) error {
 
 // Health returns the latest sweep result without interrupting callers.
 func (r *RetentionRunner) Health() RetentionHealth {
-	if r == nil {
-		return RetentionHealth{Err: errors.New("retention runner is nil")}
-	}
 	r.healthMu.RLock()
 	err := r.lastErr
 	r.healthMu.RUnlock()
@@ -197,9 +188,6 @@ func (r *RetentionRunner) clearError() {
 }
 
 func (r *RetentionRunner) workerDone() bool {
-	if r == nil {
-		return true
-	}
 	r.startMu.Lock()
 	started := r.started
 	r.startMu.Unlock()
@@ -216,9 +204,6 @@ func (r *RetentionRunner) workerDone() bool {
 
 // RunOnce executes one bounded payload, artifact, metadata, audit, and admin-session sweep.
 func (r *RetentionRunner) RunOnce(ctx context.Context, now time.Time) error {
-	if r == nil {
-		return errors.New("retention runner is nil")
-	}
 	if ctx == nil {
 		return errors.New("retention context is nil")
 	}
@@ -619,9 +604,6 @@ func (r *RetentionRunner) DeleteConversationAsAdmin(ctx context.Context, id stri
 }
 
 func (r *RetentionRunner) deleteConversation(ctx context.Context, id string, actor AdminPrincipal) error {
-	if r == nil {
-		return errors.New("retention runner is nil")
-	}
 	if ctx == nil {
 		return errors.New("conversation delete context is nil")
 	}

@@ -40,9 +40,6 @@ type QuotaError struct {
 }
 
 func (err *QuotaError) Error() string {
-	if err == nil {
-		return ErrQuotaExceeded.Error()
-	}
 	switch err.Kind {
 	case "concurrency":
 		return "API key concurrent request limit exceeded"
@@ -264,9 +261,6 @@ func periodQuotaEnabled(policy Policy) bool {
 
 // Admit atomically checks and reserves all configured quota dimensions.
 func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy, request QuotaRequest) (*QuotaAdmission, error) {
-	if store == nil || store.db == nil {
-		return nil, fmt.Errorf("admit quota: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return nil, errors.New("admit quota context is nil")
 	}
@@ -404,9 +398,6 @@ func (store *QuotaStore) Admit(ctx context.Context, keyID string, policy Policy,
 
 // Reconcile records success before it applies the reservation.
 func (store *QuotaStore) Reconcile(ctx context.Context, reservationID string, usage QuotaUsage) error {
-	if store == nil || store.db == nil {
-		return fmt.Errorf("reconcile quota: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return errors.New("reconcile quota context is nil")
 	}
@@ -463,9 +454,6 @@ func beginQuotaFinalization(tx *gorm.DB, reservationID string, usage QuotaUsage)
 
 // Release closes one reservation without charging its reserved amounts.
 func (store *QuotaStore) Release(ctx context.Context, reservationID, reason string) error {
-	if store == nil || store.db == nil {
-		return fmt.Errorf("release quota: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return errors.New("release quota context is nil")
 	}
@@ -532,9 +520,6 @@ func releasePendingReservation(tx *gorm.DB, reservation QuotaReservation, now ti
 
 // RecoverPending applies recorded successes and releases in-flight reservations.
 func (store *QuotaStore) RecoverPending(ctx context.Context) error {
-	if store == nil || store.db == nil {
-		return fmt.Errorf("recover quotas: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return errors.New("recover quotas context is nil")
 	}

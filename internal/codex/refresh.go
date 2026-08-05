@@ -58,9 +58,6 @@ type RefreshError struct {
 }
 
 func (e *RefreshError) Error() string {
-	if e == nil {
-		return "credential refresh failed"
-	}
 	if e.permanent {
 		return ErrRefreshRequiresLogin.Error()
 	}
@@ -81,9 +78,6 @@ func (e *RefreshError) Permanent() bool {
 
 // StatusCode returns the OAuth status code, or zero for a local failure.
 func (e *RefreshError) StatusCode() int {
-	if e == nil {
-		return 0
-	}
 	return e.status
 }
 

@@ -73,9 +73,7 @@ func (s *AdminTokenStore) CreateSession(ctx context.Context, principal AdminPrin
 	if ctx == nil {
 		return "", "", AdminSession{}, errors.New("admin session context is nil")
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return "", "", AdminSession{}, err
-	}
+
 	if strings.TrimSpace(principal.ID) == "" || strings.TrimSpace(principal.Name) == "" {
 		return "", "", AdminSession{}, ErrAdminTokenInvalid
 	}
@@ -233,9 +231,7 @@ func (s *AdminTokenStore) RevokeSession(ctx context.Context, auth adminSessionAu
 	if ctx == nil {
 		return errors.New("admin session context is nil")
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return err
-	}
+
 	if auth.ID == "" {
 		return errAdminSessionInvalid
 	}
@@ -255,9 +251,7 @@ func (s *AdminTokenStore) LogoutSession(ctx context.Context, auth adminSessionAu
 	if ctx == nil {
 		return errors.New("admin session context is nil")
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return err
-	}
+
 	if auth.ID == "" || principal.ID == "" || principal.Name == "" {
 		return errAdminSessionInvalid
 	}
@@ -287,9 +281,7 @@ func (s *AdminTokenStore) CreateLoginNonce(ctx context.Context) (string, error) 
 	if ctx == nil {
 		return "", errors.New("admin login nonce context is nil")
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return "", err
-	}
+
 	rawValue, raw, err := newAdminOpaqueValue(adminLoginNoncePrefix, adminSessionIDBytes, adminSessionPrefixBytes)
 	if err != nil {
 		return "", err
@@ -327,9 +319,7 @@ func (s *AdminTokenStore) ConsumeLoginNonce(ctx context.Context, cookie, formVal
 	if ctx == nil {
 		return errors.New("admin login nonce context is nil")
 	}
-	if err := s.configuredForAuth(); err != nil {
-		return err
-	}
+
 	if subtle.ConstantTimeCompare([]byte(cookie), []byte(formValue)) != 1 {
 		return errAdminSessionInvalid
 	}

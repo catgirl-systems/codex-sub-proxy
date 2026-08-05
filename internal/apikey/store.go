@@ -23,6 +23,9 @@ type Store struct {
 
 // NewStore creates an API-key store backed by db.
 func NewStore(db *gorm.DB, hmacKey []byte) *Store {
+	if db == nil || len(hmacKey) == 0 {
+		return nil
+	}
 	return &Store{
 		db:      db,
 		hmacKey: append([]byte(nil), hmacKey...),
@@ -32,17 +35,11 @@ func NewStore(db *gorm.DB, hmacKey []byte) *Store {
 
 // DB returns the store database for an enclosing transaction.
 func (s *Store) DB() *gorm.DB {
-	if s == nil || s.db == nil {
-		return nil
-	}
 	return s.db.Session(&gorm.Session{Logger: logger.Discard})
 }
 
 // Transaction runs fn in a bounded store transaction.
 func (s *Store) Transaction(ctx context.Context, fn func(*gorm.DB) error) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("API key transaction: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return errors.New("API key transaction context is nil")
 	}
@@ -54,12 +51,6 @@ func (s *Store) Transaction(ctx context.Context, fn func(*gorm.DB) error) error 
 
 // CreateTx generates and inserts a key. The caller owns transaction scope.
 func (s *Store) CreateTx(tx *gorm.DB, policy Policy) (string, Record, error) {
-	if s == nil || len(s.hmacKey) == 0 {
-		return "", Record{}, fmt.Errorf("create API key: %w", ErrUnavailable)
-	}
-	if tx == nil {
-		return "", Record{}, errors.New("create API key transaction is nil")
-	}
 	if err := validatePolicy(policy); err != nil {
 		return "", Record{}, err
 	}
@@ -77,9 +68,6 @@ func (s *Store) CreateTx(tx *gorm.DB, policy Policy) (string, Record, error) {
 }
 
 func (s *Store) currentTime() time.Time {
-	if s == nil || s.now == nil {
-		return time.Now().UTC()
-	}
 	return s.now().UTC()
 }
 
@@ -149,14 +137,14 @@ type Authorizer struct {
 }
 
 func NewAuthorizer(db *gorm.DB, hmacKey []byte) *Authorizer {
+	if db == nil || len(hmacKey) == 0 {
+		return nil
+	}
 	return &Authorizer{db: db, hmacKey: append([]byte(nil), hmacKey...)}
 }
 
 // AuthenticateHeader parses one exact Bearer value without granting policy access.
 func (a *Authorizer) AuthenticateHeader(ctx context.Context, header string) (Principal, error) {
-	if a == nil {
-		return Principal{}, fmt.Errorf("authenticate API key header: %w", ErrUnavailable)
-	}
 	if len(header) > MaxAuthorizationHeaderSize || !strings.HasPrefix(header, "Bearer ") {
 		return Principal{}, ErrInvalidKey
 	}
@@ -170,14 +158,8 @@ func (a *Authorizer) AuthenticateHeader(ctx context.Context, header string) (Pri
 // AuthorizePrincipal reloads the current API-key policy, applies endpoint and
 // model access, and records successful use in one transaction.
 func (a *Authorizer) AuthorizePrincipal(ctx context.Context, principal Principal, endpoint, model string) (Principal, error) {
-	if a == nil {
-		return Principal{}, fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return Principal{}, errors.New("API key context is nil")
-	}
-	if a.db == nil {
-		return Principal{}, fmt.Errorf("authorize API key principal: %w", ErrUnavailable)
 	}
 
 	var refreshed Principal
@@ -267,14 +249,8 @@ func (a *Authorizer) Authorize(ctx context.Context, rawKey, endpoint, model stri
 
 // Authenticate verifies the key without granting endpoint or model access.
 func (a *Authorizer) Authenticate(ctx context.Context, rawKey string) (Principal, error) {
-	if a == nil {
-		return Principal{}, fmt.Errorf("authenticate API key: %w", ErrUnavailable)
-	}
 	if ctx == nil {
 		return Principal{}, errors.New("API key context is nil")
-	}
-	if a.db == nil {
-		return Principal{}, fmt.Errorf("authenticate API key: %w", ErrUnavailable)
 	}
 	if len(rawKey) == 0 || len(rawKey) > maxKeySize || !strings.HasPrefix(rawKey, KeyPrefix) {
 		return Principal{}, ErrInvalidKey

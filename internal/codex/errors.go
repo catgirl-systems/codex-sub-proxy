@@ -38,9 +38,6 @@ type SafeError struct {
 }
 
 func (e *SafeError) Error() string {
-	if e == nil {
-		return "codex error"
-	}
 	if e.StatusCode > 0 {
 		return fmt.Sprintf("%s (status %d)", e.Message, e.StatusCode)
 	}

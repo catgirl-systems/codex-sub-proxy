@@ -555,7 +555,7 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 	}
 	if event.Type == codex.CodexEventResponseDone {
 		event.Type = codex.CodexEventResponseCompleted
-		event.Raw = normalizeCompletedEvent(event.Raw)
+		event.Raw = nil
 	}
 	eventCode, eventMessage := event.Code, event.Message
 	if event.Type == codex.CodexEventResponseFailed {
@@ -601,22 +601,6 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		return nil, false, errors.New("public Responses event exceeds limit")
 	}
 	return payload, true, nil
-}
-
-func normalizeCompletedEvent(raw []byte) []byte {
-	if len(raw) == 0 {
-		return nil
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return nil
-	}
-	fields["type"] = json.RawMessage(`"response.completed"`)
-	encoded, err := json.Marshal(fields)
-	if err != nil {
-		return nil
-	}
-	return encoded
 }
 
 func rawPublicEvent(raw []byte, eventType string) bool {

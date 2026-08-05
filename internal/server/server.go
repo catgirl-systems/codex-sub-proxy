@@ -222,7 +222,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 	if cfg.Database != nil {
 		if err := MigrateAdminTokens(cfg.Database); err == nil {
 			adminStore = NewAdminTokenStore(cfg.Database, cfg.AdminTokenHMACKey)
-			if len(cfg.AdminBootstrapToken) > 0 {
+			if adminStore != nil && len(cfg.AdminBootstrapToken) > 0 {
 				if _, materializeErr := adminStore.MaterializeBootstrap(context.Background(), cfg.AdminBootstrapToken); materializeErr != nil && cfg.Logger != nil {
 					cfg.Logger.Warn("admin_bootstrap_unavailable", "error_class", "admin", "error_code", "bootstrap", "error", materializeErr)
 				}
