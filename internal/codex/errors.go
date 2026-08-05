@@ -216,23 +216,11 @@ func classifyError(status int, code string) ErrorCategory {
 		return CategoryServer
 	case status >= 400 && status <= 499:
 		return CategoryUnknown
-	default:
-		return CategoryUnknown
 	}
+	return CategoryUnknown
 }
 
 func retryAfter(headers http.Header, detail errorDetail) time.Duration {
-	if value := strings.TrimSpace(headers.Get("Retry-After-Ms")); value != "" {
-		if milliseconds, err := strconv.ParseFloat(value, 64); err == nil &&
-			!math.IsNaN(milliseconds) &&
-			!math.IsInf(milliseconds, 0) &&
-			milliseconds >= 0 {
-			nanoseconds := milliseconds * float64(time.Millisecond)
-			if nanoseconds < float64(math.MaxInt64) {
-				return time.Duration(nanoseconds)
-			}
-		}
-	}
 	if value := strings.TrimSpace(headers.Get("Retry-After")); value != "" {
 		if seconds, err := strconv.ParseFloat(value, 64); err == nil &&
 			!math.IsNaN(seconds) &&

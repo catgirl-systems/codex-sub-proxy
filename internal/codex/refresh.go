@@ -417,8 +417,7 @@ func refreshHTTPError(status int, body []byte) error {
 		failure.Status = status
 		return &RefreshError{permanent: failure.IsPermanent(), status: status}
 	}
-	permanent := status == http.StatusUnauthorized && !isTransientRefreshText(strings.ToLower(string(body)))
-	return &RefreshError{permanent: permanent, status: status}
+	return &RefreshError{status: status}
 }
 
 func (r *Refresher) finishRefresh(call *refreshCall, credential Credential, err error, source Credential) {

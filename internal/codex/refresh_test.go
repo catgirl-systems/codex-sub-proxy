@@ -467,7 +467,7 @@ func TestRefresherPlainTextUnauthorizedClassification(t *testing.T) {
 		}
 	})
 
-	t.Run("permanent", func(t *testing.T) {
+	t.Run("unstructured", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "credential.enc")
 		keys := testCredentialKeys(t)
 		if err := SaveCredential(path, Credential{
@@ -491,15 +491,15 @@ func TestRefresherPlainTextUnauthorizedClassification(t *testing.T) {
 		}
 		_, err = refresher.Credential(context.Background())
 		var refreshErr *RefreshError
-		if !errors.Is(err, ErrRefreshRequiresLogin) || !errors.As(err, &refreshErr) || !refreshErr.Permanent() || strings.Contains(err.Error(), secret) {
-			t.Fatalf("permanent plain-text error = %v", err)
+		if !errors.Is(err, ErrRefreshTemporary) || !errors.As(err, &refreshErr) || refreshErr.Permanent() || strings.Contains(err.Error(), secret) {
+			t.Fatalf("unstructured plain-text error = %v", err)
 		}
-		if got := refresher.Status(); got != CredentialStatusPermanentFailure {
-			t.Fatalf("permanent plain-text status = %q", got)
+		if got := refresher.Status(); got != CredentialStatusTransientFailure {
+			t.Fatalf("unstructured plain-text status = %q", got)
 		}
 		_, err = refresher.Credential(context.Background())
-		if !errors.Is(err, ErrRefreshRequiresLogin) || requests.Load() != 1 {
-			t.Fatalf("permanent plain-text retry = %v, requests = %d", err, requests.Load())
+		if !errors.Is(err, ErrRefreshTemporary) || requests.Load() != 2 {
+			t.Fatalf("unstructured plain-text retry = %v, requests = %d", err, requests.Load())
 		}
 	})
 }

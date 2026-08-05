@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 )
 
@@ -500,40 +499,15 @@ type CodexRefreshFailure struct {
 	Status           int    `json:"status,omitempty"`
 }
 
-// IsPermanent reports whether a refresh failure requires a new login.
+// IsPermanent reports whether a structured refresh error requires a new login.
 func (failure CodexRefreshFailure) IsPermanent() bool {
-	code := strings.ToLower(strings.TrimSpace(failure.Error))
-	switch code {
-	case "invalid_grant", "invalid_token", "unauthorized_client", "refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated":
+	switch strings.ToLower(strings.TrimSpace(failure.Error)) {
+	case "invalid_client", "invalid_grant", "invalid_token", "unauthorized_client",
+		"refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated":
 		return true
-	}
-
-	description := strings.ToLower(strings.TrimSpace(failure.ErrorDescription))
-	normalizedDescription := strings.NewReplacer("-", " ", "_", " ").Replace(description)
-	if strings.Contains(normalizedDescription, "refresh token") &&
-		(strings.Contains(normalizedDescription, "revoked") || strings.Contains(normalizedDescription, "expired")) {
-		return true
-	}
-	if failure.Status != http.StatusUnauthorized {
+	default:
 		return false
 	}
-	return !isTransientRefreshText(code + " " + description)
-}
-
-func isTransientRefreshText(text string) bool {
-	for _, marker := range []string{
-		"timeout", "network", "fetch failed", "econnrefused", "econnreset",
-		"etimedout", "eai_again", "socket hang up", "rate limit",
-		"too many requests", "temporar", "unavailable", "forbidden",
-		"permission_denied", "cloudflare", "captcha", "408", "425",
-		"429", "500", "501", "502", "503", "504", "505", "506", "507",
-		"508", "509", "510", "511",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 // CodexStreamResult is the validated result of one private stream.

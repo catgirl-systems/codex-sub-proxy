@@ -714,7 +714,7 @@ func TestCodexTransientRefreshFixtureIsNotPermanent(t *testing.T) {
 		t.Fatalf("transient refresh failure is permanent: %#v", failure)
 	}
 }
-func TestCodexRefreshFailureClassificationMatchesOMP(t *testing.T) {
+func TestCodexRefreshFailureUsesStructuredCodes(t *testing.T) {
 	tests := []struct {
 		name      string
 		failure   CodexRefreshFailure
@@ -723,9 +723,9 @@ func TestCodexRefreshFailureClassificationMatchesOMP(t *testing.T) {
 		{name: "invalid grant", failure: CodexRefreshFailure{Error: "invalid_grant", Status: 400}, permanent: true},
 		{name: "invalid token", failure: CodexRefreshFailure{Error: "invalid_token", Status: 400}, permanent: true},
 		{name: "unauthorized client", failure: CodexRefreshFailure{Error: "unauthorized_client", Status: 400}, permanent: true},
-		{name: "revoked refresh token", failure: CodexRefreshFailure{ErrorDescription: "Refresh token revoked", Status: 400}, permanent: true},
-		{name: "expired refresh token", failure: CodexRefreshFailure{ErrorDescription: "Refresh token expired", Status: 400}, permanent: true},
-		{name: "bare unauthorized", failure: CodexRefreshFailure{Status: 401}, permanent: true},
+		{name: "unstructured revoked token", failure: CodexRefreshFailure{ErrorDescription: "Refresh token revoked", Status: 400}, permanent: false},
+		{name: "unstructured expired token", failure: CodexRefreshFailure{ErrorDescription: "Refresh token expired", Status: 400}, permanent: false},
+		{name: "bare unauthorized", failure: CodexRefreshFailure{Status: 401}, permanent: false},
 		{name: "temporary unavailable", failure: CodexRefreshFailure{Error: "temporarily_unavailable", Status: 503}, permanent: false},
 		{name: "service unavailable", failure: CodexRefreshFailure{ErrorDescription: "refresh service is unavailable", Status: 503}, permanent: false},
 		{name: "rate limited unauthorized", failure: CodexRefreshFailure{ErrorDescription: "401 unauthorized: too many requests", Status: 401}, permanent: false},
