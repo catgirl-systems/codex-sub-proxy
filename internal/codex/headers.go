@@ -23,6 +23,7 @@ const (
 	ImageTurnIDHeader     = "x-codex-image-turn-id"
 	AttestationHeader     = "x-oai-attestation"
 	FedRAMPHeader         = "X-OpenAI-Fedramp"
+	ResponsesLiteHeader   = "x-openai-internal-codex-responses-lite"
 )
 
 const (
@@ -51,9 +52,9 @@ type HeaderConfig struct {
 	TurnStartedAtUnixMs int64
 	RequestKind         string
 	ImageTurnID         string
-
-	Attestation string
-	FedRAMP     bool
+	Attestation         string
+	FedRAMP             bool
+	ResponsesLite       bool
 }
 
 // BuildHeaders creates the headers required by a Codex upstream request.
@@ -127,6 +128,9 @@ func BuildHeaders(config HeaderConfig) (http.Header, error) {
 	}
 	if config.FedRAMP {
 		headers.Set(FedRAMPHeader, "true")
+	}
+	if config.ResponsesLite {
+		headers.Set(ResponsesLiteHeader, "true")
 	}
 	return headers, nil
 }

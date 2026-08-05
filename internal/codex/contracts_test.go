@@ -168,6 +168,61 @@ func TestCodexRequestUnionsRoundTripAndRejectInvalidForms(t *testing.T) {
 	}
 }
 
+func TestResponsesCompatibilityMatrix(t *testing.T) {
+	raw := `{"model":"gpt-5.6-sol","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"fixture instructions"}]},{"type":"additional_tools","tools":[{"type":"namespace","name":"shell","tools":[{"type":"function","name":"exec"}]}]},{"type":"message","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}],"client_metadata":{"trace":"fixture","ws_request_header_x_openai_internal_codex_responses_lite":"true"},"generate":false,"reasoning":{"effort":"high","context":"fixture-context"},"text":{"format":{"type":"json_schema","name":"fixture","schema":{"type":"object"},"strict":true}},"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"}}`
+	var request CodexResponseRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		t.Fatalf("decode private compatibility matrix request: %v", err)
+	}
+	if request.ClientMetadata["trace"] != "fixture" ||
+		request.ClientMetadata["ws_request_header_x_openai_internal_codex_responses_lite"] != "true" ||
+		request.Generate == nil || *request.Generate ||
+		request.Input == nil || len(request.Input.Items) != 3 ||
+		request.Input.Items[0].Role != "developer" ||
+		len(request.Input.Items[1].Tools) != 1 ||
+		request.Input.Items[1].Tools[0].Type != "namespace" ||
+		len(request.Input.Items[1].Tools[0].Tools) != 1 ||
+		request.Input.Items[1].Tools[0].Tools[0].Name != "exec" ||
+		!bytes.Contains(request.Input.Items[2].Content, []byte("data:image/png;base64,AAAA")) ||
+		request.Reasoning == nil || request.Reasoning.Context != "fixture-context" ||
+		request.Text == nil || request.Text.Format == nil || request.Text.Format.Name != "fixture" ||
+		request.StreamOptions == nil || request.StreamOptions.ReasoningSummaryDelivery != "sequential_cutoff" {
+		t.Fatalf("private compatibility matrix request = %#v", request)
+	}
+
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("encode private compatibility matrix request: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode encoded private request: %v", err)
+	}
+	if string(fields["client_metadata"]) != `{"trace":"fixture","ws_request_header_x_openai_internal_codex_responses_lite":"true"}` ||
+		string(fields["generate"]) != "false" {
+		t.Fatalf("private request fields = %s", encoded)
+	}
+
+	var response CodexResponse
+	if err := json.Unmarshal([]byte(`{"output":[{"type":"compaction","id":"cmp_1","encrypted_content":"fixture","created_by":"codex"}]}`), &response); err != nil {
+		t.Fatalf("decode private compaction output: %v", err)
+	}
+	if len(response.Output) != 1 || response.Output[0].Type != "compaction" ||
+		response.Output[0].EncryptedContent != "fixture" || response.Output[0].CreatedBy != "codex" {
+		t.Fatalf("private compaction output = %#v", response.Output)
+	}
+
+	for _, invalid := range []string{
+		`{"model":"gpt-5.6-sol","unknown":true}`,
+		`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","tools":[{"type":"namespace","tools":[{"type":"namespace","tools":[{"type":"function"}]}]}]}]}`,
+	} {
+		var invalidRequest CodexResponseRequest
+		if err := json.Unmarshal([]byte(invalid), &invalidRequest); err == nil {
+			t.Fatalf("accepted invalid private matrix request: %s", invalid)
+		}
+	}
+}
+
 func TestCodexStreamEventArgumentsRoundTrip(t *testing.T) {
 	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}"}`)
 	var event CodexResponseStreamEvent

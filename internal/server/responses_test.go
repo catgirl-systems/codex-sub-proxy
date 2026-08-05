@@ -5,6 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/openai"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,11 +19,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 )
 
 func TestResponsesJSONPreservesImageAndUsage(t *testing.T) {
@@ -223,6 +223,12 @@ func TestResponsesSupportedFieldsReachCodexAndUnknownFieldsReject(t *testing.T) 
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown field status = %d", response.StatusCode)
 	}
+	unsupportedResponse := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","background":true}`, "application/json")
+	unsupportedBody, err := io.ReadAll(unsupportedResponse.Body)
+	unsupportedResponse.Body.Close()
+	if unsupportedResponse.StatusCode != http.StatusBadRequest || !bytes.Contains(unsupportedBody, []byte(`"unsupported_parameter"`)) {
+		t.Fatalf("unsupported parameter response = %d, body = %s", unsupportedResponse.StatusCode, unsupportedBody)
+	}
 	for _, body := range []string{
 		`{"model":"gpt-5.6-sol","input":[{"type":"message","content":[{"type":"input_text","txet":"fixture"}]}]}`,
 		`{"model":"gpt-5.6-sol","input":[{"type":"computer_call_output","output":{"type":"computer_screenshot","file_id":"fixture","filed_id":"typo"}}]}`,
@@ -238,6 +244,140 @@ func TestResponsesSupportedFieldsReachCodexAndUnknownFieldsReject(t *testing.T) 
 	}
 	if upstreamCalls.Load() != 1 {
 		t.Fatalf("upstream calls after unknown field = %d", upstreamCalls.Load())
+	}
+}
+
+func TestResponsesCompatibilityMatrix(t *testing.T) {
+	generate := false
+	parallel := true
+	maxOutputTokens := 123
+	strict := true
+	publicRequest := openai.ResponseRequest{
+		Model:             "gpt-5.6-sol",
+		Instructions:      "public instructions",
+		ParallelToolCalls: &parallel,
+		ClientMetadata: map[string]string{
+			"trace": "fixture",
+			"ws_request_header_x_openai_internal_codex_responses_lite": "true",
+		},
+		Generate:             &generate,
+		MaxOutputTokens:      &maxOutputTokens,
+		PromptCacheKey:       "fixture-cache",
+		PromptCacheRetention: "24h",
+		Reasoning:            &openai.ReasoningConfig{Effort: "high", Context: "fixture-context"},
+		Text:                 &openai.TextConfig{Format: &openai.TextFormat{Type: "json_schema", Name: "fixture", Schema: json.RawMessage(`{"type":"object"}`), Strict: &strict}},
+		StreamOptions:        &openai.StreamOptions{ReasoningSummaryDelivery: "sequential_cutoff"},
+		Input: &openai.Input{Items: []openai.InputItem{
+			{Type: "message", Role: "developer", Content: json.RawMessage(`[{"type":"input_text","text":"fixture instructions"}]`)},
+			{Type: "additional_tools", Tools: []openai.Tool{{Type: "namespace", Name: "shell", Tools: []openai.Tool{{Type: "function", Name: "exec"}}}}},
+			{Type: "message", Content: json.RawMessage(`[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]`)},
+		}},
+	}
+	privateRequest, err := privateResponseRequest(publicRequest)
+	if err != nil {
+		t.Fatalf("map public request: %v", err)
+	}
+	if privateRequest.Model != publicRequest.Model ||
+		privateRequest.Instructions != publicRequest.Instructions ||
+		!privateRequest.ResponsesLite ||
+		privateRequest.ClientMetadata["trace"] != "fixture" ||
+		privateRequest.ClientMetadata["ws_request_header_x_openai_internal_codex_responses_lite"] != "true" ||
+		privateRequest.Generate == nil || *privateRequest.Generate ||
+		privateRequest.MaxOutputTokens != maxOutputTokens ||
+		privateRequest.Reasoning == nil || privateRequest.Reasoning.Context != "fixture-context" ||
+		privateRequest.Text == nil || privateRequest.Text.Format == nil || privateRequest.Text.Format.Name != "fixture" ||
+		privateRequest.StreamOptions == nil || privateRequest.StreamOptions.ReasoningSummaryDelivery != "sequential_cutoff" {
+		t.Fatalf("mapped private request = %#v", privateRequest)
+	}
+	if privateRequest.Input == nil || len(privateRequest.Input.Items) != 3 ||
+		privateRequest.Input.Items[0].Role != "developer" ||
+		len(privateRequest.Input.Items[1].Tools) != 1 ||
+		privateRequest.Input.Items[1].Tools[0].Type != "namespace" ||
+		len(privateRequest.Input.Items[1].Tools[0].Tools) != 1 ||
+		privateRequest.Input.Items[1].Tools[0].Tools[0].Name != "exec" ||
+		!bytes.Contains(privateRequest.Input.Items[2].Content, []byte("data:image/png;base64,AAAA")) {
+		t.Fatalf("mapped private input = %#v", privateRequest.Input)
+	}
+	if privateRequest.ParallelToolCalls == nil || *privateRequest.ParallelToolCalls != *publicRequest.ParallelToolCalls ||
+		privateRequest.PromptCacheRetention != "24h" {
+		t.Fatalf("mapped private controls = %#v", privateRequest)
+	}
+
+	for _, invalid := range []openai.ResponseRequest{
+		{Model: "gpt-5.6-sol", Metadata: map[string]string{"trace": "public"}, ClientMetadata: map[string]string{"trace": "private"}},
+		{Model: "gpt-5.6-sol", ClientMetadata: map[string]string{responsesLiteClientMetadataKey: "false"}},
+	} {
+		if _, err := privateResponseRequest(invalid); err == nil {
+			t.Fatal("invalid metadata marker was accepted")
+		}
+	}
+}
+
+func TestResponsesLiteMarkers(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamCalls atomic.Int32
+	var liteHeaders atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+		if request.Header.Get(codex.ResponsesLiteHeader) == "true" {
+			liteHeaders.Add(1)
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	}))
+	defer upstream.Close()
+
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, nil)
+	defer shutdownResponsesTestServer(t, servers)
+
+	doRequest := func(body string, headerValues ...string) *http.Response {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+responsesEndpoint, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", "application/json")
+		for _, value := range headerValues {
+			request.Header.Add(codex.ResponsesLiteHeader, value)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	response := doRequest(`{"model":"gpt-5.6-sol"}`, "true")
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("header marker status = %d", response.StatusCode)
+	}
+	response = doRequest(`{"model":"gpt-5.6-sol","client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("client metadata marker status = %d", response.StatusCode)
+	}
+	for _, values := range [][]string{
+		{"true", "true"},
+		{"false"},
+	} {
+		response = doRequest(`{"model":"gpt-5.6-sol"}`, values...)
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid Lite marker %v status = %d", values, response.StatusCode)
+		}
+	}
+	response = doRequest(`{"model":"gpt-5.6-sol","client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`, "true")
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("duplicate Lite marker status = %d", response.StatusCode)
+	}
+	if upstreamCalls.Load() != 2 || liteHeaders.Load() != 2 {
+		t.Fatalf("upstream Lite markers = calls %d, headers %d; want 2, 2", upstreamCalls.Load(), liteHeaders.Load())
 	}
 }
 

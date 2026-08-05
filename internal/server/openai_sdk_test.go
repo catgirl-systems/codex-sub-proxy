@@ -14,11 +14,11 @@ import (
 	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
-	sdk "github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
-	"github.com/openai/openai-go/packages/param"
-	"github.com/openai/openai-go/responses"
-	"github.com/openai/openai-go/shared"
+	sdk "github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared"
 )
 
 func TestOfficialOpenAISDKUsesOnlyBaseURLAndAPIKey(t *testing.T) {
@@ -263,8 +263,8 @@ func TestOfficialOpenAISDKComputerCallRequestReachesCodex(t *testing.T) {
 		CallID: "sdk-computer-call",
 		PendingSafetyChecks: []responses.ResponseComputerToolCallPendingSafetyCheckParam{{
 			ID:      "sdk-safety",
-			Code:    "confirm",
-			Message: "sdk safety",
+			Code:    param.NewOpt("confirm"),
+			Message: param.NewOpt("sdk safety"),
 		}},
 		Status: "completed",
 		Type:   "computer_call",

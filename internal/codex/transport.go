@@ -140,6 +140,7 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 		headers := transport.headers
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
+		headers.ResponsesLite = headers.ResponsesLite || request.ResponsesLite
 		if credential.AccountIsFedRAMP {
 			headers.FedRAMP = true
 		}
@@ -216,6 +217,7 @@ func (transport *ResponsesTransport) Stream(ctx context.Context, request CodexRe
 		headers := transport.headers
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
+		headers.ResponsesLite = headers.ResponsesLite || request.ResponsesLite
 		if credential.AccountIsFedRAMP {
 			headers.FedRAMP = true
 		}

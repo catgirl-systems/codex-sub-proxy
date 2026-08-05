@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -34,44 +35,68 @@ const (
 	ResponseStatusIncomplete = "incomplete"
 )
 const (
-	maxResponsesInputItems   = 1024
-	maxResponsesContentParts = 1024
-	maxResponsesItemTools    = 128
-	maxResponsesInclude      = 64
-	maxResponsesMetadata     = 16
-	maxResponsesSafetyChecks = maxResponsesItemTools
+	maxResponsesInputItems    = 1024
+	maxResponsesContentParts  = 1024
+	maxResponsesItemTools     = 128
+	maxResponsesInclude       = 64
+	maxResponsesMetadata      = 16
+	maxResponsesSafetyChecks  = maxResponsesItemTools
+	maxResponsesContractBytes = 4 * 1024 * 1024
 )
 
-// ResponseRequest is the public OpenAI Responses request body.
+// ErrUnsupportedParameter marks a public Responses field that this Codex adapter cannot represent.
+var ErrUnsupportedParameter = errors.New("Responses parameter is unsupported")
+
 type ResponseRequest struct {
-	Model              string            `json:"model" validate:"required,max=256"`
-	Input              *Input            `json:"input,omitempty"`
-	Instructions       string            `json:"instructions,omitempty" validate:"max=65536"`
-	Tools              []Tool            `json:"tools,omitempty" validate:"max=128"`
-	ToolChoice         *ToolChoice       `json:"tool_choice,omitempty"`
-	Store              *bool             `json:"store,omitempty"`
-	Stream             bool              `json:"stream,omitempty"`
-	ParallelToolCalls  *bool             `json:"parallel_tool_calls,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty" validate:"max=256"`
-	Reasoning          *ReasoningConfig  `json:"reasoning,omitempty"`
-	Text               *TextConfig       `json:"text,omitempty"`
-	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty" validate:"omitempty,min=1"`
-	Include            []string          `json:"include,omitempty" validate:"max=64,dive,max=128"`
-	Metadata           map[string]string `json:"metadata,omitempty" validate:"max=16,dive,keys,max=64,endkeys,max=512"`
-	PromptCacheKey     string            `json:"prompt_cache_key,omitempty" validate:"max=512"`
-	ServiceTier        string            `json:"service_tier,omitempty" validate:"omitempty,oneof=auto default flex scale priority"`
+	Model                string            `json:"model" validate:"required,max=256"`
+	Input                *Input            `json:"input,omitempty"`
+	Instructions         string            `json:"instructions,omitempty" validate:"max=65536"`
+	Tools                []Tool            `json:"tools,omitempty" validate:"max=128"`
+	ToolChoice           *ToolChoice       `json:"tool_choice,omitempty"`
+	Store                *bool             `json:"store,omitempty"`
+	Stream               bool              `json:"stream,omitempty"`
+	ParallelToolCalls    *bool             `json:"parallel_tool_calls,omitempty"`
+	ClientMetadata       map[string]string `json:"client_metadata,omitempty" validate:"max=16,dive,keys,max=64,endkeys,max=512"`
+	Generate             *bool             `json:"generate,omitempty"`
+	PreviousResponseID   string            `json:"previous_response_id,omitempty" validate:"max=256"`
+	Reasoning            *ReasoningConfig  `json:"reasoning,omitempty"`
+	Text                 *TextConfig       `json:"text,omitempty"`
+	StreamOptions        *StreamOptions    `json:"stream_options,omitempty"`
+	MaxOutputTokens      *int              `json:"max_output_tokens,omitempty" validate:"omitempty,min=1"`
+	Include              []string          `json:"include,omitempty" validate:"max=64,dive,max=128"`
+	Metadata             map[string]string `json:"metadata,omitempty" validate:"max=16,dive,keys,max=64,endkeys,max=512"`
+	PromptCacheKey       string            `json:"prompt_cache_key,omitempty" validate:"max=512"`
+	PromptCacheRetention string            `json:"prompt_cache_retention,omitempty" validate:"omitempty,oneof=in_memory 24h"`
+	ServiceTier          string            `json:"service_tier,omitempty" validate:"omitempty,oneof=auto default flex scale priority"`
 }
 
 func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
+	if len(data) > maxResponsesContractBytes {
+		return fmt.Errorf("decode public Responses request: body exceeds %d bytes", maxResponsesContractBytes)
+	}
 	*request = ResponseRequest{}
 	type responseRequest ResponseRequest
 	wire := struct {
 		*responseRequest
-		Input      json.RawMessage `json:"input"`
-		ToolChoice json.RawMessage `json:"tool_choice"`
-		Tools      json.RawMessage `json:"tools"`
-		Include    json.RawMessage `json:"include"`
-		Metadata   json.RawMessage `json:"metadata"`
+		Input              json.RawMessage `json:"input"`
+		ToolChoice         json.RawMessage `json:"tool_choice"`
+		Tools              json.RawMessage `json:"tools"`
+		Include            json.RawMessage `json:"include"`
+		Metadata           json.RawMessage `json:"metadata"`
+		ClientMetadata     json.RawMessage `json:"client_metadata"`
+		Background         json.RawMessage `json:"background"`
+		Conversation       json.RawMessage `json:"conversation"`
+		ContextManagement  json.RawMessage `json:"context_management"`
+		MaxToolCalls       json.RawMessage `json:"max_tool_calls"`
+		Moderation         json.RawMessage `json:"moderation"`
+		Prompt             json.RawMessage `json:"prompt"`
+		PromptCacheOptions json.RawMessage `json:"prompt_cache_options"`
+		SafetyIdentifier   json.RawMessage `json:"safety_identifier"`
+		Temperature        json.RawMessage `json:"temperature"`
+		TopLogprobs        json.RawMessage `json:"top_logprobs"`
+		TopP               json.RawMessage `json:"top_p"`
+		Truncation         json.RawMessage `json:"truncation"`
+		User               json.RawMessage `json:"user"`
 	}{
 		responseRequest: (*responseRequest)(request),
 	}
@@ -86,6 +111,35 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("decode public Responses request: multiple JSON values")
 		}
 		return fmt.Errorf("decode public Responses request: %w", err)
+	}
+	if wire.Metadata != nil && wire.ClientMetadata != nil {
+		return fmt.Errorf("public Responses request cannot contain both metadata and client_metadata")
+	}
+	unsupported := []struct {
+		field string
+		value json.RawMessage
+	}{
+		{"background", wire.Background},
+		{"conversation", wire.Conversation},
+		{"context_management", wire.ContextManagement},
+		{"max_tool_calls", wire.MaxToolCalls},
+		{"moderation", wire.Moderation},
+		{"prompt", wire.Prompt},
+		{"prompt_cache_options", wire.PromptCacheOptions},
+		{"safety_identifier", wire.SafetyIdentifier},
+		{"temperature", wire.Temperature},
+		{"top_logprobs", wire.TopLogprobs},
+		{"top_p", wire.TopP},
+		{"truncation", wire.Truncation},
+		{"user", wire.User},
+	}
+	for _, parameter := range unsupported {
+		if parameter.value != nil {
+			return fmt.Errorf("%w: %s", ErrUnsupportedParameter, parameter.field)
+		}
+	}
+	if request.StreamOptions != nil && request.StreamOptions.IncludeObfuscation != nil {
+		return fmt.Errorf("%w: stream_options.include_obfuscation", ErrUnsupportedParameter)
 	}
 	if wire.Input != nil {
 		if bytes.Equal(bytes.TrimSpace(wire.Input), []byte("null")) {
@@ -135,6 +189,13 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		request.Metadata = metadata
+	}
+	if wire.ClientMetadata != nil {
+		clientMetadata, err := decodeResponsesMetadata(wire.ClientMetadata, "decode public request client_metadata")
+		if err != nil {
+			return err
+		}
+		request.ClientMetadata = clientMetadata
 	}
 	return nil
 }
@@ -285,11 +346,19 @@ func decodeResponsesInputItemField(data []byte, field string, allowObject bool) 
 }
 
 func decodeResponsesTools(data []byte, field string) ([]Tool, error) {
+	return decodeResponsesToolsAtDepth(data, field, 0)
+}
+
+func decodeResponsesToolsAtDepth(data []byte, field string, depth int) ([]Tool, error) {
 	tools := make([]Tool, 0)
 	err := decodeResponsesArray(data, field, "tools", maxResponsesItemTools,
 		func(decoder *json.Decoder, index int) error {
+			var raw json.RawMessage
+			if err := decoder.Decode(&raw); err != nil {
+				return err
+			}
 			var tool Tool
-			if err := decoder.Decode(&tool); err != nil {
+			if err := decodePublicTool(raw, &tool, depth); err != nil {
 				return err
 			}
 			tools = append(tools, tool)
@@ -530,6 +599,51 @@ type Tool struct {
 	PartialImages     int             `json:"partial_images,omitempty"`
 	Quality           string          `json:"quality,omitempty"`
 	Size              string          `json:"size,omitempty"`
+	Tools             []Tool          `json:"tools,omitempty" validate:"max=128,dive"`
+}
+
+func (tool *Tool) UnmarshalJSON(data []byte) error {
+	return decodePublicTool(data, tool, 0)
+}
+
+func decodePublicTool(data []byte, tool *Tool, depth int) error {
+	if depth > 1 {
+		return fmt.Errorf("public namespace tool nesting exceeds one level")
+	}
+	*tool = Tool{}
+	type toolFields Tool
+	wire := struct {
+		*toolFields
+		Tools json.RawMessage `json:"tools"`
+	}{
+		toolFields: (*toolFields)(tool),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode public tool: multiple JSON values")
+		}
+		return fmt.Errorf("decode public tool: %w", err)
+	}
+	if wire.Tools != nil {
+		if tool.Type != "namespace" {
+			return fmt.Errorf("public tool tools is only valid for namespace tools")
+		}
+		if depth >= 1 {
+			return fmt.Errorf("public namespace tool nesting exceeds one level")
+		}
+		tools, err := decodeResponsesToolsAtDepth(wire.Tools, "decode public namespace tools", depth+1)
+		if err != nil {
+			return err
+		}
+		tool.Tools = tools
+	}
+	return nil
 }
 
 // ToolChoice selects a public Responses tool as a string or object.
@@ -602,11 +716,28 @@ func (choice *ToolChoice) UnmarshalJSON(data []byte) error {
 type ReasoningConfig struct {
 	Effort  string `json:"effort,omitempty"`
 	Summary string `json:"summary,omitempty"`
+	Context string `json:"context,omitempty"`
+}
+
+// StreamOptions carries provider-specific streaming options accepted by Codex.
+type StreamOptions struct {
+	ReasoningSummaryDelivery string `json:"reasoning_summary_delivery,omitempty"`
+	IncludeObfuscation       *bool  `json:"include_obfuscation,omitempty"`
 }
 
 // TextConfig carries public text output options.
 type TextConfig struct {
-	Verbosity string `json:"verbosity,omitempty"`
+	Verbosity string      `json:"verbosity,omitempty"`
+	Format    *TextFormat `json:"format,omitempty"`
+}
+
+// TextFormat is the structured-output format accepted by Responses.
+type TextFormat struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 // Response is the public OpenAI Responses result.
@@ -642,6 +773,8 @@ type OutputItem struct {
 	Action                   json.RawMessage `json:"action,omitempty"`
 	PendingSafetyChecks      []SafetyCheck   `json:"pending_safety_checks,omitempty"`
 	AcknowledgedSafetyChecks []SafetyCheck   `json:"acknowledged_safety_checks,omitempty"`
+	EncryptedContent         string          `json:"encrypted_content,omitempty"`
+	CreatedBy                string          `json:"created_by,omitempty"`
 }
 
 // ContentPart is one public output content part.

@@ -62,8 +62,10 @@ func TestResponsesTransportWebSocketSuccessPreservesEvents(t *testing.T) {
 func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 	messageReceived := make(chan string, 1)
 	betaReceived := make(chan string, 1)
+	liteReceived := make(chan string, 1)
 	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
 		betaReceived <- request.Header.Get(BetaHeader)
+		liteReceived <- request.Header.Get(ResponsesLiteHeader)
 		connection, err := transportUpgrader.Upgrade(writer, request, nil)
 		if err != nil {
 			return
@@ -79,7 +81,7 @@ func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 	defer server.Close()
 
 	transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
-	request := CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true}
+	request := CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true, ResponsesLite: true}
 	if _, err := transport.Do(context.Background(), request); err != nil {
 		t.Fatalf("transport.Do: %v", err)
 	}
@@ -90,6 +92,14 @@ func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("WebSocket handshake was not received")
+	}
+	select {
+	case got := <-liteReceived:
+		if got != "true" {
+			t.Fatalf("Responses Lite header = %q, want true", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket Lite header was not received")
 	}
 	select {
 	case got := <-messageReceived:

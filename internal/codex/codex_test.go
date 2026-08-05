@@ -22,6 +22,7 @@ func TestBuildHeadersMatchesCodexFixture(t *testing.T) {
 		ImageTurnID:         "image-turn-123",
 		Attestation:         `{"v":1,"s":0,"t":"opaque"}`,
 		FedRAMP:             true,
+		ResponsesLite:       true,
 	})
 	if err != nil {
 		t.Fatalf("BuildHeaders returned error: %v", err)
@@ -43,6 +44,7 @@ func TestBuildHeadersMatchesCodexFixture(t *testing.T) {
 		ImageTurnIDHeader:     "image-turn-123",
 		AttestationHeader:     `{"v":1,"s":0,"t":"opaque"}`,
 		FedRAMPHeader:         "true",
+		ResponsesLiteHeader:   "true",
 	}
 	for name, expected := range want {
 		if got := headers.Get(name); got != expected {

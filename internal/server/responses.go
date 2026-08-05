@@ -23,10 +23,12 @@ import (
 const (
 	responsesEndpoint        = "/v1/responses"
 	maxResponsesBodyBytes    = 4 * 1024 * 1024
-	maxResponsesJSONBytes    = 4 * 1024 * 1024
 	maxResponsesEventBytes   = 256 * 1024
+	maxResponsesJSONBytes    = 4 * 1024 * 1024
 	responsesErrorType       = "invalid_request_error"
 	responsesServerErrorType = "server_error"
+
+	responsesLiteClientMetadataKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
@@ -85,6 +87,11 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
+		responsesLiteHeader, err := responsesLiteHeaderValue(request.Header.Values(codex.ResponsesLiteHeader))
+		if err != nil {
+			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
+			return
+		}
 		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, responsesEndpoint, publicRequest.Model)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
@@ -109,6 +116,11 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
+		if responsesLiteHeader && privateRequest.ResponsesLite {
+			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
+			return
+		}
+		privateRequest.ResponsesLite = responsesLiteHeader || privateRequest.ResponsesLite
 
 		if publicRequest.Stream {
 			lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
@@ -192,26 +204,48 @@ func writeResponsesDecodeError(ctx iris.Context, err error, message string) {
 		writeResponsesError(ctx, http.StatusRequestEntityTooLarge, responsesErrorType, "request_too_large", "Request body is too large.")
 		return
 	}
+	if errors.Is(err, openai.ErrUnsupportedParameter) {
+		writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "unsupported_parameter", "The request uses an unsupported parameter.")
+		return
+	}
 	writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_json", message)
 }
 
 func privateResponseRequest(publicRequest openai.ResponseRequest) (codex.CodexResponseRequest, error) {
+	if publicRequest.Metadata != nil && publicRequest.ClientMetadata != nil {
+		return codex.CodexResponseRequest{}, errors.New("public Responses request cannot contain both metadata and client_metadata")
+	}
+	clientMetadata := publicRequest.Metadata
+	if publicRequest.ClientMetadata != nil {
+		clientMetadata = publicRequest.ClientMetadata
+	}
+	responsesLite, err := responsesLiteClientMetadataValue(publicRequest.ClientMetadata)
+	if err != nil {
+		return codex.CodexResponseRequest{}, err
+	}
 	privateRequest := codex.CodexResponseRequest{
-		Model:              publicRequest.Model,
-		Instructions:       publicRequest.Instructions,
-		Store:              publicRequest.Store,
-		Stream:             true,
-		ParallelToolCalls:  publicRequest.ParallelToolCalls,
-		ClientMetadata:     publicRequest.Metadata,
-		Include:            publicRequest.Include,
-		PreviousResponseID: publicRequest.PreviousResponseID,
-		PromptCacheKey:     publicRequest.PromptCacheKey,
-		ServiceTier:        publicRequest.ServiceTier,
+		Model:                publicRequest.Model,
+		Instructions:         publicRequest.Instructions,
+		Store:                publicRequest.Store,
+		Stream:               true,
+		ParallelToolCalls:    publicRequest.ParallelToolCalls,
+		ClientMetadata:       clientMetadata,
+		Generate:             publicRequest.Generate,
+		Include:              publicRequest.Include,
+		PreviousResponseID:   publicRequest.PreviousResponseID,
+		PromptCacheKey:       publicRequest.PromptCacheKey,
+		PromptCacheRetention: publicRequest.PromptCacheRetention,
+		ServiceTier:          publicRequest.ServiceTier,
+		ResponsesLite:        responsesLite,
+	}
+	if publicRequest.StreamOptions != nil {
+		privateRequest.StreamOptions = &codex.CodexStreamOptions{
+			ReasoningSummaryDelivery: publicRequest.StreamOptions.ReasoningSummaryDelivery,
+		}
 	}
 	if publicRequest.MaxOutputTokens != nil {
 		privateRequest.MaxOutputTokens = *publicRequest.MaxOutputTokens
 	}
-	var err error
 	privateRequest.Input, err = privateInput(publicRequest.Input)
 	if err != nil {
 		return codex.CodexResponseRequest{}, err
@@ -227,6 +261,27 @@ func privateResponseRequest(publicRequest openai.ResponseRequest) (codex.CodexRe
 	privateRequest.Reasoning = privateReasoning(publicRequest.Reasoning)
 	privateRequest.Text = privateText(publicRequest.Text)
 	return privateRequest, nil
+}
+
+func responsesLiteHeaderValue(values []string) (bool, error) {
+	if len(values) == 0 {
+		return false, nil
+	}
+	if len(values) != 1 || values[0] != "true" {
+		return false, errors.New("Responses Lite header must contain one true value")
+	}
+	return true, nil
+}
+
+func responsesLiteClientMetadataValue(metadata map[string]string) (bool, error) {
+	value, ok := metadata[responsesLiteClientMetadataKey]
+	if !ok {
+		return false, nil
+	}
+	if value != "true" {
+		return false, errors.New("Responses Lite client metadata must be true")
+	}
+	return true, nil
 }
 
 func privateInput(input *openai.Input) (*codex.CodexInput, error) {
@@ -298,14 +353,28 @@ func privateInput(input *openai.Input) (*codex.CodexInput, error) {
 }
 
 func privateTools(tools []openai.Tool) ([]codex.CodexTool, error) {
+	return privateToolsAtDepth(tools, 0)
+}
+
+func privateToolsAtDepth(tools []openai.Tool, depth int) ([]codex.CodexTool, error) {
 	if tools == nil {
 		return nil, nil
+	}
+	if depth > 1 {
+		return nil, errors.New("public namespace tool nesting exceeds one level")
 	}
 	result := make([]codex.CodexTool, 0, len(tools))
 	for _, tool := range tools {
 		var mask *codex.CodexInputImageMask
 		if tool.InputImageMask != nil {
 			mask = &codex.CodexInputImageMask{FileID: tool.InputImageMask.FileID, ImageURL: tool.InputImageMask.ImageURL}
+		}
+		nested, err := privateToolsAtDepth(tool.Tools, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if len(tool.Tools) != 0 && tool.Type != "namespace" {
+			return nil, errors.New("public tool tools is only valid for namespace tools")
 		}
 		result = append(result, codex.CodexTool{
 			Type:              tool.Type,
@@ -324,6 +393,7 @@ func privateTools(tools []openai.Tool) ([]codex.CodexTool, error) {
 			PartialImages:     tool.PartialImages,
 			Quality:           tool.Quality,
 			Size:              tool.Size,
+			Tools:             nested,
 		})
 	}
 	return result, nil
@@ -348,14 +418,24 @@ func privateReasoning(reasoning *openai.ReasoningConfig) *codex.CodexReasoningCo
 	if reasoning == nil {
 		return nil
 	}
-	return &codex.CodexReasoningConfig{Effort: reasoning.Effort, Summary: reasoning.Summary}
+	return &codex.CodexReasoningConfig{Effort: reasoning.Effort, Summary: reasoning.Summary, Context: reasoning.Context}
 }
 
 func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 	if text == nil {
 		return nil
 	}
-	return &codex.CodexTextConfig{Verbosity: text.Verbosity}
+	privateText := &codex.CodexTextConfig{Verbosity: text.Verbosity}
+	if text.Format != nil {
+		privateText.Format = &codex.CodexTextFormat{
+			Type:        text.Format.Type,
+			Name:        text.Format.Name,
+			Description: text.Format.Description,
+			Schema:      text.Format.Schema,
+			Strict:      text.Format.Strict,
+		}
+	}
+	return privateText
 }
 
 func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
@@ -671,8 +751,20 @@ func privateOutputJSON(raw []byte) bool {
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return true
 	}
-	for _, key := range []string{"output", "actions", "created_by", "phase"} {
+	for _, key := range []string{"output", "actions", "phase"} {
 		if _, found := item[key]; found {
+			return true
+		}
+	}
+	if _, found := item["created_by"]; found {
+		var itemType string
+		if err := json.Unmarshal(item["type"], &itemType); err != nil || itemType != "compaction" {
+			return true
+		}
+	}
+	if _, found := item["encrypted_content"]; found {
+		var itemType string
+		if err := json.Unmarshal(item["type"], &itemType); err != nil || itemType != "compaction" {
 			return true
 		}
 	}
@@ -759,6 +851,10 @@ func publicOutputItem(item *codex.CodexOutputItem) openai.OutputItem {
 		Action:                   item.Action,
 		PendingSafetyChecks:      publicSafetyChecks(item.PendingSafetyChecks),
 		AcknowledgedSafetyChecks: publicSafetyChecks(item.AcknowledgedSafetyChecks),
+	}
+	if item.Type == "compaction" {
+		output.EncryptedContent = item.EncryptedContent
+		output.CreatedBy = item.CreatedBy
 	}
 	return output
 }

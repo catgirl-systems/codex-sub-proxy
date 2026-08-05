@@ -21,9 +21,9 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/openai"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 	"github.com/go-playground/validator/v10"
-	sdk "github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
-	"github.com/openai/openai-go/packages/param"
+	sdk "github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
 )
 
 type typedImageReader struct {

@@ -39,10 +39,17 @@ const (
 )
 
 const (
-	maxCodexStreamLineBytes = 256 * 1024
-
+	maxCodexStreamLineBytes    = 256 * 1024
 	maxCodexStreamEvents       = 8192
 	maxCodexStreamPayloadBytes = 4 * 1024 * 1024
+
+	maxCodexInputItems    = 1024
+	maxCodexContentParts  = 1024
+	maxCodexItemTools     = 128
+	maxCodexInclude       = 64
+	maxCodexMetadata      = 16
+	maxCodexSafetyChecks  = maxCodexItemTools
+	maxCodexContractBytes = 4 * 1024 * 1024
 )
 
 // CodexStreamOptions controls provider-specific stream behavior.
@@ -89,6 +96,7 @@ type CodexResponseRequest struct {
 	Stream               bool                  `json:"stream,omitempty"`
 	ParallelToolCalls    *bool                 `json:"parallel_tool_calls,omitempty"`
 	ClientMetadata       map[string]string     `json:"client_metadata,omitempty"`
+	Generate             *bool                 `json:"generate,omitempty"`
 	Include              []string              `json:"include,omitempty"`
 	PreviousResponseID   string                `json:"previous_response_id,omitempty"`
 	Reasoning            *CodexReasoningConfig `json:"reasoning,omitempty"`
@@ -99,20 +107,46 @@ type CodexResponseRequest struct {
 	MaxOutputTokens      int                   `json:"max_output_tokens,omitempty"`
 	MaxCompletionTokens  int                   `json:"max_completion_tokens,omitempty"`
 	ServiceTier          string                `json:"service_tier,omitempty"`
+
+	// ResponsesLite requests the private Lite transport marker and is never
+	// serialized into the private request body.
+	ResponsesLite bool `json:"-"`
 }
 
 func (request *CodexResponseRequest) UnmarshalJSON(data []byte) error {
+	if len(data) > maxCodexContractBytes {
+		return fmt.Errorf("decode private Responses request: body exceeds %d bytes", maxCodexContractBytes)
+	}
 	*request = CodexResponseRequest{}
 	type codexResponseRequest CodexResponseRequest
 	wire := struct {
 		*codexResponseRequest
-		Input      json.RawMessage `json:"input"`
-		ToolChoice json.RawMessage `json:"tool_choice"`
+		Input          json.RawMessage `json:"input"`
+		ToolChoice     json.RawMessage `json:"tool_choice"`
+		Tools          json.RawMessage `json:"tools"`
+		Include        json.RawMessage `json:"include"`
+		ClientMetadata json.RawMessage `json:"client_metadata"`
+		Metadata       json.RawMessage `json:"metadata"`
 	}{
 		codexResponseRequest: (*codexResponseRequest)(request),
 	}
-	if err := json.Unmarshal(data, &wire); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
 		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode private Responses request: multiple JSON values")
+		}
+		return fmt.Errorf("decode private Responses request: %w", err)
+	}
+	if wire.Metadata != nil && wire.ClientMetadata != nil {
+		return fmt.Errorf("private Responses request cannot contain both metadata and client_metadata")
+	}
+	if wire.Metadata != nil {
+		return fmt.Errorf("private Responses request does not support metadata")
 	}
 	if wire.Input != nil {
 		if bytes.Equal(bytes.TrimSpace(wire.Input), []byte("null")) {
@@ -133,6 +167,35 @@ func (request *CodexResponseRequest) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		request.ToolChoice = &choice
+	}
+	if wire.Tools != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Tools), []byte("null")) {
+			request.Tools = nil
+		} else {
+			tools, err := decodeCodexTools(wire.Tools, "decode private request tools")
+			if err != nil {
+				return err
+			}
+			request.Tools = tools
+		}
+	}
+	if wire.Include != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Include), []byte("null")) {
+			request.Include = nil
+		} else {
+			include, err := decodeCodexInclude(wire.Include, "decode private request include")
+			if err != nil {
+				return err
+			}
+			request.Include = include
+		}
+	}
+	if wire.ClientMetadata != nil {
+		metadata, err := decodeCodexMetadata(wire.ClientMetadata, "decode private request client_metadata")
+		if err != nil {
+			return err
+		}
+		request.ClientMetadata = metadata
 	}
 	return nil
 }
@@ -168,15 +231,60 @@ func (input *CodexInput) UnmarshalJSON(data []byte) error {
 		*input = CodexInput{String: &text}
 		return nil
 	case '[':
-		var items []CodexInputItem
-		if err := json.Unmarshal(value, &items); err != nil {
-			return fmt.Errorf("decode private input array: %w", err)
+		items := make([]CodexInputItem, 0)
+		err := decodeCodexArray(value, "decode private input array", "input items", maxCodexInputItems,
+			func(decoder *json.Decoder, index int) error {
+				var item CodexInputItem
+				if err := decoder.Decode(&item); err != nil {
+					return err
+				}
+				items = append(items, item)
+				return nil
+			})
+		if err != nil {
+			return err
 		}
 		*input = CodexInput{Items: items}
 		return nil
 	default:
 		return fmt.Errorf("private input must be a string or array")
 	}
+}
+
+func decodeCodexArray(data []byte, field, itemName string, limit int, decode func(*json.Decoder, int) error) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok || delimiter != '[' {
+		return fmt.Errorf("%s: must be an array", field)
+	}
+	for index := 0; decoder.More(); index++ {
+		if index >= limit {
+			return fmt.Errorf("%s: too many %s (maximum %d)", field, itemName, limit)
+		}
+		if err := decode(decoder, index); err != nil {
+			return fmt.Errorf("%s %d: %w", field, index, err)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("%s: multiple JSON values", field)
+		}
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
 }
 
 // CodexInputItem is one private Responses input item. Content and output are
@@ -196,6 +304,122 @@ type CodexInputItem struct {
 	PendingSafetyChecks      []CodexSafetyCheck `json:"pending_safety_checks,omitempty"`
 	AcknowledgedSafetyChecks []CodexSafetyCheck `json:"acknowledged_safety_checks,omitempty"`
 	Tools                    []CodexTool        `json:"tools,omitempty"`
+}
+
+func (item *CodexInputItem) UnmarshalJSON(data []byte) error {
+	*item = CodexInputItem{}
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || value[0] != '{' {
+		return fmt.Errorf("private input item must be a JSON object")
+	}
+	type inputItem CodexInputItem
+	wire := struct {
+		*inputItem
+		PendingSafetyChecks      json.RawMessage `json:"pending_safety_checks"`
+		AcknowledgedSafetyChecks json.RawMessage `json:"acknowledged_safety_checks"`
+		Tools                    json.RawMessage `json:"tools"`
+	}{
+		inputItem: (*inputItem)(item),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode private input item: multiple JSON values")
+		}
+		return fmt.Errorf("decode private input item: %w", err)
+	}
+	if wire.PendingSafetyChecks != nil {
+		checks, err := decodeCodexSafetyChecks(wire.PendingSafetyChecks, "decode private input item pending_safety_checks")
+		if err != nil {
+			return err
+		}
+		item.PendingSafetyChecks = checks
+	}
+	if wire.AcknowledgedSafetyChecks != nil {
+		checks, err := decodeCodexSafetyChecks(wire.AcknowledgedSafetyChecks, "decode private input item acknowledged_safety_checks")
+		if err != nil {
+			return err
+		}
+		item.AcknowledgedSafetyChecks = checks
+	}
+	if wire.Tools != nil {
+		tools, err := decodeCodexTools(wire.Tools, "decode private input item tools")
+		if err != nil {
+			return err
+		}
+		item.Tools = tools
+	}
+	if err := decodeCodexInputItemField(item.Content, "decode private input item content", false); err != nil {
+		return err
+	}
+	if err := decodeCodexInputItemField(item.Output, "decode private input item output", true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeCodexInputContentParts(data []byte, field string) ([]CodexInputContent, error) {
+	parts := make([]CodexInputContent, 0)
+	err := decodeCodexArray(data, field, "content parts", maxCodexContentParts,
+		func(decoder *json.Decoder, index int) error {
+			var part CodexInputContent
+			if err := decoder.Decode(&part); err != nil {
+				return err
+			}
+			parts = append(parts, part)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+func decodeCodexInputItemField(data []byte, field string, allowObject bool) error {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return nil
+	}
+	switch value[0] {
+	case '"':
+		var text string
+		return decodeCodexJSONValue(value, &text, field)
+	case '[':
+		_, err := decodeCodexInputContentParts(value, field)
+		return err
+	case '{':
+		if !allowObject {
+			return fmt.Errorf("%s: must be a string or array", field)
+		}
+		var content CodexInputContent
+		return decodeCodexJSONValue(value, &content, field)
+	default:
+		if allowObject {
+			return fmt.Errorf("%s: must be a string, object, or array", field)
+		}
+		return fmt.Errorf("%s: must be a string or array", field)
+	}
+}
+
+func decodeCodexJSONValue(data []byte, target any, field string) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("%s: multiple JSON values", field)
+		}
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
 }
 
 // CodexInputContent is one private input content part.
@@ -228,6 +452,171 @@ type CodexTool struct {
 	PartialImages     int                  `json:"partial_images,omitempty"`
 	Quality           string               `json:"quality,omitempty"`
 	Size              string               `json:"size,omitempty"`
+	Tools             []CodexTool          `json:"tools,omitempty"`
+}
+
+func (tool *CodexTool) UnmarshalJSON(data []byte) error {
+	return decodeCodexTool(data, tool, 0)
+}
+
+func decodeCodexTool(data []byte, tool *CodexTool, depth int) error {
+	if depth > 1 {
+		return fmt.Errorf("private namespace tool nesting exceeds one level")
+	}
+	*tool = CodexTool{}
+	type toolFields CodexTool
+	wire := struct {
+		*toolFields
+		Tools json.RawMessage `json:"tools"`
+	}{
+		toolFields: (*toolFields)(tool),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode private tool: multiple JSON values")
+		}
+		return fmt.Errorf("decode private tool: %w", err)
+	}
+	if wire.Tools != nil {
+		if tool.Type != "namespace" {
+			return fmt.Errorf("private tool tools is only valid for namespace tools")
+		}
+		if depth >= 1 {
+			return fmt.Errorf("private namespace tool nesting exceeds one level")
+		}
+		tools, err := decodeCodexToolsAtDepth(wire.Tools, "decode private namespace tools", depth+1)
+		if err != nil {
+			return err
+		}
+		tool.Tools = tools
+	}
+	return nil
+}
+func decodeCodexTools(data []byte, field string) ([]CodexTool, error) {
+	return decodeCodexToolsAtDepth(data, field, 0)
+}
+
+func decodeCodexToolsAtDepth(data []byte, field string, depth int) ([]CodexTool, error) {
+	tools := make([]CodexTool, 0)
+	err := decodeCodexArray(data, field, "tools", maxCodexItemTools,
+		func(decoder *json.Decoder, index int) error {
+			var raw json.RawMessage
+			if err := decoder.Decode(&raw); err != nil {
+				return err
+			}
+			var tool CodexTool
+			if err := decodeCodexTool(raw, &tool, depth); err != nil {
+				return err
+			}
+			tools = append(tools, tool)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return tools, nil
+}
+
+func decodeCodexSafetyChecks(data []byte, field string) ([]CodexSafetyCheck, error) {
+	checks := make([]CodexSafetyCheck, 0)
+	err := decodeCodexArray(data, field, "safety checks", maxCodexSafetyChecks,
+		func(decoder *json.Decoder, index int) error {
+			var check CodexSafetyCheck
+			if err := decoder.Decode(&check); err != nil {
+				return err
+			}
+			checks = append(checks, check)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return checks, nil
+}
+
+func decodeCodexInclude(data []byte, field string) ([]string, error) {
+	include := make([]string, 0)
+	err := decodeCodexArray(data, field, "include entries", maxCodexInclude,
+		func(decoder *json.Decoder, index int) error {
+			var entry string
+			if err := decoder.Decode(&entry); err != nil {
+				return err
+			}
+			include = append(include, entry)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return include, nil
+}
+
+func decodeCodexMetadata(data []byte, field string) (map[string]string, error) {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 {
+		return nil, fmt.Errorf("%s: empty JSON value", field)
+	}
+	if bytes.Equal(value, []byte("null")) {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok || delimiter != '{' {
+		return nil, fmt.Errorf("%s: must be a JSON object", field)
+	}
+	metadata := make(map[string]string)
+	for index := 0; decoder.More(); index++ {
+		if index >= maxCodexMetadata {
+			return nil, fmt.Errorf("%s: too many metadata entries (maximum %d)", field, maxCodexMetadata)
+		}
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", field, err)
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: metadata key must be a string", field)
+		}
+		if _, exists := metadata[key]; exists {
+			return nil, fmt.Errorf("%s: duplicate metadata key %q", field, key)
+		}
+		valueToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%s %q: %w", field, key, err)
+		}
+		metadataValue, ok := valueToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s %q: metadata value must be a string", field, key)
+		}
+		metadata[key] = metadataValue
+	}
+	token, err = decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	delimiter, ok = token.(json.Delim)
+	if !ok || delimiter != '}' {
+		return nil, fmt.Errorf("%s: must end with a JSON object", field)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("%s: multiple JSON values", field)
+		}
+		return nil, fmt.Errorf("%s: %w", field, err)
+	}
+	return metadata, nil
 }
 
 // CodexToolChoice selects a private Responses tool as a string or object.
@@ -271,7 +660,16 @@ func (choice *CodexToolChoice) UnmarshalJSON(data []byte) error {
 			Type string `json:"type"`
 			Name string `json:"name,omitempty"`
 		}
-		if err := json.Unmarshal(value, &object); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&object); err != nil {
+			return fmt.Errorf("decode private tool choice object: %w", err)
+		}
+		var extra json.RawMessage
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("decode private tool choice object: multiple JSON values")
+			}
 			return fmt.Errorf("decode private tool choice object: %w", err)
 		}
 		if object.Type == "" {
@@ -342,6 +740,7 @@ type CodexOutputItem struct {
 	Actions                  json.RawMessage    `json:"actions,omitempty"`
 	PendingSafetyChecks      []CodexSafetyCheck `json:"pending_safety_checks,omitempty"`
 	AcknowledgedSafetyChecks []CodexSafetyCheck `json:"acknowledged_safety_checks,omitempty"`
+	EncryptedContent         string             `json:"encrypted_content,omitempty"`
 	CreatedBy                string             `json:"created_by,omitempty"`
 	Phase                    string             `json:"phase,omitempty"`
 }

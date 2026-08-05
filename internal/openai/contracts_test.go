@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"regexp"
 	"strings"
@@ -160,6 +161,106 @@ func TestPublicRequestUnionsRoundTripAndRejectInvalidForms(t *testing.T) {
 	}
 	if _, err := json.Marshal(ToolChoice{String: &text, Type: "function"}); err == nil {
 		t.Fatal("mixed tool choice union encoded")
+	}
+}
+
+func TestResponsesCompatibilityMatrix(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		check   func(*ResponseRequest) error
+		wantErr error
+	}{
+		{
+			name: "client metadata and generate",
+			raw:  `{"model":"gpt-5.6-sol","client_metadata":{"trace":"fixture"},"generate":false}`,
+			check: func(request *ResponseRequest) error {
+				if request.ClientMetadata["trace"] != "fixture" || request.Generate == nil || *request.Generate {
+					return errors.New("public client metadata/generate mapping changed")
+				}
+				return nil
+			},
+		},
+		{
+			name: "developer message and data image",
+			raw:  `{"model":"gpt-5.6-sol","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"fixture instructions"}]},{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}`,
+			check: func(request *ResponseRequest) error {
+				if request.Input == nil || len(request.Input.Items) != 2 ||
+					request.Input.Items[0].Role != "developer" ||
+					!strings.Contains(string(request.Input.Items[1].Content), "data:image/png;base64,AAAA") {
+					return errors.New("developer/image input mapping changed")
+				}
+				return nil
+			},
+		},
+		{
+			name: "additional tools namespace",
+			raw:  `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"shell","tools":[{"type":"function","name":"exec"}]}]}]}`,
+			check: func(request *ResponseRequest) error {
+				if request.Input == nil || len(request.Input.Items) != 1 || len(request.Input.Items[0].Tools) != 1 ||
+					request.Input.Items[0].Tools[0].Type != "namespace" ||
+					len(request.Input.Items[0].Tools[0].Tools) != 1 ||
+					request.Input.Items[0].Tools[0].Tools[0].Name != "exec" {
+					return errors.New("additional namespace tools mapping changed")
+				}
+				return nil
+			},
+		},
+		{
+			name: "reasoning context and text format",
+			raw:  `{"model":"gpt-5.6-sol","reasoning":{"effort":"high","context":"fixture-context"},"text":{"format":{"type":"json_schema","name":"fixture","schema":{"type":"object"},"strict":true}},"stream_options":{"reasoning_summary_delivery":"sequential_cutoff"}}`,
+			check: func(request *ResponseRequest) error {
+				if request.Reasoning == nil || request.Reasoning.Context != "fixture-context" ||
+					request.Text == nil || request.Text.Format == nil || request.Text.Format.Name != "fixture" ||
+					request.StreamOptions == nil || request.StreamOptions.ReasoningSummaryDelivery != "sequential_cutoff" {
+					return errors.New("reasoning/text/stream options mapping changed")
+				}
+				return nil
+			},
+		},
+		{
+			name:    "metadata and client metadata conflict",
+			raw:     `{"model":"gpt-5.6-sol","metadata":{"trace":"public"},"client_metadata":{"trace":"private"}}`,
+			wantErr: errors.New("both metadata and client_metadata"),
+		},
+		{
+			name:    "unsupported public parameter",
+			raw:     `{"model":"gpt-5.6-sol","background":true}`,
+			wantErr: ErrUnsupportedParameter,
+		},
+		{
+			name:    "unsupported stream obfuscation",
+			raw:     `{"model":"gpt-5.6-sol","stream_options":{"include_obfuscation":false}}`,
+			wantErr: ErrUnsupportedParameter,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request ResponseRequest
+			err := json.Unmarshal([]byte(test.raw), &request)
+			if test.wantErr != nil {
+				if err == nil || (!errors.Is(test.wantErr, ErrUnsupportedParameter) && !strings.Contains(err.Error(), test.wantErr.Error())) ||
+					(errors.Is(test.wantErr, ErrUnsupportedParameter) && !errors.Is(err, ErrUnsupportedParameter)) {
+					t.Fatalf("error = %v, want %v", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if err := test.check(&request); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	var response Response
+	if err := json.Unmarshal([]byte(`{"output":[{"type":"compaction","id":"cmp_1","encrypted_content":"fixture","created_by":"codex"}]}`), &response); err != nil {
+		t.Fatalf("decode compaction output: %v", err)
+	}
+	if len(response.Output) != 1 || response.Output[0].Type != "compaction" ||
+		response.Output[0].EncryptedContent != "fixture" || response.Output[0].CreatedBy != "codex" {
+		t.Fatalf("compaction output = %#v", response.Output)
 	}
 }
 
