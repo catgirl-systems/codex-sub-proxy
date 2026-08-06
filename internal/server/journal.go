@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
-	"gorm.io/gorm"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
+	"github.com/mattn/go-sqlite3"
+	"gorm.io/gorm"
 )
 
 const (
@@ -32,6 +34,12 @@ const (
 var (
 	// ErrJournalClosed indicates that the journal no longer accepts records.
 	ErrJournalClosed = errors.New("journal is closed")
+
+	// ErrSessionAffinityNotFound indicates that no nonexpired affinity exists.
+	ErrSessionAffinityNotFound = errors.New("session affinity not found")
+
+	// ErrSessionAffinityConflict indicates that another request owns a new session.
+	ErrSessionAffinityConflict = errors.New("session affinity account conflict")
 )
 
 // JournalRequestRecord stores the next sequence number and safe metadata for one request.
@@ -330,6 +338,35 @@ func (j *Journal) ResolvePreviousResponse(ctx context.Context, responseID, apiKe
 		Endpoint: request.Endpoint, Model: request.Model, APIKeyID: link.APIKeyID,
 		ConversationID: link.ConversationID, AccountID: link.AccountID,
 	}, nil
+}
+
+// ResolveSessionAffinity returns the account bound to one nonexpired session hash.
+func (j *Journal) ResolveSessionAffinity(ctx context.Context, apiKeyID, sessionHash string) (string, error) {
+	if ctx == nil {
+		return "", errors.New("session affinity context is nil")
+	}
+	if apiKeyID == "" || len(apiKeyID) > lifecycleMaxString ||
+		len(sessionHash) != sha256.Size*2 {
+		return "", ErrSessionAffinityNotFound
+	}
+	if _, err := hex.DecodeString(sessionHash); err != nil {
+		return "", ErrSessionAffinityNotFound
+	}
+	var affinity SessionAffinityRecord
+	err := j.db.WithContext(ctx).Where(
+		"api_key_id = ? AND session_hash = ? AND expires_at > ?",
+		apiKeyID, sessionHash, time.Now().UTC(),
+	).First(&affinity).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", ErrSessionAffinityNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve session affinity: %w", err)
+	}
+	if affinity.AccountID == "" {
+		return "", ErrSessionAffinityNotFound
+	}
+	return affinity.AccountID, nil
 }
 
 // LoadConversationInput reconstructs bounded input and output items from the
@@ -729,6 +766,15 @@ func ensureResponseLink(tx *gorm.DB, request JournalRequest, responseID string, 
 	return nil
 }
 
+func isUniqueSessionAffinityInsertError(err error) bool {
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique ||
+		sqliteErr.ExtendedCode == sqlite3.ErrConstraintPrimaryKey
+}
+
 func ensureSessionAffinity(tx *gorm.DB, apiKeyID, sessionHash, accountID string, createdAt, expiresAt time.Time) error {
 	if sessionHash == "" {
 		return nil
@@ -741,15 +787,23 @@ func ensureSessionAffinity(tx *gorm.DB, apiKeyID, sessionHash, accountID string,
 	err := tx.Where("api_key_id = ? AND session_hash = ?", apiKeyID, sessionHash).First(&existing).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		if err := tx.Create(&affinity).Error; err != nil {
-			return fmt.Errorf("store session affinity: %w", err)
+			if !isUniqueSessionAffinityInsertError(err) {
+				return fmt.Errorf("store session affinity: %w", err)
+			}
+			if lookupErr := tx.Where("api_key_id = ? AND session_hash = ?", apiKeyID, sessionHash).First(&existing).Error; lookupErr != nil {
+				if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("store session affinity: %w", err)
+				}
+				return fmt.Errorf("load concurrent session affinity: %w", lookupErr)
+			}
+		} else {
+			return nil
 		}
-		return nil
-	}
-	if err != nil {
+	} else if err != nil {
 		return fmt.Errorf("load session affinity: %w", err)
 	}
 	if existing.AccountID != accountID && existing.ExpiresAt.After(createdAt) {
-		return errors.New("session affinity account conflicts")
+		return fmt.Errorf("%w: account %q already owns the session", ErrSessionAffinityConflict, existing.AccountID)
 	}
 	if err := tx.Model(&SessionAffinityRecord{}).Where("api_key_id = ? AND session_hash = ?", apiKeyID, sessionHash).Updates(map[string]any{
 		"account_id": accountID, "created_at": createdAt, "updated_at": createdAt, "expires_at": expiresAt,

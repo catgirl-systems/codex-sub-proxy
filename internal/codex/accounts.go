@@ -30,7 +30,7 @@ func (config RequestHeaderConfig) Validate() error {
 		"session_id": config.SessionID,
 		"thread-id":  config.ThreadID,
 	} {
-		if len(value) > 256 || strings.ContainsAny(value, "\r\n") {
+		if len(value) > 256 || strings.ContainsAny(value, "\x00\r\n") {
 			return fmt.Errorf("%s header value is invalid", name)
 		}
 	}
@@ -41,6 +41,9 @@ func (config RequestHeaderConfig) Validate() error {
 type SelectionRequest struct {
 	Endpoint, Model, APIKeyID, PreviousResponseID string
 	Headers                                       RequestHeaderConfig
+	// AffinityAccountID is a best-effort session affinity hint. A broker must
+	// fall back to its selector when the hinted account is no longer usable.
+	AffinityAccountID string
 }
 
 // QuotaSnapshot is the bounded quota observation used by QuotaAwareSelector.

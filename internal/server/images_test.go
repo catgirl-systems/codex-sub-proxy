@@ -574,7 +574,8 @@ func TestInvalidRequestHeadersRejectBeforeJournalAndUpstream(t *testing.T) {
 		}
 		request.Header.Set("Authorization", "Bearer "+rawKey)
 		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set(codex.SessionIDHeader, strings.Repeat("x", 257))
+		request.Header.Set(codex.SessionIDHeader, "session")
+		request.Header.Set(codex.TurnMetadataHeader, `{"session_id":"session\u0000id"}`)
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)

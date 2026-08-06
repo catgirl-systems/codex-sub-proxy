@@ -23,7 +23,7 @@ func TestProfileBrokerRequiresUsableProfiles(t *testing.T) {
 	}
 }
 
-func TestProfileBrokerCompactBindsBeforeUnavailableTransport(t *testing.T) {
+func TestProfileBrokerUnavailableTransportDoesNotBind(t *testing.T) {
 	broker, err := NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
 		Account: codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
 		Images:  &codex.ImagesClient{},
@@ -39,8 +39,32 @@ func TestProfileBrokerCompactBindsBeforeUnavailableTransport(t *testing.T) {
 	if !errors.Is(err, ErrBrokerUnavailable) {
 		t.Fatalf("error = %v, want ErrBrokerUnavailable", err)
 	}
-	if result.Account.ID != "default" || bound.ID != "default" {
+	if result.Account.ID != "default" || bound.ID != "" {
 		t.Fatalf("compact account = %#v, bound = %#v", result.Account, bound)
+	}
+}
+
+func TestProfileBrokerStreamUnavailableDoesNotBind(t *testing.T) {
+	broker, err := NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
+		Account: codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
+		Images:  &codex.ImagesClient{},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bound codex.Account
+	result, err := broker.StreamResponses(context.Background(), codex.SelectionRequest{}, codex.CodexResponseRequest{}, "", func(account codex.Account) error {
+		bound = account
+		return nil
+	}, func(codex.CodexResponseStreamEvent) error {
+		t.Fatal("unavailable stream emitted an event")
+		return nil
+	})
+	if !errors.Is(err, ErrBrokerUnavailable) {
+		t.Fatalf("error = %v, want ErrBrokerUnavailable", err)
+	}
+	if result.Account.ID != "default" || bound.ID != "" {
+		t.Fatalf("stream account = %#v, bound = %#v", result.Account, bound)
 	}
 }
 

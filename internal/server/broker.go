@@ -16,8 +16,8 @@ type UpstreamBroker interface {
 	DoResponses(ctx context.Context, request codex.SelectionRequest, private codex.CodexResponseRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerResponsesResult, error)
 	StreamResponses(ctx context.Context, request codex.SelectionRequest, private codex.CodexResponseRequest, forcedAccountID string, bind func(codex.Account) error, onEvent func(codex.CodexResponseStreamEvent) error) (BrokerResponsesResult, error)
 	Compact(ctx context.Context, request codex.SelectionRequest, private codex.CodexCompactRequest, bind func(codex.Account) error) (BrokerCompactResult, error)
-	GenerateImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageGenerationRequest, bind func(codex.Account) error) (BrokerImageResult, error)
-	EditImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageEditRequest, bind func(codex.Account) error) (BrokerImageResult, error)
+	GenerateImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageGenerationRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerImageResult, error)
+	EditImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageEditRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerImageResult, error)
 }
 
 // BrokerResponsesResult is a Responses result together with its selected
@@ -103,6 +103,12 @@ func (broker *ProfileBroker) profile(ctx context.Context, request codex.Selectio
 		accounts = append(accounts, account)
 		accountByID[account.ID] = account
 	}
+	if forcedAccountID == "" {
+		affinityAccountID := strings.TrimSpace(request.AffinityAccountID)
+		if account, exists := accountByID[affinityAccountID]; exists && account.Usable(request.Model) {
+			forcedAccountID = affinityAccountID
+		}
+	}
 	if forcedAccountID = strings.TrimSpace(forcedAccountID); forcedAccountID != "" {
 		profile, ok := broker.profiles[forcedAccountID]
 		broker.mu.RUnlock()
@@ -172,11 +178,11 @@ func (broker *ProfileBroker) DoResponses(ctx context.Context, request codex.Sele
 	if err != nil {
 		return BrokerResponsesResult{}, err
 	}
-	if err := bindSelected(bind, profile.Account); err != nil {
-		return BrokerResponsesResult{Account: profile.Account}, err
-	}
 	if profile.Responses == nil {
 		return BrokerResponsesResult{Account: profile.Account}, fmt.Errorf("%w: selected profile Responses transport is unavailable", ErrBrokerUnavailable)
+	}
+	if err := bindSelected(bind, profile.Account); err != nil {
+		return BrokerResponsesResult{Account: profile.Account}, err
 	}
 	requestHeaders := broker.requestHeaders(request, profile.Account, &private)
 	result, err := profile.Responses.DoWithHeaders(ctx, private, requestHeaders)
@@ -188,11 +194,11 @@ func (broker *ProfileBroker) StreamResponses(ctx context.Context, request codex.
 	if err != nil {
 		return BrokerResponsesResult{}, err
 	}
-	if err := bindSelected(bind, profile.Account); err != nil {
-		return BrokerResponsesResult{Account: profile.Account}, err
-	}
 	if profile.Responses == nil {
 		return BrokerResponsesResult{Account: profile.Account}, fmt.Errorf("%w: selected profile Responses transport is unavailable", ErrBrokerUnavailable)
+	}
+	if err := bindSelected(bind, profile.Account); err != nil {
+		return BrokerResponsesResult{Account: profile.Account}, err
 	}
 	requestHeaders := broker.requestHeaders(request, profile.Account, &private)
 	err = profile.Responses.StreamWithHeaders(ctx, private, requestHeaders, onEvent)
@@ -204,11 +210,11 @@ func (broker *ProfileBroker) Compact(ctx context.Context, request codex.Selectio
 	if err != nil {
 		return BrokerCompactResult{}, err
 	}
-	if err := bindSelected(bind, profile.Account); err != nil {
-		return BrokerCompactResult{Account: profile.Account}, err
-	}
 	if profile.Responses == nil {
 		return BrokerCompactResult{Account: profile.Account}, fmt.Errorf("%w: selected profile Responses transport is unavailable", ErrBrokerUnavailable)
+	}
+	if err := bindSelected(bind, profile.Account); err != nil {
+		return BrokerCompactResult{Account: profile.Account}, err
 	}
 	headers := request.Headers
 	headers.ResponsesLiteRequested = headers.ResponsesLiteRequested || profile.Account.ResponsesLite || private.ResponsesLite
@@ -217,31 +223,31 @@ func (broker *ProfileBroker) Compact(ctx context.Context, request codex.Selectio
 	return BrokerCompactResult{Result: result, Account: profile.Account}, err
 }
 
-func (broker *ProfileBroker) GenerateImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageGenerationRequest, bind func(codex.Account) error) (BrokerImageResult, error) {
-	profile, err := broker.profile(ctx, request, "")
+func (broker *ProfileBroker) GenerateImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageGenerationRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerImageResult, error) {
+	profile, err := broker.profile(ctx, request, forcedAccountID)
 	if err != nil {
 		return BrokerImageResult{}, err
 	}
-	if err := bindSelected(bind, profile.Account); err != nil {
-		return BrokerImageResult{Account: profile.Account}, err
-	}
 	if profile.Images == nil {
 		return BrokerImageResult{Account: profile.Account}, fmt.Errorf("%w: selected profile Images client is unavailable", ErrBrokerUnavailable)
+	}
+	if err := bindSelected(bind, profile.Account); err != nil {
+		return BrokerImageResult{Account: profile.Account}, err
 	}
 	result, err := profile.Images.GenerateWithHeaders(ctx, private, request.Headers)
 	return BrokerImageResult{Result: result, Account: profile.Account}, err
 }
 
-func (broker *ProfileBroker) EditImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageEditRequest, bind func(codex.Account) error) (BrokerImageResult, error) {
-	profile, err := broker.profile(ctx, request, "")
+func (broker *ProfileBroker) EditImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageEditRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerImageResult, error) {
+	profile, err := broker.profile(ctx, request, forcedAccountID)
 	if err != nil {
 		return BrokerImageResult{}, err
 	}
-	if err := bindSelected(bind, profile.Account); err != nil {
-		return BrokerImageResult{Account: profile.Account}, err
-	}
 	if profile.Images == nil {
 		return BrokerImageResult{Account: profile.Account}, fmt.Errorf("%w: selected profile Images client is unavailable", ErrBrokerUnavailable)
+	}
+	if err := bindSelected(bind, profile.Account); err != nil {
+		return BrokerImageResult{Account: profile.Account}, err
 	}
 	result, err := profile.Images.EditWithHeaders(ctx, private, request.Headers)
 	return BrokerImageResult{Result: result, Account: profile.Account}, err

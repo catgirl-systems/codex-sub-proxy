@@ -97,6 +97,11 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, broker UpstreamBr
 			writeAPIKeyError(ctx, err)
 			return
 		}
+		sessionHash, affinityAccountID, affinityErr := resolveSessionAffinity(request.Context(), journal, principal.ID, requestHeaders)
+		if affinityErr != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
+			return
+		}
 		if broker == nil {
 			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -106,23 +111,27 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, broker UpstreamBr
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
-		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+		journalMetadata := JournalRequestMetadata{
 			Endpoint: imagesGenerationsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-		}, journalInput)
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
 		if err != nil {
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
 		defer finishJournalRequest(ctx, journal, journalRequestID)
 		selection := codex.SelectionRequest{
-			Endpoint: imagesGenerationsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-			Headers: requestHeaders,
+			Endpoint:          imagesGenerationsEndpoint,
+			Model:             publicRequest.Model,
+			APIKeyID:          principal.ID,
+			Headers:           requestHeaders,
+			AffinityAccountID: affinityAccountID,
 		}
 		bindAccount := func(account codex.Account) error {
 			if journal == nil {
 				return nil
 			}
-			return journal.BindAccount(request.Context(), journalRequestID.ID, account.ID, "")
+			return journal.BindAccount(request.Context(), journalRequestID.ID, account.ID, sessionAffinityHashForAccount(sessionHash, affinityAccountID, account.ID))
 		}
 		lease, err := admitRequestQuota(request.Context(), quota, principal, imageQuotaRequest(principal.Policy, publicRequest.N))
 		if err != nil {
@@ -148,9 +157,31 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, broker UpstreamBr
 			Moderation:        publicRequest.Moderation,
 			User:              publicRequest.User,
 		}
-		brokerResult, err := broker.GenerateImage(request.Context(), selection, imageRequest, bindAccount)
+		forcedAccountID := ""
+		retriedAffinity := false
+		var brokerResult BrokerImageResult
+		for {
+			attemptContext, cancel := context.WithCancel(request.Context())
+			brokerResult, err = broker.GenerateImage(attemptContext, selection, imageRequest, forcedAccountID, bindAccount)
+			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
+			cancel()
+			if !retry {
+				break
+			}
+			retriedAffinity = true
+			winner, resolveErr := journal.ResolveSessionAffinity(request.Context(), principal.ID, sessionHash)
+			if resolveErr != nil {
+				err = resolveErr
+				break
+			}
+			forcedAccountID = winner
+			selection.AffinityAccountID = ""
+		}
 		result := brokerResult.Result
 		if err != nil {
+			if request.Context().Err() != nil {
+				return
+			}
 			writeImagesDispatchError(ctx, err)
 			return
 		}
@@ -260,8 +291,9 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, 
 			writeAPIKeyError(ctx, err)
 			return
 		}
-		if broker == nil {
-			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
+		sessionHash, affinityAccountID, affinityErr := resolveSessionAffinity(request.Context(), journal, principal.ID, requestHeaders)
+		if affinityErr != nil {
+			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
 		journalInput, err := json.Marshal(publicRequest)
@@ -269,9 +301,14 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, 
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
 		}
-		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+		if broker == nil {
+			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
+			return
+		}
+		journalMetadata := JournalRequestMetadata{
 			Endpoint: imagesEditsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-		}, journalInput)
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
 		if err != nil {
 			writeImagesError(ctx, http.StatusInternalServerError, "internal_error", "Internal server error.")
 			return
@@ -288,14 +325,17 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, 
 			return
 		}
 		selection := codex.SelectionRequest{
-			Endpoint: imagesEditsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-			Headers: requestHeaders,
+			Endpoint:          imagesEditsEndpoint,
+			Model:             publicRequest.Model,
+			APIKeyID:          principal.ID,
+			Headers:           requestHeaders,
+			AffinityAccountID: affinityAccountID,
 		}
 		bindAccount := func(account codex.Account) error {
 			if journal == nil {
 				return nil
 			}
-			return journal.BindAccount(request.Context(), journalRequestID.ID, account.ID, "")
+			return journal.BindAccount(request.Context(), journalRequestID.ID, account.ID, sessionAffinityHashForAccount(sessionHash, affinityAccountID, account.ID))
 		}
 		lease, err := admitRequestQuota(request.Context(), quota, principal, imageQuotaRequest(principal.Policy, publicRequest.N))
 		if err != nil {
@@ -321,9 +361,31 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, 
 			OutputFormat:      publicRequest.OutputFormat,
 			User:              publicRequest.User,
 		}
-		brokerResult, err := broker.EditImage(request.Context(), selection, imageRequest, bindAccount)
+		forcedAccountID := ""
+		retriedAffinity := false
+		var brokerResult BrokerImageResult
+		for {
+			attemptContext, cancel := context.WithCancel(request.Context())
+			brokerResult, err = broker.EditImage(attemptContext, selection, imageRequest, forcedAccountID, bindAccount)
+			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
+			cancel()
+			if !retry {
+				break
+			}
+			retriedAffinity = true
+			winner, resolveErr := journal.ResolveSessionAffinity(request.Context(), principal.ID, sessionHash)
+			if resolveErr != nil {
+				err = resolveErr
+				break
+			}
+			forcedAccountID = winner
+			selection.AffinityAccountID = ""
+		}
 		result := brokerResult.Result
 		if err != nil {
+			if request.Context().Err() != nil {
+				return
+			}
 			writeImagesDispatchError(ctx, err)
 			return
 		}

@@ -200,6 +200,11 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, broker UpstreamBro
 			writeAPIKeyError(ctx, err)
 			return
 		}
+		sessionHash, affinityAccountID, affinityErr := resolveSessionAffinity(requestContext, journal, principal.ID, requestHeaders)
+		if affinityErr != nil {
+			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
 		if broker == nil {
 			writeChatError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
 			return
@@ -209,9 +214,10 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, broker UpstreamBro
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
 		}
-		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, JournalRequestMetadata{
+		journalMetadata := JournalRequestMetadata{
 			Endpoint: chatCompletionsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-		}, journalInput)
+		}
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
 		if err != nil {
 			writeChatError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
 			return
@@ -227,14 +233,17 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, broker UpstreamBro
 			return
 		}
 		selection := codex.SelectionRequest{
-			Endpoint: chatCompletionsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-			Headers: requestHeaders,
+			Endpoint:          chatCompletionsEndpoint,
+			Model:             publicRequest.Model,
+			APIKeyID:          principal.ID,
+			Headers:           requestHeaders,
+			AffinityAccountID: affinityAccountID,
 		}
 		bindAccount := func(account codex.Account) error {
 			if journal == nil {
 				return nil
 			}
-			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, "")
+			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, sessionAffinityHashForAccount(sessionHash, affinityAccountID, account.ID))
 		}
 		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxCompletionTokens))
 		if err != nil {
@@ -248,7 +257,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, broker UpstreamBro
 		}
 		defer func() { _ = lease.release("request ended") }()
 		if publicRequest.Stream {
-			serveChatStream(ctx, requestContext, broker, selection, privateRequest, publicRequest.Model, includeUsage, bindAccount, lease)
+			serveChatStream(ctx, requestContext, broker, selection, privateRequest, publicRequest.Model, includeUsage, sessionHash, principal.ID, journal, bindAccount, lease)
 			return
 		}
 
@@ -257,7 +266,25 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, broker UpstreamBro
 			return
 		}
 		setTransportOutcome(ctx, "http")
-		brokerResult, err := broker.DoResponses(requestContext, selection, privateRequest, "", bindAccount)
+		forcedAccountID := ""
+		retriedAffinity := false
+		var brokerResult BrokerResponsesResult
+		for {
+			attemptContext, cancel := context.WithCancel(requestContext)
+			brokerResult, err = broker.DoResponses(attemptContext, selection, privateRequest, forcedAccountID, bindAccount)
+			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
+			cancel()
+			if !retry {
+				break
+			}
+			retriedAffinity = true
+			winner, resolveErr := journal.ResolveSessionAffinity(requestContext, principal.ID, sessionHash)
+			if resolveErr != nil {
+				err = resolveErr
+				break
+			}
+			forcedAccountID = winner
+		}
 		result := brokerResult.Result
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
@@ -1080,30 +1107,48 @@ func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 	return result, nil
 }
 
-func serveChatStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, model string, includeUsage bool, bindAccount func(codex.Account) error, lease *quotaLease) {
+func serveChatStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, model string, includeUsage bool, sessionHash, apiKeyID string, journal *Journal, bindAccount func(codex.Account) error, lease *quotaLease) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
-	writer.Header().Set("Content-Type", "text/event-stream")
-	writer.Header().Set("Cache-Control", "no-cache, no-store")
-	writer.Header().Set("Connection", "keep-alive")
-	writer.Header().Set("X-Accel-Buffering", "no")
-	flusher, ok := writer.(http.Flusher)
+	baseFlusher, ok := writer.(http.Flusher)
 	if !ok {
 		markJournalTerminal(ctx, requestStatusFailed, "")
 		return
 	}
-	baseFlusher := flusher
-	writer.WriteHeader(http.StatusOK)
-	flusher.Flush()
-	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
+	deferredWriter, ok := newDeferredSSEWriter(writer)
+	if !ok {
 		markJournalTerminal(ctx, requestStatusFailed, "")
 		return
 	}
+	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		markJournalTerminal(ctx, requestStatusFailed, "")
+		return
+	}
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache, no-store")
+	writer.Header().Set("Connection", "keep-alive")
+	writer.Header().Set("X-Accel-Buffering", "no")
+	writer = deferredWriter
+	var flusher http.Flusher = deferredWriter
 	var journalWriter *journalSSEWriter
 	if wrapped, journalFlusher := newJournalSSEWriter(ctx, writer); wrapped != nil {
 		journalWriter = wrapped
 		writer = wrapped
 		flusher = journalFlusher
+	}
+	bindForStream := func(account codex.Account) error {
+		if bindAccount != nil {
+			if err := bindAccount(account); err != nil {
+				return err
+			}
+		}
+		if !deferredWriter.committed {
+			if err := deferredWriter.commit(http.StatusOK); err != nil {
+				return err
+			}
+			flusher.Flush()
+		}
+		return nil
 	}
 	reportJournalFailure := func() bool {
 		if journalWriter == nil || journalWriter.failed == nil {
@@ -1118,14 +1163,41 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, broker Up
 		return true
 	}
 
-	state := newChatStreamState(model, includeUsage, writer, flusher)
+	var state *chatStreamState
+	forcedAccountID := ""
+	retriedAffinity := false
+	wroteOutput := false
 	setTransportOutcome(ctx, "websocket")
-	state.lease = lease
-	_, streamErr := broker.StreamResponses(requestContext, selection, privateRequest, "", bindAccount, state.event)
+	var streamErr error
+	for {
+		state = newChatStreamState(model, includeUsage, writer, flusher)
+		state.lease = lease
+		attemptContext, cancel := context.WithCancel(requestContext)
+		_, streamErr = broker.StreamResponses(attemptContext, selection, privateRequest, forcedAccountID, bindForStream, state.event)
+		wroteOutput = wroteOutput || state.wroteOutput
+		retry := !retriedAffinity && canRetrySessionAffinity(streamErr, sessionHash, forcedAccountID, wroteOutput) && journal != nil
+		cancel()
+		if !retry {
+			break
+		}
+		retriedAffinity = true
+		winner, resolveErr := journal.ResolveSessionAffinity(requestContext, apiKeyID, sessionHash)
+		if resolveErr != nil {
+			streamErr = resolveErr
+			break
+		}
+		forcedAccountID = winner
+		selection.AffinityAccountID = ""
+	}
 	if requestContext.Err() != nil {
 		return
 	}
 	if reportJournalFailure() {
+		return
+	}
+	if !deferredWriter.committed && streamErr != nil {
+		status, responseError := responsesError(streamErr)
+		writeChatError(ctx, status, responseError.Type, responseError.Code, responseError.Message)
 		return
 	}
 	if state.writeErr != nil {
@@ -1191,6 +1263,7 @@ type chatStreamState struct {
 	response     *codex.CodexResponse
 	failure      error
 	writeErr     error
+	wroteOutput  bool
 	tools        []*chatToolStreamState
 	aliases      map[string]*chatToolStreamState
 }
@@ -1660,7 +1733,11 @@ func (state *chatStreamState) writeChunk(chunk chatCompletionChunk) error {
 	if len(payload) > maxResponsesEventBytes {
 		return errors.New("chat stream payload is too large")
 	}
-	return writeResponsesSSERecord(state.writer, state.flusher, payload)
+	if err := writeResponsesSSERecord(state.writer, state.flusher, payload); err != nil {
+		return err
+	}
+	state.wroteOutput = true
+	return nil
 }
 
 func (state *chatStreamState) writeError(err error) error {

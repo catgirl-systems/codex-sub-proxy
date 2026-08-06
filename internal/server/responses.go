@@ -26,6 +26,7 @@ const (
 	maxResponsesBodyBytes    = 4 * 1024 * 1024
 	maxResponsesEventBytes   = 256 * 1024
 	maxResponsesJSONBytes    = 4 * 1024 * 1024
+	maxTurnMetadataBytes     = 4096
 	responsesErrorType       = "invalid_request_error"
 	responsesServerErrorType = "server_error"
 
@@ -111,6 +112,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 		journalMetadata := JournalRequestMetadata{
 			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
 		}
+		var sessionHash, affinityAccountID string
 		if publicRequest.PreviousResponseID != "" {
 			if journal == nil {
 				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
@@ -128,6 +130,13 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 			journalMetadata.ConversationID = resolved.ConversationID
 			journalMetadata.AccountID = resolved.AccountID
 			journalMetadata.PreviousResponseID = publicRequest.PreviousResponseID
+		} else {
+			var affinityErr error
+			sessionHash, affinityAccountID, affinityErr = resolveSessionAffinity(requestContext, journal, principal.ID, requestHeaders)
+			if affinityErr != nil {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				return
+			}
 		}
 		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
 		if err != nil {
@@ -151,15 +160,21 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 		privateRequest.ResponsesLite = responsesLiteHeader || privateRequest.ResponsesLite
 		selection := codex.SelectionRequest{
 			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-			Headers: requestHeaders,
+			PreviousResponseID: publicRequest.PreviousResponseID,
+			Headers:            requestHeaders,
+			AffinityAccountID:  affinityAccountID,
 		}
 		bindAccount := func(account codex.Account) error {
 			if journal == nil {
 				return nil
 			}
-			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, "")
+			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, sessionAffinityHashForAccount(sessionHash, affinityAccountID, account.ID))
 		}
 
+		continuationAccountID := ""
+		if publicRequest.PreviousResponseID != "" {
+			continuationAccountID = journalRequestID.AccountID
+		}
 		if publicRequest.Stream {
 			lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
 			if err != nil {
@@ -172,7 +187,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 				return
 			}
 			defer func() { _ = lease.release("request ended") }()
-			serveResponsesStream(ctx, requestContext, broker, selection, privateRequest, journalRequestID.AccountID, bindAccount, lease, artifacts, artifactRequired)
+			serveResponsesStream(ctx, requestContext, broker, selection, privateRequest, continuationAccountID, sessionHash, principal.ID, journal, bindAccount, lease, artifacts, artifactRequired)
 			return
 		}
 		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
@@ -192,7 +207,25 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 		}
 
 		setTransportOutcome(ctx, "http")
-		brokerResult, err := broker.DoResponses(requestContext, selection, privateRequest, journalRequestID.AccountID, bindAccount)
+		forcedAccountID := continuationAccountID
+		retriedAffinity := false
+		var brokerResult BrokerResponsesResult
+		for {
+			attemptContext, cancel := context.WithCancel(requestContext)
+			brokerResult, err = broker.DoResponses(attemptContext, selection, privateRequest, forcedAccountID, bindAccount)
+			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
+			cancel()
+			if !retry {
+				break
+			}
+			retriedAffinity = true
+			winner, resolveErr := journal.ResolveSessionAffinity(requestContext, principal.ID, sessionHash)
+			if resolveErr != nil {
+				err = resolveErr
+				break
+			}
+			forcedAccountID = winner
+		}
 		result := brokerResult.Result
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
@@ -312,6 +345,67 @@ func responsesLiteHeaderValue(values []string) (bool, error) {
 	return true, nil
 }
 
+type turnMetadataIdentity struct {
+	SessionID string `json:"session_id"`
+	ThreadID  string `json:"thread_id"`
+}
+
+func decodeTurnMetadataIdentity(raw string) (turnMetadataIdentity, error) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return turnMetadataIdentity{}, err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok || delimiter != '{' {
+		return turnMetadataIdentity{}, errors.New("turn metadata is not an object")
+	}
+	seen := make(map[string]struct{}, 4)
+	var metadata turnMetadataIdentity
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return turnMetadataIdentity{}, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return turnMetadataIdentity{}, errors.New("turn metadata key is invalid")
+		}
+		normalizedKey := strings.ToLower(key)
+		if _, exists := seen[normalizedKey]; exists {
+			return turnMetadataIdentity{}, errors.New("turn metadata contains duplicate keys")
+		}
+		seen[normalizedKey] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return turnMetadataIdentity{}, err
+		}
+		switch normalizedKey {
+		case "session_id":
+			if len(value) == 0 || bytes.Equal(bytes.TrimSpace(value), []byte("null")) || json.Unmarshal(value, &metadata.SessionID) != nil {
+				return turnMetadataIdentity{}, errors.New("turn metadata session_id is invalid")
+			}
+		case "thread_id":
+			if len(value) == 0 || bytes.Equal(bytes.TrimSpace(value), []byte("null")) || json.Unmarshal(value, &metadata.ThreadID) != nil {
+				return turnMetadataIdentity{}, errors.New("turn metadata thread_id is invalid")
+			}
+		}
+	}
+	token, err = decoder.Token()
+	if err != nil {
+		return turnMetadataIdentity{}, err
+	}
+	delimiter, ok = token.(json.Delim)
+	if !ok || delimiter != '}' {
+		return turnMetadataIdentity{}, errors.New("turn metadata object is invalid")
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return turnMetadataIdentity{}, errors.New("turn metadata has trailing data")
+	}
+	return metadata, nil
+}
+
 func requestHeaderConfig(headers http.Header) (codex.RequestHeaderConfig, error) {
 	lite, err := responsesLiteHeaderValue(headerValuesEqualFold(headers, codex.ResponsesLiteHeader))
 	if err != nil {
@@ -325,7 +419,46 @@ func requestHeaderConfig(headers http.Header) (codex.RequestHeaderConfig, error)
 	if err != nil {
 		return codex.RequestHeaderConfig{}, err
 	}
+	metadataValues := headerValuesEqualFold(headers, codex.TurnMetadataHeader)
+	if len(metadataValues) > 1 {
+		return codex.RequestHeaderConfig{}, errors.New("turn metadata header must contain one value")
+	}
+	if len(metadataValues) == 1 {
+		rawMetadata := strings.TrimSpace(metadataValues[0])
+		if len(rawMetadata) == 0 || len(rawMetadata) > maxTurnMetadataBytes || rawMetadata[0] != '{' {
+			return codex.RequestHeaderConfig{}, errors.New("turn metadata header is invalid")
+		}
+		metadata, err := decodeTurnMetadataIdentity(rawMetadata)
+		if err != nil {
+			return codex.RequestHeaderConfig{}, errors.New("turn metadata header is invalid")
+		}
+		if metadata.SessionID, err = boundedIdentityValue("session_id", metadata.SessionID); err != nil {
+			return codex.RequestHeaderConfig{}, err
+		}
+		if metadata.ThreadID, err = boundedIdentityValue("thread-id", metadata.ThreadID); err != nil {
+			return codex.RequestHeaderConfig{}, err
+		}
+		if sessionID != "" && metadata.SessionID != "" && sessionID != metadata.SessionID {
+			return codex.RequestHeaderConfig{}, errors.New("session_id and turn metadata disagree")
+		}
+		if threadID != "" && metadata.ThreadID != "" && threadID != metadata.ThreadID {
+			return codex.RequestHeaderConfig{}, errors.New("thread-id and turn metadata disagree")
+		}
+		if sessionID == "" {
+			sessionID = metadata.SessionID
+		}
+		if threadID == "" {
+			threadID = metadata.ThreadID
+		}
+	}
 	return codex.RequestHeaderConfig{SessionID: sessionID, ThreadID: threadID, ResponsesLiteRequested: lite}, nil
+}
+
+func boundedIdentityValue(name, value string) (string, error) {
+	if len(value) > 256 || strings.ContainsAny(value, "\x00\r\n") {
+		return "", fmt.Errorf("%s header is invalid", name)
+	}
+	return value, nil
 }
 
 func boundedRequestHeader(headers http.Header, name string) (string, error) {
@@ -333,7 +466,7 @@ func boundedRequestHeader(headers http.Header, name string) (string, error) {
 	if len(values) == 0 {
 		return "", nil
 	}
-	if len(values) != 1 || len(values[0]) > 256 || strings.ContainsAny(values[0], "\r\n") {
+	if len(values) != 1 || len(values[0]) > 256 || strings.ContainsAny(values[0], "\x00\r\n") {
 		return "", fmt.Errorf("%s header is invalid", name)
 	}
 	return values[0], nil
@@ -514,83 +647,123 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 	return privateText
 }
 
-func serveResponsesStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, forcedAccountID string, bindAccount func(codex.Account) error, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
+func serveResponsesStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, forcedAccountID, sessionHash, apiKeyID string, journal *Journal, bindAccount func(codex.Account) error, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
-	writer.Header().Set("Content-Type", "text/event-stream")
-	writer.Header().Set("Cache-Control", "no-cache, no-store")
-	writer.Header().Set("Connection", "keep-alive")
-	writer.Header().Set("X-Accel-Buffering", "no")
-	flusher, ok := writer.(http.Flusher)
+	baseFlusher, ok := writer.(http.Flusher)
 	if !ok {
 		markJournalTerminal(ctx, requestStatusFailed, "")
 		return
 	}
-	baseFlusher := flusher
-	writer.WriteHeader(http.StatusOK)
-	flusher.Flush()
-	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil {
+	deferredWriter, ok := newDeferredSSEWriter(writer)
+	if !ok {
 		markJournalTerminal(ctx, requestStatusFailed, "")
 		return
 	}
+	if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		markJournalTerminal(ctx, requestStatusFailed, "")
+		return
+	}
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache, no-store")
+	writer.Header().Set("Connection", "keep-alive")
+	writer.Header().Set("X-Accel-Buffering", "no")
+	writer = deferredWriter
+	var flusher http.Flusher = deferredWriter
 	var journalWriter *journalSSEWriter
 	if wrapped, journalFlusher := newJournalSSEWriter(ctx, writer); wrapped != nil {
 		journalWriter = wrapped
 		writer = wrapped
 		flusher = journalFlusher
 	}
+	bindForStream := func(account codex.Account) error {
+		if bindAccount != nil {
+			if err := bindAccount(account); err != nil {
+				return err
+			}
+		}
+		if !deferredWriter.committed {
+			if err := deferredWriter.commit(http.StatusOK); err != nil {
+				return err
+			}
+			flusher.Flush()
+		}
+		return nil
+	}
 
 	terminalWritten := false
 	lastSequence := -1
+	wroteOutput := false
+	retriedAffinity := false
 	setTransportOutcome(ctx, "websocket")
-	_, streamErr := broker.StreamResponses(requestContext, selection, privateRequest, forcedAccountID, bindAccount, func(event codex.CodexResponseStreamEvent) error {
-		if requestContext.Err() != nil {
-			return requestContext.Err()
-		}
-		if event.SequenceNumber < 0 || event.SequenceNumber == math.MaxInt {
-			return fmt.Errorf("invalid upstream sequence number %d", event.SequenceNumber)
-		}
-		if event.SequenceNumber > lastSequence {
-			lastSequence = event.SequenceNumber
-		}
-		if isCodexTerminal(event.Type) && event.Response != nil {
-			if err := persistResponseImageArtifacts(requestContext, artifacts, artifactRequired, imageArtifactOwner(ctx), codex.CodexStreamResult{Response: event.Response}); err != nil {
+	var streamErr error
+	for {
+		terminalWritten = false
+		lastSequence = -1
+		attemptContext, cancel := context.WithCancel(requestContext)
+		_, streamErr = broker.StreamResponses(attemptContext, selection, privateRequest, forcedAccountID, bindForStream, func(event codex.CodexResponseStreamEvent) error {
+			if requestContext.Err() != nil {
+				return requestContext.Err()
+			}
+			if event.SequenceNumber < 0 || event.SequenceNumber == math.MaxInt {
+				return fmt.Errorf("invalid upstream sequence number %d", event.SequenceNumber)
+			}
+			if event.SequenceNumber > lastSequence {
+				lastSequence = event.SequenceNumber
+			}
+			if isCodexTerminal(event.Type) && event.Response != nil {
+				if err := persistResponseImageArtifacts(requestContext, artifacts, artifactRequired, imageArtifactOwner(ctx), codex.CodexStreamResult{Response: event.Response}); err != nil {
+					return err
+				}
+			}
+			payload, keep, err := publicEventPayload(event)
+			if err != nil {
 				return err
 			}
-		}
-		payload, keep, err := publicEventPayload(event)
-		if err != nil {
-			return err
-		}
-		if !keep {
+			if !keep {
+				return nil
+			}
+			successTerminal := isCodexTerminal(event.Type) && event.Type != codex.CodexEventError &&
+				event.Response != nil && event.Response.Error == nil &&
+				event.Response.Status != codex.CodexResponseStatusFailed
+			if successTerminal {
+				if err := validateQuotaUsageFromCodex(event.Response.Usage); err != nil {
+					return fmt.Errorf("%w: %v", codex.ErrCodexStreamMalformed, err)
+				}
+				usage := quotaUsageFromCodex(event.Response.Usage, 0)
+				if err := lease.reconcile(usage); err != nil {
+					return err
+				}
+				journalUsage := journalUsageFromCodex(event.Response.Usage, 0)
+				journalUsage.ResolvedModel = event.Response.Model
+				recordJournalUsageDetails(ctx, journalUsage)
+			}
+			if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
+				return err
+			}
+			wroteOutput = true
+			if isCodexTerminal(event.Type) || event.Error != nil {
+				terminalWritten = true
+			}
+			if event.Error != nil || event.Type == codex.CodexEventError {
+				return errors.New("upstream error event terminated public stream")
+			}
 			return nil
+		})
+		retry := !retriedAffinity && canRetrySessionAffinity(streamErr, sessionHash, forcedAccountID, wroteOutput) && journal != nil
+		cancel()
+		if !retry {
+			break
 		}
-		successTerminal := isCodexTerminal(event.Type) && event.Type != codex.CodexEventError &&
-			event.Response != nil && event.Response.Error == nil &&
-			event.Response.Status != codex.CodexResponseStatusFailed
-		if successTerminal {
-			if err := validateQuotaUsageFromCodex(event.Response.Usage); err != nil {
-				return fmt.Errorf("%w: %v", codex.ErrCodexStreamMalformed, err)
-			}
-			usage := quotaUsageFromCodex(event.Response.Usage, 0)
-			if err := lease.reconcile(usage); err != nil {
-				return err
-			}
-			journalUsage := journalUsageFromCodex(event.Response.Usage, 0)
-			journalUsage.ResolvedModel = event.Response.Model
-			recordJournalUsageDetails(ctx, journalUsage)
+		retriedAffinity = true
+		winner, resolveErr := journal.ResolveSessionAffinity(requestContext, apiKeyID, sessionHash)
+		if resolveErr != nil {
+			streamErr = resolveErr
+			break
 		}
-		if err := writeResponsesSSERecord(writer, flusher, payload); err != nil {
-			return err
-		}
-		if isCodexTerminal(event.Type) || event.Error != nil {
-			terminalWritten = true
-		}
-		if event.Error != nil || event.Type == codex.CodexEventError {
-			return errors.New("upstream error event terminated public stream")
-		}
-		return nil
-	})
+		forcedAccountID = winner
+		selection.AffinityAccountID = ""
+	}
 	if requestContext.Err() != nil {
 		return
 	}
@@ -598,6 +771,11 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, brok
 		markJournalTerminalValue(journalWriter.value, requestStatusFailed, "")
 		journalWriter.value.journal.recordError(journalWriter.failed)
 		writeJournalSSEFailure(baseWriter, baseFlusher, []byte(`{"type":"error","code":"internal_error","message":"Internal server error."}`))
+		return
+	}
+	if !deferredWriter.committed && !terminalWritten && streamErr != nil {
+		status, responseError := responsesError(streamErr)
+		writeResponsesError(ctx, status, responseError.Type, responseError.Code, responseError.Message)
 		return
 	}
 	if !terminalWritten {
@@ -638,6 +816,58 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, brok
 		}
 		return
 	}
+}
+
+type deferredSSEWriter struct {
+	writer    http.ResponseWriter
+	flusher   http.Flusher
+	committed bool
+}
+
+func newDeferredSSEWriter(writer http.ResponseWriter) (*deferredSSEWriter, bool) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		return nil, false
+	}
+	return &deferredSSEWriter{writer: writer, flusher: flusher}, true
+}
+
+func (writer *deferredSSEWriter) Header() http.Header {
+	return writer.writer.Header()
+}
+
+func (writer *deferredSSEWriter) WriteHeader(statusCode int) {
+	if !writer.committed {
+		if err := writer.commit(statusCode); err != nil {
+			return
+		}
+		return
+	}
+	writer.writer.WriteHeader(statusCode)
+}
+
+func (writer *deferredSSEWriter) Write(payload []byte) (int, error) {
+	if !writer.committed {
+		if err := writer.commit(http.StatusOK); err != nil {
+			return 0, err
+		}
+	}
+	return writer.writer.Write(payload)
+}
+
+func (writer *deferredSSEWriter) Flush() {
+	if writer.committed {
+		writer.flusher.Flush()
+	}
+}
+
+func (writer *deferredSSEWriter) commit(statusCode int) error {
+	if writer.committed {
+		return nil
+	}
+	writer.writer.WriteHeader(statusCode)
+	writer.committed = true
+	return nil
 }
 
 func writeResponsesSSERecord(writer http.ResponseWriter, flusher http.Flusher, payload []byte) error {

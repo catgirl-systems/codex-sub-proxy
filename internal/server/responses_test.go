@@ -61,11 +61,11 @@ func (broker *bindFailureBroker) Compact(_ context.Context, _ codex.SelectionReq
 	return BrokerCompactResult{}, ErrBrokerBind
 }
 
-func (broker *bindFailureBroker) GenerateImage(_ context.Context, _ codex.SelectionRequest, _ codex.CodexImageGenerationRequest, bind func(codex.Account) error) (BrokerImageResult, error) {
+func (broker *bindFailureBroker) GenerateImage(_ context.Context, _ codex.SelectionRequest, _ codex.CodexImageGenerationRequest, _ string, bind func(codex.Account) error) (BrokerImageResult, error) {
 	return BrokerImageResult{}, broker.bind(bind)
 }
 
-func (broker *bindFailureBroker) EditImage(_ context.Context, _ codex.SelectionRequest, _ codex.CodexImageEditRequest, bind func(codex.Account) error) (BrokerImageResult, error) {
+func (broker *bindFailureBroker) EditImage(_ context.Context, _ codex.SelectionRequest, _ codex.CodexImageEditRequest, _ string, bind func(codex.Account) error) (BrokerImageResult, error) {
 	return BrokerImageResult{}, broker.bind(bind)
 }
 
@@ -121,6 +121,75 @@ func TestBrokerBindFailureIsInternalAndDoesNotDispatch(t *testing.T) {
 	}
 	if broker.dispatches.Load() != 0 || upstreamCalls.Load() != 0 {
 		t.Fatalf("dispatches = %d, upstream calls = %d, want zero", broker.dispatches.Load(), upstreamCalls.Load())
+	}
+}
+
+func TestStreamingBrokerBindFailureReturnsInternalJSON(t *testing.T) {
+	broker := &bindFailureBroker{}
+	policy := &apikey.Policy{
+		Name: "stream-bind-failure", Owner: "stream-bind-failure",
+		AllowedEndpoints: []string{responsesEndpoint, chatCompletionsEndpoint},
+		AllowedModels:    []string{"gpt-5.6-sol"},
+	}
+	servers, rawKey := newResponsesTestServerWithBroker(t, "", policy, broker)
+	defer shutdownResponsesTestServer(t, servers)
+	for _, test := range []struct {
+		name, endpoint, body string
+	}{
+		{name: "responses", endpoint: responsesEndpoint, body: `{"model":"gpt-5.6-sol","stream":true,"input":"hello"}`},
+		{name: "chat", endpoint: chatCompletionsEndpoint, body: `{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"hello"}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+test.endpoint, strings.NewReader(test.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("stream bind failure status = %d, want 500 (body=%s)", response.StatusCode, body)
+			}
+			var decoded map[string]map[string]string
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("decode stream bind failure body: %v (%s)", err, body)
+			}
+			if decoded["error"]["code"] != "internal_error" {
+				t.Fatalf("stream bind failure body = %#v", decoded)
+			}
+		})
+	}
+}
+
+func TestResponsesUnavailableStreamReturns503BeforeCommitting(t *testing.T) {
+	broker, err := NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
+		Account: codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
+		Images:  &codex.ImagesClient{},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, rawKey := newResponsesTestServerWithBroker(t, "", nil, broker)
+	defer shutdownResponsesTestServer(t, servers)
+	response := doResponsesRequest(t, servers.DataAddr(), rawKey, `{"model":"gpt-5.6-sol","stream":true,"input":"hello"}`, "application/json")
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unavailable stream status = %d, want 503 (body=%s)", response.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"upstream_unavailable"`)) {
+		t.Fatalf("unavailable stream body = %s", body)
 	}
 }
 func TestResponsesJSONPreservesImageAndUsage(t *testing.T) {
