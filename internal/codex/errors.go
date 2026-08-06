@@ -2,6 +2,7 @@ package codex
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -30,6 +31,7 @@ const (
 type SafeError struct {
 	Category       ErrorCategory
 	StatusCode     int
+	ProviderCode   string
 	ProviderStatus string
 	Message        string
 	RetryAfter     time.Duration
@@ -47,6 +49,17 @@ func (e *SafeError) Error() string {
 // IsRetryable reports whether the upstream failure can be retried.
 func (e *SafeError) IsRetryable() bool {
 	return e != nil && e.Retryable
+}
+
+func isSafeErrorCode(err error, code string) bool {
+	var safe *SafeError
+	if errors.As(err, &safe) && safe != nil &&
+		strings.EqualFold(strings.TrimSpace(safe.ProviderCode), code) {
+		return true
+	}
+	var streamFailure *CodexStreamFailureError
+	return errors.As(err, &streamFailure) && streamFailure != nil &&
+		strings.EqualFold(strings.TrimSpace(streamFailure.Code), code)
 }
 
 // MapUpstreamError maps a private Codex response to a safe typed error.
@@ -92,6 +105,7 @@ func MapUpstreamError(status int, headers http.Header, body []byte) *SafeError {
 	return &SafeError{
 		Category:       category,
 		StatusCode:     status,
+		ProviderCode:   detail.Code,
 		ProviderStatus: detail.Status,
 		Message:        message,
 		RetryAfter:     retryAfter,

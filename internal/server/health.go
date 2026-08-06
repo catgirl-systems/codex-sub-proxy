@@ -168,9 +168,12 @@ const journalRequestValueKey = "csp-journal-request"
 const journalAuditValueKey = "csp-journal-audit"
 
 type journalRequestValue struct {
-	journal *Journal
-	request JournalRequest
-	context context.Context
+	journal        *Journal
+	request        JournalRequest
+	context        context.Context
+	terminalMu     sync.Mutex
+	terminalState  string
+	terminalFailed bool
 }
 
 type journalAuditValue struct {
@@ -213,14 +216,24 @@ func recordJournalRejection(ctx iris.Context, status int, eventType string) {
 }
 
 func startJournalRequestWithMetadata(ctx iris.Context, journal *Journal, metadata JournalRequestMetadata, input []byte) (JournalRequest, error) {
+	if ctx == nil {
+		return JournalRequest{}, errors.New("journal context is nil")
+	}
+	return startJournalRequestWithContext(ctx, ctx.Request().Context(), journal, metadata, input)
+}
+
+func startJournalRequestWithContext(ctx iris.Context, operationContext context.Context, journal *Journal, metadata JournalRequestMetadata, input []byte) (JournalRequest, error) {
 	if journal == nil {
 		return JournalRequest{}, nil
 	}
-	request, err := journal.BeginRequestWithMetadata(ctx.Request().Context(), metadata, input)
+	if operationContext == nil {
+		return JournalRequest{}, errors.New("journal operation context is nil")
+	}
+	request, err := journal.BeginRequestWithMetadata(operationContext, metadata, input)
 	if err != nil {
 		return JournalRequest{}, err
 	}
-	ctx.Values().Set(journalRequestValueKey, &journalRequestValue{journal: journal, request: request, context: ctx.Request().Context()})
+	ctx.Values().Set(journalRequestValueKey, &journalRequestValue{journal: journal, request: request, context: operationContext})
 	return request, nil
 }
 
@@ -236,17 +249,55 @@ func markJournalTerminalValue(value *journalRequestValue, state, detail string) 
 	if value == nil {
 		return
 	}
+	value.terminalMu.Lock()
+	if value.terminalState != "" {
+		value.terminalMu.Unlock()
+		return
+	}
+	if state == requestStatusFailed {
+		value.terminalFailed = true
+	}
+	value.terminalState = state
+	value.terminalMu.Unlock()
 	if err := value.journal.RecordTerminal(context.WithoutCancel(value.context), value.request, state, []byte(detail)); err != nil {
 		value.journal.recordError(err)
+		value.terminalMu.Lock()
+		value.terminalState = ""
+		value.terminalMu.Unlock()
 	}
+}
+
+func markJournalFailure(ctx iris.Context) {
+	if ctx == nil {
+		return
+	}
+	value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue)
+	if !ok || value == nil {
+		return
+	}
+	value.terminalMu.Lock()
+	value.terminalFailed = true
+	value.terminalMu.Unlock()
 }
 
 func finishJournalRequest(ctx iris.Context, journal *Journal, request JournalRequest) {
 	if journal == nil {
 		return
 	}
+	failed := false
+	if value, ok := ctx.Values().Get(journalRequestValueKey).(*journalRequestValue); ok && value != nil {
+		value.terminalMu.Lock()
+		terminal := value.terminalState != ""
+		failed = value.terminalFailed
+		value.terminalMu.Unlock()
+		if terminal {
+			return
+		}
+	}
 	state := requestStatusSucceeded
-	if ctx.Request().Context().Err() != nil {
+	if failed {
+		state = requestStatusFailed
+	} else if ctx.Request().Context().Err() != nil {
 		state = requestStatusCanceled
 	} else if status := ctx.ResponseWriter().StatusCode(); status >= http.StatusBadRequest {
 		state = requestStatusFailed

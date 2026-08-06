@@ -150,6 +150,7 @@ func (transport *ResponsesTransport) DoWithHeaders(ctx context.Context, request 
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
 		headers.ResponsesLite = headers.ResponsesLite || requestHeaders.ResponsesLiteRequested || request.ResponsesLite
+		headers.TurnState = turnStateFromContext(attemptContext)
 		if credential.AccountIsFedRAMP {
 			headers.FedRAMP = true
 		}
@@ -342,6 +343,7 @@ func (transport *ResponsesTransport) StreamWithHeaders(ctx context.Context, requ
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
 		headers.ResponsesLite = headers.ResponsesLite || requestHeaders.ResponsesLiteRequested || request.ResponsesLite
+		headers.TurnState = turnStateFromContext(attemptContext)
 		if credential.AccountIsFedRAMP {
 			headers.FedRAMP = true
 		}
@@ -387,6 +389,23 @@ func (transport *ResponsesTransport) streamAttempt(ctx context.Context, body, we
 	}
 	buffer := &codexReplayBuffer{onEvent: onEvent}
 	result, authResponse, err, fallback := transport.tryWebSocket(ctx, webSocketBody, headers, buffer.emit)
+	if authResponse != nil && authResponse.StatusCode != http.StatusUnauthorized {
+		err = mapHTTPResponseError(authResponse)
+		authResponse = nil
+		fallback = false
+	}
+	if err != nil && authResponse == nil && !buffer.emitted &&
+		isSafeErrorCode(err, "websocket_connection_limit_reached") {
+		// The failed connection is closed by tryWebSocket. Retry once before
+		// replaying any event or allowing account-level error handling.
+		buffer.discard()
+		result, authResponse, err, fallback = transport.tryWebSocket(ctx, webSocketBody, headers, buffer.emit)
+		if authResponse != nil && authResponse.StatusCode != http.StatusUnauthorized {
+			err = mapHTTPResponseError(authResponse)
+			authResponse = nil
+			fallback = false
+		}
+	}
 	if authResponse != nil || err == nil {
 		return result, authResponse, err
 	}
@@ -437,6 +456,19 @@ func (transport *ResponsesTransport) attempt(ctx context.Context, body, webSocke
 		return transport.trySSE(ctx, body, headers, nil)
 	}
 	result, authResponse, err, fallback := transport.tryWebSocket(ctx, webSocketBody, headers, nil)
+	if authResponse != nil && authResponse.StatusCode != http.StatusUnauthorized {
+		err = mapHTTPResponseError(authResponse)
+		authResponse = nil
+		fallback = false
+	}
+	if err != nil && authResponse == nil && isSafeErrorCode(err, "websocket_connection_limit_reached") {
+		result, authResponse, err, fallback = transport.tryWebSocket(ctx, webSocketBody, headers, nil)
+		if authResponse != nil && authResponse.StatusCode != http.StatusUnauthorized {
+			err = mapHTTPResponseError(authResponse)
+			authResponse = nil
+			fallback = false
+		}
+	}
 	if authResponse != nil || err == nil {
 		return result, authResponse, err
 	}

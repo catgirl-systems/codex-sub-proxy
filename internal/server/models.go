@@ -66,7 +66,8 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, broke
 		app.Any(chatCompletionsEndpoint, unavailable)
 	}
 	if authorizer != nil && broker != nil && quota != nil {
-		app.Any(responsesEndpoint, newResponsesHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
+		app.Post(responsesEndpoint, newResponsesHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
+		app.Get(responsesEndpoint, newResponsesWebSocketHandler(authorizer, broker, journal, quota, artifacts, artifactRequired, policy.allowedOrigins))
 	} else {
 		app.Any(responsesEndpoint, unavailable)
 	}

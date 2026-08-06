@@ -519,7 +519,7 @@ func (j *Journal) LoadConversationInputThrough(ctx context.Context, conversation
 		var terminalFound bool
 		var streamedOutput []json.RawMessage
 		requestSucceeded := false
-		rows, err := j.db.WithContext(ctx).Model(&JournalRecord{}).Where("request_id = ? AND event_type IN ?", request.ID, []string{"request.input", "request.terminal", "response.json", "response.output_item.done"}).Order("sequence ASC").Rows()
+		rows, err := j.db.WithContext(ctx).Model(&JournalRecord{}).Where("request_id = ? AND event_type IN ?", request.ID, []string{"request.input", "request.terminal", "response.json", "response.completed", "response.incomplete", "response.output_item.done"}).Order("sequence ASC").Rows()
 		if err != nil {
 			return nil, fmt.Errorf("load conversation journal events: %w", err)
 		}
@@ -586,26 +586,45 @@ func (j *Journal) LoadConversationInputThrough(ctx context.Context, conversation
 				if terminal.State == requestStatusSucceeded {
 					requestSucceeded = true
 				}
-			case "response.json":
-				var response struct {
-					Status string            `json:"status"`
-					Object string            `json:"object"`
-					Output []json.RawMessage `json:"output"`
+			case "response.json", "response.completed", "response.incomplete":
+				data := bytes.TrimSpace(plain)
+				if bytes.HasPrefix(data, []byte("data:")) {
+					data = bytes.TrimSpace(bytes.TrimPrefix(data, []byte("data:")))
+					if index := bytes.IndexByte(data, '\n'); index >= 0 {
+						data = bytes.TrimSpace(data[:index])
+					}
 				}
-				if err := json.Unmarshal(plain, &response); err != nil {
+				var response struct {
+					Status   string            `json:"status"`
+					Object   string            `json:"object"`
+					Output   []json.RawMessage `json:"output"`
+					Response *struct {
+						Status string            `json:"status"`
+						Object string            `json:"object"`
+						Output []json.RawMessage `json:"output"`
+					} `json:"response,omitempty"`
+				}
+				if err := json.Unmarshal(data, &response); err != nil {
 					_ = rows.Close()
 					return nil, fmt.Errorf("decode conversation response: %w", err)
 				}
-				if response.Object != "response.compaction" &&
-					response.Status != "completed" && response.Status != "incomplete" {
+				status, object, output := response.Status, response.Object, response.Output
+				if response.Response != nil {
+					status, object, output = response.Response.Status, response.Response.Object, response.Response.Output
+				}
+				if object != "response.compaction" &&
+					status != "completed" && status != "incomplete" {
 					continue
 				}
-				if response.Output == nil {
-					_ = rows.Close()
-					return nil, errors.New("conversation terminal response output is missing")
+				if output == nil {
+					if event.EventType == "response.json" {
+						_ = rows.Close()
+						return nil, errors.New("conversation terminal response output is missing")
+					}
+					continue
 				}
 				var validatedOutput []json.RawMessage
-				for _, item := range response.Output {
+				for _, item := range output {
 					validated, err := validateOutputItem(item)
 					if err != nil {
 						_ = rows.Close()

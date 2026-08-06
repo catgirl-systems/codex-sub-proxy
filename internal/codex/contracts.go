@@ -1069,6 +1069,7 @@ var ErrCodexStreamFailed = errors.New("codex stream failed")
 type CodexStreamFailureError struct {
 	Category string
 	Status   string
+	Code     string
 }
 
 func (e *CodexStreamFailureError) Error() string {
@@ -1240,6 +1241,7 @@ type codexStreamDecoder struct {
 	terminalType string
 	response     *CodexResponse
 	failed       bool
+	code         string
 	doneSeen     bool
 	payloadBytes int
 }
@@ -1268,6 +1270,15 @@ func (decoder *codexStreamDecoder) add(event CodexResponseStreamEvent) error {
 	decoder.events = append(decoder.events, event)
 	decoder.failed = decoder.failed || event.Error != nil ||
 		(event.Response != nil && event.Response.Error != nil)
+	if isCodexTerminalEvent(event.Type) {
+		if event.Code != "" {
+			decoder.code = event.Code
+		} else if event.Error != nil {
+			decoder.code = event.Error.Code
+		} else if event.Response != nil && event.Response.Error != nil {
+			decoder.code = event.Response.Error.Code
+		}
+	}
 	if !isCodexTerminalEvent(event.Type) {
 		return nil
 	}
@@ -1303,7 +1314,7 @@ func (decoder *codexStreamDecoder) finish() (CodexStreamResult, error) {
 				status = decoder.response.Status
 			}
 		}
-		return result, &CodexStreamFailureError{Category: category, Status: status}
+		return result, &CodexStreamFailureError{Category: category, Status: status, Code: decoder.code}
 	}
 	return result, nil
 }

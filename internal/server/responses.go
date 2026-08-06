@@ -46,16 +46,9 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 			writeResponsesError(ctx, http.StatusMethodNotAllowed, responsesErrorType, "method_not_allowed", "Only POST is allowed for this endpoint.")
 			return
 		}
-
-		headers := request.Header.Values("Authorization")
-		if len(headers) != 1 {
-			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
-			return
-		}
-		principal, err := authorizer.AuthenticateHeader(requestContext, headers[0])
-		setJournalAuditPrincipal(ctx, principal.ID)
+		principal, err := authenticateResponsesPrincipal(ctx, authorizer)
 		if err != nil {
-			writeAPIKeyError(ctx, err)
+			writeResponsesRequestError(ctx, err)
 			return
 		}
 
@@ -68,7 +61,6 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 			writeResponsesError(ctx, http.StatusRequestEntityTooLarge, responsesErrorType, "request_too_large", "Request body is too large.")
 			return
 		}
-
 		request.Body = http.MaxBytesReader(ctx.ResponseWriter(), request.Body, maxResponsesBodyBytes)
 		defer request.Body.Close()
 		var publicRequest openai.ResponseRequest
@@ -91,115 +83,26 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
-		requestHeaders, err := requestHeaderConfig(request.Header)
+		admission, err := prepareResponsesAdmissionForPrincipal(ctx, requestContext, authorizer, broker, journal, quota, publicRequest, principal)
 		if err != nil {
-			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
-			return
-		}
-		responsesLiteHeader := requestHeaders.ResponsesLiteRequested
-		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, responsesEndpoint, publicRequest.Model)
-		if err != nil {
-			writeAPIKeyError(ctx, err)
-			return
-		}
-		if broker == nil {
-			writeResponsesError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
-			return
-		}
-		journalInput, err := json.Marshal(publicRequest)
-		if err != nil {
-			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-			return
-		}
-		journalMetadata := JournalRequestMetadata{
-			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-		}
-		var sessionHash, affinityAccountID string
-		if publicRequest.PreviousResponseID != "" {
-			if journal == nil {
-				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
-				return
+			if admission != nil {
+				defer finishJournalRequest(ctx, journal, admission.journalRequest)
+				markJournalTerminal(ctx, requestStatusFailed, "")
 			}
-			resolved, resolveErr := journal.ResolvePreviousResponse(requestContext, publicRequest.PreviousResponseID, principal.ID)
-			if resolveErr != nil {
-				if errors.Is(resolveErr, ErrPreviousResponseNotFound) {
-					writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
-				} else {
-					writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-				}
-				return
-			}
-			journalMetadata.ConversationID = resolved.ConversationID
-			journalMetadata.AccountID = resolved.AccountID
-			journalMetadata.PreviousResponseID = publicRequest.PreviousResponseID
-		} else {
-			var affinityErr error
-			sessionHash, affinityAccountID, affinityErr = resolveSessionAffinity(requestContext, journal, principal.ID, requestHeaders)
-			if affinityErr != nil {
-				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-				return
-			}
-		}
-		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
-		if err != nil {
-			if errors.Is(err, ErrPreviousResponseNotFound) {
-				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
-			} else {
-				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-			}
+			writeResponsesRequestError(ctx, err)
 			return
 		}
-		defer finishJournalRequest(ctx, journal, journalRequestID)
-		privateRequest, err := privateResponseRequest(publicRequest)
-		if err != nil {
-			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
-			return
-		}
-		if responsesLiteHeader && privateRequest.ResponsesLite {
-			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
-			return
-		}
-		privateRequest.ResponsesLite = responsesLiteHeader || privateRequest.ResponsesLite
-		selection := codex.SelectionRequest{
-			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
-			PreviousResponseID: publicRequest.PreviousResponseID,
-			Headers:            requestHeaders,
-			AffinityAccountID:  affinityAccountID,
-		}
-		bindAccount := func(account codex.Account) error {
-			if journal == nil {
-				return nil
-			}
-			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, sessionAffinityHashForAccount(sessionHash, affinityAccountID, account.ID))
-		}
-
-		continuationAccountID := ""
-		if publicRequest.PreviousResponseID != "" {
-			continuationAccountID = journalRequestID.AccountID
-		}
+		defer finishJournalRequest(ctx, journal, admission.journalRequest)
+		principal = admission.principal
+		privateRequest := admission.privateRequest
+		selection := admission.selection
+		bindAccount := admission.bindAccount
+		lease := admission.lease
+		continuationAccountID := admission.continuationAccountID
+		sessionHash := admission.sessionHash
 		if publicRequest.Stream {
-			lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
-			if err != nil {
-				var quotaErr *apikey.QuotaError
-				if errors.As(err, &quotaErr) {
-					writeQuotaResponsesError(ctx, err)
-				} else {
-					writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-				}
-				return
-			}
 			defer func() { _ = lease.release("request ended") }()
-			serveResponsesStream(ctx, requestContext, broker, selection, privateRequest, continuationAccountID, sessionHash, principal.ID, journal, bindAccount, lease, artifacts, artifactRequired)
-			return
-		}
-		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
-		if err != nil {
-			var quotaErr *apikey.QuotaError
-			if errors.As(err, &quotaErr) {
-				writeQuotaResponsesError(ctx, err)
-			} else {
-				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-			}
+			serveResponsesStream(ctx, requestContext, broker, selection, privateRequest, continuationAccountID, admission.continuationSourceRequestID, admission.journalRequest.ConversationID, sessionHash, principal.ID, journal, bindAccount, lease, artifacts, artifactRequired)
 			return
 		}
 		defer func() { _ = lease.release("request ended") }()
@@ -211,12 +114,34 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 		setTransportOutcome(ctx, "http")
 		forcedAccountID := continuationAccountID
 		retriedAffinity := false
+		retriedContinuation := false
+		turnState := ""
 		var brokerResult BrokerResponsesResult
 		for {
-			attemptContext, cancel := context.WithCancel(requestContext)
-			brokerResult, err = broker.DoResponses(attemptContext, selection, privateRequest, forcedAccountID, bindAccount)
-			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
+			attemptContext, cancel := context.WithCancel(codex.WithTurnState(requestContext, turnState))
+			attemptRequest := privateRequest
+			attemptSelection := selection
+			brokerResult, err = broker.DoResponses(attemptContext, attemptSelection, attemptRequest, forcedAccountID, bindAccount)
+			for _, event := range brokerResult.Result.Events {
+				if state := responseEventTurnState(event); state != "" {
+					turnState = state
+				}
+			}
 			cancel()
+			previousResponseError := isPreviousResponseNotFoundError(err) ||
+				strings.EqualFold(responseResultErrorCode(brokerResult.Result), "previous_response_not_found")
+			if !retriedContinuation && previousResponseError {
+				fallbackRequest, fallbackErr := rebuildContinuationRequest(requestContext, journal, admission.continuationSourceRequestID, admission.journalRequest.ConversationID, privateRequest)
+				if fallbackErr == nil {
+					privateRequest = fallbackRequest
+					selection.PreviousResponseID = ""
+					retriedContinuation = true
+					continue
+				}
+				err = fallbackErr
+				break
+			}
+			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
 			if !retry {
 				break
 			}
@@ -227,6 +152,8 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 				break
 			}
 			forcedAccountID = winner
+			selection.AffinityAccountID = ""
+			turnState = ""
 		}
 		result := brokerResult.Result
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
@@ -1152,6 +1079,127 @@ func privateInput(input *openai.Input) (*codex.CodexInput, error) {
 	}
 }
 
+type upstreamEventError struct {
+	code string
+	err  error
+}
+
+func (e *upstreamEventError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *upstreamEventError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func upstreamErrorCode(err error) string {
+	var eventErr *upstreamEventError
+	if errors.As(err, &eventErr) && eventErr != nil && eventErr.code != "" {
+		return strings.TrimSpace(eventErr.code)
+	}
+	var safeErr *codex.SafeError
+	if errors.As(err, &safeErr) && safeErr != nil && safeErr.ProviderCode != "" {
+		return strings.TrimSpace(safeErr.ProviderCode)
+	}
+	var streamErr *codex.CodexStreamFailureError
+	if errors.As(err, &streamErr) && streamErr != nil {
+		return strings.TrimSpace(streamErr.Code)
+	}
+	return ""
+}
+
+func responseEventErrorCode(event codex.CodexResponseStreamEvent) string {
+	if event.Code != "" {
+		return strings.TrimSpace(event.Code)
+	}
+	if event.Error != nil && event.Error.Code != "" {
+		return strings.TrimSpace(event.Error.Code)
+	}
+	if event.Response != nil && event.Response.Error != nil {
+		return strings.TrimSpace(event.Response.Error.Code)
+	}
+	return ""
+}
+func responseResultErrorCode(result codex.CodexStreamResult) string {
+	for index := len(result.Events) - 1; index >= 0; index-- {
+		if code := responseEventErrorCode(result.Events[index]); code != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+func isPreviousResponseNotFoundError(err error) bool {
+	return strings.EqualFold(upstreamErrorCode(err), "previous_response_not_found")
+}
+
+func responseEventTurnState(event codex.CodexResponseStreamEvent) string {
+	if event.Type != codex.CodexEventResponseMetadata {
+		return ""
+	}
+	for name, value := range event.Headers {
+		if strings.EqualFold(name, codex.TurnStateHeader) &&
+			value != "" && len(value) <= 4096 && !strings.ContainsAny(value, "\r\n") {
+			return value
+		}
+	}
+	return ""
+}
+
+func rebuildContinuationRequest(
+	ctx context.Context,
+	journal *Journal,
+	sourceRequestID string,
+	conversationID string,
+	original codex.CodexResponseRequest,
+) (codex.CodexResponseRequest, error) {
+	if ctx == nil {
+		return codex.CodexResponseRequest{}, errors.New("continuation context is nil")
+	}
+	if journal == nil || sourceRequestID == "" || conversationID == "" {
+		return codex.CodexResponseRequest{}, ErrPreviousResponseNotFound
+	}
+	history, err := journal.LoadConversationInputThrough(ctx, conversationID, sourceRequestID)
+	if err != nil {
+		return codex.CodexResponseRequest{}, err
+	}
+	items, err := privateCompactHistory(history)
+	if err != nil {
+		return codex.CodexResponseRequest{}, fmt.Errorf("rebuild continuation history: %w", err)
+	}
+	if original.Input != nil {
+		if original.Input.String != nil {
+			content, err := json.Marshal(*original.Input.String)
+			if err != nil {
+				return codex.CodexResponseRequest{}, fmt.Errorf("encode continuation input: %w", err)
+			}
+			items = append(items, codex.CodexInputItem{Type: "message", Role: "user", Content: content})
+		} else {
+			items = append(items, original.Input.Items...)
+		}
+	}
+	if len(items) > 1024 {
+		return codex.CodexResponseRequest{}, errors.New("continuation input exceeds item limit")
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		return codex.CodexResponseRequest{}, fmt.Errorf("encode continuation input: %w", err)
+	}
+	if len(encoded) > maxResponsesBodyBytes {
+		return codex.CodexResponseRequest{}, errors.New("continuation input exceeds bounds")
+	}
+	rebuilt := original
+	rebuilt.PreviousResponseID = ""
+	rebuilt.Input = &codex.CodexInput{Items: items}
+	return rebuilt, nil
+}
+
 func privateTools(tools []openai.Tool) ([]codex.CodexTool, error) {
 	return privateToolsAtDepth(tools, 0)
 }
@@ -1238,7 +1286,7 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 	return privateText
 }
 
-func serveResponsesStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, forcedAccountID, sessionHash, apiKeyID string, journal *Journal, bindAccount func(codex.Account) error, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
+func serveResponsesStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, forcedAccountID, continuationSourceRequestID, conversationID, sessionHash, apiKeyID string, journal *Journal, bindAccount func(codex.Account) error, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	baseFlusher, ok := writer.(http.Flusher)
@@ -1285,16 +1333,32 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, brok
 	terminalWritten := false
 	lastSequence := -1
 	wroteOutput := false
+	retriedConnectionLimit := false
 	retriedAffinity := false
-	setTransportOutcome(ctx, "websocket")
+	retriedContinuation := false
+	turnState := ""
+	setTransportOutcome(ctx, "sse")
 	var streamErr error
 	for {
 		terminalWritten = false
 		lastSequence = -1
-		attemptContext, cancel := context.WithCancel(requestContext)
-		_, streamErr = broker.StreamResponses(attemptContext, selection, privateRequest, forcedAccountID, bindForStream, func(event codex.CodexResponseStreamEvent) error {
+		attemptContext, cancel := context.WithCancel(codex.WithTurnState(requestContext, turnState))
+		attemptRequest := privateRequest
+		attemptSelection := selection
+		var attemptResult BrokerResponsesResult
+		attemptResult, streamErr = broker.StreamResponses(attemptContext, attemptSelection, attemptRequest, forcedAccountID, bindForStream, func(event codex.CodexResponseStreamEvent) error {
 			if requestContext.Err() != nil {
 				return requestContext.Err()
+			}
+			if state := responseEventTurnState(event); state != "" {
+				turnState = state
+			}
+			code := responseEventErrorCode(event)
+			if !wroteOutput && strings.EqualFold(code, "previous_response_not_found") {
+				return &upstreamEventError{code: code, err: errors.New("upstream previous response was not found")}
+			}
+			if !wroteOutput && strings.EqualFold(code, "websocket_connection_limit_reached") {
+				return &upstreamEventError{code: code, err: errors.New("upstream connection limit terminated before output")}
 			}
 			if event.SequenceNumber < 0 || event.SequenceNumber == math.MaxInt {
 				return fmt.Errorf("invalid upstream sequence number %d", event.SequenceNumber)
@@ -1314,9 +1378,8 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, brok
 			if !keep {
 				return nil
 			}
-			successTerminal := isCodexTerminal(event.Type) && event.Type != codex.CodexEventError &&
-				event.Response != nil && event.Response.Error == nil &&
-				event.Response.Status != codex.CodexResponseStatusFailed
+			failedTerminal := isFailedCodexResponseEvent(event)
+			successTerminal := isCodexTerminal(event.Type) && !failedTerminal && event.Response != nil
 			if successTerminal {
 				if err := validateQuotaUsageFromCodex(event.Response.Usage); err != nil {
 					return fmt.Errorf("%w: %v", codex.ErrCodexStreamMalformed, err)
@@ -1335,14 +1398,39 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, brok
 			wroteOutput = true
 			if isCodexTerminal(event.Type) || event.Error != nil {
 				terminalWritten = true
+				if failedTerminal {
+					markJournalTerminal(ctx, requestStatusFailed, "")
+				}
 			}
 			if event.Error != nil || event.Type == codex.CodexEventError {
-				return errors.New("upstream error event terminated public stream")
+				return &upstreamEventError{code: responseEventErrorCode(event), err: errors.New("upstream error event terminated public stream")}
 			}
 			return nil
 		})
-		retry := !retriedAffinity && canRetrySessionAffinity(streamErr, sessionHash, forcedAccountID, wroteOutput) && journal != nil
 		cancel()
+		if requestContext.Err() != nil {
+			break
+		}
+		if !retriedContinuation && !wroteOutput && isPreviousResponseNotFoundError(streamErr) {
+			fallbackRequest, fallbackErr := rebuildContinuationRequest(requestContext, journal, continuationSourceRequestID, conversationID, privateRequest)
+			if fallbackErr == nil {
+				privateRequest = fallbackRequest
+				selection.PreviousResponseID = ""
+				retriedContinuation = true
+				continue
+			}
+			streamErr = fallbackErr
+			break
+		}
+		if !retriedConnectionLimit && !wroteOutput &&
+			strings.EqualFold(upstreamErrorCode(streamErr), "websocket_connection_limit_reached") {
+			if attemptResult.Account.ID != "" {
+				forcedAccountID = attemptResult.Account.ID
+			}
+			retriedConnectionLimit = true
+			continue
+		}
+		retry := !retriedAffinity && canRetrySessionAffinity(streamErr, sessionHash, forcedAccountID, wroteOutput) && journal != nil
 		if !retry {
 			break
 		}
@@ -1353,6 +1441,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, brok
 			break
 		}
 		forcedAccountID = winner
+		turnState = ""
 		selection.AffinityAccountID = ""
 	}
 	if requestContext.Err() != nil {
@@ -1489,6 +1578,10 @@ func isCodexTerminal(eventType string) bool {
 		return false
 	}
 }
+func isFailedCodexResponseEvent(event codex.CodexResponseStreamEvent) bool {
+	return event.Error != nil || event.Type == codex.CodexEventError || event.Type == codex.CodexEventResponseFailed ||
+		(event.Response != nil && (event.Response.Status == codex.CodexResponseStatusFailed || event.Response.Error != nil))
+}
 
 func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, error) {
 	if event.Error != nil || event.Type == codex.CodexEventError {
@@ -1521,7 +1614,22 @@ func publicEventPayload(event codex.CodexResponseStreamEvent) ([]byte, bool, err
 		return nil, false, fmt.Errorf("%w: terminal event response is missing", codex.ErrCodexStreamMalformed)
 	}
 	if event.Type == codex.CodexEventResponseDone {
-		event.Type = codex.CodexEventResponseCompleted
+		if event.Response.Status == codex.CodexResponseStatusFailed || event.Response.Error != nil {
+			event.Type = codex.CodexEventResponseFailed
+		} else {
+			switch event.Response.Status {
+			case codex.CodexResponseStatusCompleted:
+				event.Type = codex.CodexEventResponseCompleted
+			case codex.CodexResponseStatusIncomplete:
+				event.Type = codex.CodexEventResponseIncomplete
+			default:
+				return nil, false, fmt.Errorf("%w: response.done status %q", codex.ErrCodexStreamMalformed, event.Response.Status)
+			}
+		}
+		event.Raw = nil
+	} else if isCodexTerminal(event.Type) && event.Response != nil &&
+		(event.Response.Status == codex.CodexResponseStatusFailed || event.Response.Error != nil) {
+		event.Type = codex.CodexEventResponseFailed
 		event.Raw = nil
 	}
 	eventCode, eventMessage := event.Code, event.Message
@@ -1899,6 +2007,12 @@ func responsesError(err error) (int, openai.Error) {
 	}
 	if errors.Is(err, codex.ErrInvalidImageRequest) {
 		return http.StatusBadRequest, openai.Error{Type: responsesErrorType, Code: "invalid_request", Message: "The request is invalid."}
+	}
+	switch {
+	case strings.EqualFold(upstreamErrorCode(err), "previous_response_not_found"):
+		return http.StatusBadRequest, openai.Error{Type: responsesErrorType, Code: "previous_response_not_found", Message: "The previous response was not found."}
+	case strings.EqualFold(upstreamErrorCode(err), "websocket_connection_limit_reached"):
+		return http.StatusServiceUnavailable, openai.Error{Type: responsesServerErrorType, Code: "upstream_unavailable", Message: "The upstream service is unavailable."}
 	}
 	var safeError *codex.SafeError
 	if errors.Is(err, ErrBrokerUnavailable) || errors.Is(err, codex.ErrNoAvailableAccount) {

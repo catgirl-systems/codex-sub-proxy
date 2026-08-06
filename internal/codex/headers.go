@@ -3,9 +3,11 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -20,6 +22,7 @@ const (
 	ThreadIDHeader        = "thread-id"
 	WindowIDHeader        = "x-codex-window-id"
 	TurnMetadataHeader    = "x-codex-turn-metadata"
+	TurnStateHeader       = "x-codex-turn-state"
 	ImageTurnIDHeader     = "x-codex-image-turn-id"
 	AttestationHeader     = "x-oai-attestation"
 	FedRAMPHeader         = "X-OpenAI-Fedramp"
@@ -31,6 +34,7 @@ const (
 	DefaultOriginator  = "pi"
 	DefaultVersion     = "0.144.1"
 	DefaultRequestKind = "turn"
+	maxTurnStateBytes  = 4096
 )
 
 // HeaderConfig contains only upstream Codex identity and request metadata.
@@ -51,10 +55,30 @@ type HeaderConfig struct {
 	TurnID              string
 	TurnStartedAtUnixMs int64
 	RequestKind         string
+	TurnState           string
 	ImageTurnID         string
 	Attestation         string
 	FedRAMP             bool
 	ResponsesLite       bool
+}
+
+type turnStateContextKey struct{}
+
+// WithTurnState carries one private upstream turn state through a replacement
+// request for the active turn. Callers must not retain it for later turns.
+func WithTurnState(ctx context.Context, state string) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, turnStateContextKey{}, state)
+}
+
+func turnStateFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	state, _ := ctx.Value(turnStateContextKey{}).(string)
+	return state
 }
 
 // BuildHeaders creates the headers required by a Codex upstream request.
@@ -87,6 +111,14 @@ func BuildHeaders(config HeaderConfig) (http.Header, error) {
 	headers := make(http.Header, 15)
 	for _, value := range values {
 		headers.Set(value.name, value.value)
+	}
+
+	if config.TurnState != "" {
+		if len(config.TurnState) > maxTurnStateBytes ||
+			strings.ContainsAny(config.TurnState, "\r\n") {
+			return nil, errors.New("upstream turn state is invalid")
+		}
+		headers.Set(TurnStateHeader, config.TurnState)
 	}
 
 	if config.SessionID != "" {

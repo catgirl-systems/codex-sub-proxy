@@ -2224,3 +2224,27 @@ func TestRetentionSweepsExpiredSessionAffinities(t *testing.T) {
 		t.Fatalf("expired session affinity count = %d, want 0", count)
 	}
 }
+func TestJournalLoadConversationInputUsesResponsesTerminalEvents(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`))
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	payload := []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-stream\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"world\"}]}]}}\n\n")
+	if err := journal.Forward(context.Background(), request, "response.completed", payload, func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward response: %v", err)
+	}
+	items, err := journal.LoadConversationInput(context.Background(), request.ConversationID)
+	if err != nil {
+		t.Fatalf("load conversation input: %v", err)
+	}
+	if len(items) != 2 || !bytes.Contains(items[0], []byte("hello")) || !bytes.Contains(items[1], []byte("world")) {
+		t.Fatalf("conversation items = %s", items)
+	}
+}

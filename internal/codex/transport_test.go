@@ -59,6 +59,83 @@ func TestResponsesTransportWebSocketSuccessPreservesEvents(t *testing.T) {
 		t.Fatalf("SSE requests = %d, want 0", sseRequests.Load())
 	}
 }
+func TestResponsesTransportWebSocketConnectionLimitRetriesExactlyOnce(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		secondBody string
+		wantError  bool
+	}{
+		{
+			name:       "second attempt succeeds",
+			secondBody: `{"type":"response.completed","sequence_number":0,"response":{"id":"response-2","model":"gpt-5.6-sol","status":"completed"}}`,
+		},
+		{
+			name:       "second attempt fails",
+			secondBody: `{"type":"error","sequence_number":0,"code":"websocket_connection_limit_reached","message":"limit"}`,
+			wantError:  true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			var mu sync.Mutex
+			seenHeaders := make([]http.Header, 0, 2)
+			seenBodies := make([]string, 0, 2)
+			server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+				connection, err := transportUpgrader.Upgrade(writer, request, nil)
+				if err != nil {
+					return
+				}
+				defer connection.CloseNow()
+				_, body, err := connection.Read(context.Background())
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				seenHeaders = append(seenHeaders, request.Header.Clone())
+				seenBodies = append(seenBodies, string(body))
+				mu.Unlock()
+				if attempts.Add(1) == 1 {
+					_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(`{"type":"error","sequence_number":0,"code":"websocket_connection_limit_reached","message":"limit"}`))
+					return
+				}
+				_ = connection.Write(context.Background(), coderwebsocket.MessageText, []byte(test.secondBody))
+			})
+			defer server.Close()
+			transport := newTestResponsesTransport(t, server, ResponsesTransportWebSocketPreferred)
+			transport.headers = HeaderConfig{SessionID: "session-1", ThreadID: "thread-1"}
+			_, err := transport.Do(WithTurnState(context.Background(), "replacement-state"), CodexResponseRequest{Model: "gpt-5.6-sol", Stream: true})
+			if test.wantError {
+				if err == nil {
+					t.Fatal("second connection-limit attempt unexpectedly succeeded")
+				}
+			} else if err != nil {
+				t.Fatalf("transport.Do: %v", err)
+			}
+			if got := attempts.Load(); got != 2 {
+				t.Fatalf("WebSocket attempts = %d, want exactly 2", got)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(seenHeaders) != 2 || len(seenBodies) != 2 {
+				t.Fatalf("captured attempts = %d headers, %d bodies", len(seenHeaders), len(seenBodies))
+			}
+			if seenBodies[0] != seenBodies[1] {
+				t.Fatalf("request bodies differ across retry: %q vs %q", seenBodies[0], seenBodies[1])
+			}
+			for index, headers := range seenHeaders {
+				if got := headers.Get(AuthorizationHeader); got != "Bearer transport-token" {
+					t.Errorf("attempt %d authorization = %q", index+1, got)
+				}
+				if got := headers.Get(AccountIDHeader); got != "transport-account" {
+					t.Errorf("attempt %d account ID = %q", index+1, got)
+				}
+				if got := headers.Get(TurnStateHeader); got != "replacement-state" {
+					t.Errorf("attempt %d turn state = %q", index+1, got)
+				}
+			}
+		})
+	}
+}
 
 func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 	messageReceived := make(chan string, 1)
