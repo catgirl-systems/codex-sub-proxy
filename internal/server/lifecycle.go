@@ -237,68 +237,65 @@ type lifecycleUsagePayload struct {
 }
 
 func migrateAccounts(db *gorm.DB) error {
-	if !db.Migrator().HasTable(&AccountRecord{}) {
-		if err := db.Exec(`
-			CREATE TABLE accounts (
-				id TEXT PRIMARY KEY NOT NULL,
-				provider TEXT NOT NULL,
-				provider_account_id TEXT NOT NULL,
-				credential_path TEXT NOT NULL DEFAULT '',
-				enabled INTEGER NOT NULL DEFAULT 0,
-				is_default INTEGER NOT NULL DEFAULT 0,
-				plan_type TEXT NOT NULL DEFAULT '',
-				email TEXT NOT NULL DEFAULT '',
-				created_at DATETIME NOT NULL,
-				updated_at DATETIME NOT NULL,
-				last_seen_at DATETIME,
-				cooldown_until DATETIME,
-				last_error_class TEXT NOT NULL DEFAULT '',
-				CHECK (provider = 'codex')
-			)`).Error; err != nil {
-			return fmt.Errorf("create accounts table: %w", err)
-		}
-	} else if !db.Migrator().HasColumn(&AccountRecord{}, "provider_account_id") {
-		if err := db.Exec("ALTER TABLE accounts RENAME TO accounts_v1").Error; err != nil {
-			return fmt.Errorf("rename legacy accounts table: %w", err)
-		}
-		if err := db.Exec(`
-			CREATE TABLE accounts (
-				id TEXT PRIMARY KEY NOT NULL,
-				provider TEXT NOT NULL,
-				provider_account_id TEXT NOT NULL,
-				credential_path TEXT NOT NULL DEFAULT '',
-				enabled INTEGER NOT NULL DEFAULT 0,
-				is_default INTEGER NOT NULL DEFAULT 0,
-				plan_type TEXT NOT NULL DEFAULT '',
-				email TEXT NOT NULL DEFAULT '',
-				created_at DATETIME NOT NULL,
-				updated_at DATETIME NOT NULL,
-				last_seen_at DATETIME,
-				cooldown_until DATETIME,
-				last_error_class TEXT NOT NULL DEFAULT '',
-				CHECK (provider = 'codex')
-			)`).Error; err != nil {
-			return fmt.Errorf("create migrated accounts table: %w", err)
-		}
-		if err := db.Exec(`
-			INSERT INTO accounts
-				(id, provider, provider_account_id, credential_path, enabled, is_default,
-				 plan_type, email, created_at, updated_at, last_seen_at, cooldown_until, last_error_class)
-			SELECT id, provider, account_id, '', 0, 0, '', '', created_at, updated_at, NULL, NULL, ''
-			FROM accounts_v1`).Error; err != nil {
-			return fmt.Errorf("copy legacy accounts: %w", err)
-		}
-		if err := db.Exec("DROP TABLE accounts_v1").Error; err != nil {
-			return fmt.Errorf("drop legacy accounts table: %w", err)
-		}
+	if db == nil {
+		return errors.New("lifecycle database is nil")
 	}
-	if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_provider_account_id ON accounts(provider_account_id)").Error; err != nil {
-		return fmt.Errorf("index account identities: %w", err)
-	}
-	if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_default ON accounts(is_default) WHERE is_default = 1").Error; err != nil {
-		return fmt.Errorf("index default account: %w", err)
-	}
-	return nil
+	const createAccountsTable = `
+		CREATE TABLE accounts (
+			id TEXT PRIMARY KEY NOT NULL,
+			provider TEXT NOT NULL,
+			provider_account_id TEXT NOT NULL,
+			credential_path TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 0,
+			is_default INTEGER NOT NULL DEFAULT 0,
+			plan_type TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			last_seen_at DATETIME,
+			cooldown_until DATETIME,
+			last_error_class TEXT NOT NULL DEFAULT '',
+			CHECK (provider = 'codex')
+		)`
+	return db.Transaction(func(tx *gorm.DB) error {
+		if !tx.Migrator().HasTable(&AccountRecord{}) {
+			if err := tx.Exec(createAccountsTable).Error; err != nil {
+				return fmt.Errorf("create accounts table: %w", err)
+			}
+		} else if !tx.Migrator().HasColumn(&AccountRecord{}, "provider_account_id") {
+			if err := tx.Exec("ALTER TABLE accounts RENAME TO accounts_v1").Error; err != nil {
+				return fmt.Errorf("rename legacy accounts table: %w", err)
+			}
+			if err := tx.Exec(createAccountsTable).Error; err != nil {
+				return fmt.Errorf("create migrated accounts table: %w", err)
+			}
+			if err := tx.Exec(`
+				INSERT INTO accounts
+					(id, provider, provider_account_id, credential_path, enabled, is_default,
+					 plan_type, email, created_at, updated_at, last_seen_at, cooldown_until, last_error_class)
+				SELECT legacy.id, 'codex', legacy.account_id, '', 0, 0, '', '', legacy.created_at, legacy.updated_at, NULL, NULL, ''
+				FROM accounts_v1 AS legacy
+				WHERE NOT EXISTS (
+					SELECT 1
+					FROM accounts_v1 AS earlier
+					WHERE earlier.account_id = legacy.account_id
+						AND (earlier.created_at < legacy.created_at OR
+							(earlier.created_at = legacy.created_at AND earlier.id < legacy.id))
+				)`).Error; err != nil {
+				return fmt.Errorf("copy legacy accounts: %w", err)
+			}
+			if err := tx.Exec("DROP TABLE accounts_v1").Error; err != nil {
+				return fmt.Errorf("drop legacy accounts table: %w", err)
+			}
+		}
+		if err := tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_provider_account_id ON accounts(provider_account_id)").Error; err != nil {
+			return fmt.Errorf("index account identities: %w", err)
+		}
+		if err := tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_default ON accounts(is_default) WHERE is_default = 1").Error; err != nil {
+			return fmt.Errorf("index default account: %w", err)
+		}
+		return nil
+	})
 }
 
 func migrateLifecycle(db *gorm.DB) error {
@@ -309,7 +306,6 @@ func migrateLifecycle(db *gorm.DB) error {
 		return err
 	}
 	if err := db.AutoMigrate(
-		&AccountRecord{},
 		&ConversationRecord{},
 		&RequestRecord{},
 		&ResponseLinkRecord{},

@@ -26,6 +26,103 @@ func responsesFixtureForCall(fixture []byte, call int32) []byte {
 	return bytes.ReplaceAll(fixture, []byte(`resp_fixture_001`), []byte(fmt.Sprintf("resp_fixture_%03d", call)))
 }
 
+func TestResponsesErrorMapsBrokerBindToInternalError(t *testing.T) {
+	status, response := responsesError(ErrBrokerBind)
+	if status != http.StatusInternalServerError || response.Type != responsesServerErrorType ||
+		response.Code != "internal_error" {
+		t.Fatalf("broker bind response = %d %#v", status, response)
+	}
+}
+
+type bindFailureBroker struct {
+	dispatches atomic.Int32
+}
+
+func (broker *bindFailureBroker) bind(bind func(codex.Account) error) error {
+	if bind == nil {
+		return ErrBrokerBind
+	}
+	if err := bind(codex.Account{}); err != nil {
+		return fmt.Errorf("%w: %w", ErrBrokerBind, err)
+	}
+	broker.dispatches.Add(1)
+	return nil
+}
+
+func (broker *bindFailureBroker) DoResponses(_ context.Context, _ codex.SelectionRequest, _ codex.CodexResponseRequest, _ string, bind func(codex.Account) error) (BrokerResponsesResult, error) {
+	return BrokerResponsesResult{}, broker.bind(bind)
+}
+
+func (broker *bindFailureBroker) StreamResponses(_ context.Context, _ codex.SelectionRequest, _ codex.CodexResponseRequest, _ string, _ func(codex.Account) error, _ func(codex.CodexResponseStreamEvent) error) (BrokerResponsesResult, error) {
+	return BrokerResponsesResult{}, ErrBrokerBind
+}
+
+func (broker *bindFailureBroker) Compact(_ context.Context, _ codex.SelectionRequest, _ codex.CodexCompactRequest, _ func(codex.Account) error) (BrokerCompactResult, error) {
+	return BrokerCompactResult{}, ErrBrokerBind
+}
+
+func (broker *bindFailureBroker) GenerateImage(_ context.Context, _ codex.SelectionRequest, _ codex.CodexImageGenerationRequest, bind func(codex.Account) error) (BrokerImageResult, error) {
+	return BrokerImageResult{}, broker.bind(bind)
+}
+
+func (broker *bindFailureBroker) EditImage(_ context.Context, _ codex.SelectionRequest, _ codex.CodexImageEditRequest, bind func(codex.Account) error) (BrokerImageResult, error) {
+	return BrokerImageResult{}, broker.bind(bind)
+}
+
+func TestBrokerBindFailureIsInternalAndDoesNotDispatch(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		upstreamCalls.Add(1)
+		http.NotFound(writer, request)
+	}))
+	defer upstream.Close()
+	broker := &bindFailureBroker{}
+	policy := &apikey.Policy{
+		Name: "bind-failure", Owner: "bind-failure",
+		AllowedEndpoints: []string{responsesEndpoint, chatCompletionsEndpoint, imagesGenerationsEndpoint},
+		AllowedModels:    []string{"gpt-5.6-sol", "gpt-image-2"},
+	}
+	servers, rawKey := newResponsesTestServerWithBroker(t, upstream.URL, policy, broker)
+	defer shutdownResponsesTestServer(t, servers)
+	for _, test := range []struct {
+		name, endpoint, body string
+	}{
+		{name: "responses", endpoint: responsesEndpoint, body: `{"model":"gpt-5.6-sol","input":"hello"}`},
+		{name: "chat", endpoint: chatCompletionsEndpoint, body: `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`},
+		{name: "image generation", endpoint: imagesGenerationsEndpoint, body: `{"model":"gpt-image-2","prompt":"hello"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+test.endpoint, strings.NewReader(test.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("bind failure status = %d, want 500 (body=%s)", response.StatusCode, body)
+			}
+			var decoded map[string]map[string]string
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("decode bind failure body: %v (%s)", err, body)
+			}
+			if decoded["error"]["code"] != "internal_error" {
+				t.Fatalf("bind failure body = %#v", decoded)
+			}
+		})
+	}
+	if broker.dispatches.Load() != 0 || upstreamCalls.Load() != 0 {
+		t.Fatalf("dispatches = %d, upstream calls = %d, want zero", broker.dispatches.Load(), upstreamCalls.Load())
+	}
+}
 func TestResponsesJSONPreservesImageAndUsage(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	fixture, err := os.ReadFile(filepath.Join("..", "codex", "testdata", "responses_terminal.sse"))
@@ -314,6 +411,30 @@ func TestResponsesCompatibilityMatrix(t *testing.T) {
 	} {
 		if _, err := privateResponseRequest(invalid); err == nil {
 			t.Fatal("invalid metadata marker was accepted")
+		}
+	}
+}
+
+func TestRequestHeaderConfigMatchesCaseInsensitiveKeys(t *testing.T) {
+	config, err := requestHeaderConfig(http.Header{
+		"sEsSiOn_Id":                             {"session"},
+		"ThReAd-Id":                              {"thread"},
+		"X-OPENAI-INTERNAL-CODEX-RESPONSES-LITE": {"true"},
+	})
+	if err != nil {
+		t.Fatalf("mixed-case request headers: %v", err)
+	}
+	if config.SessionID != "session" || config.ThreadID != "thread" || !config.ResponsesLiteRequested {
+		t.Fatalf("request header config = %#v", config)
+	}
+
+	for _, headers := range []http.Header{
+		{"session_id": {"one"}, "SESSION_ID": {"two"}},
+		{"thread-id": {"one"}, "THREAD-ID": {"two"}},
+		{"x-openai-internal-codex-responses-lite": {"true"}, "X-OPENAI-INTERNAL-CODEX-RESPONSES-LITE": {"true"}},
+	} {
+		if _, err := requestHeaderConfig(headers); err == nil {
+			t.Fatalf("duplicate case-variant request headers accepted: %#v", headers)
 		}
 	}
 }
@@ -848,6 +969,11 @@ func responsesTestJSONMetadata(count int) string {
 
 func newResponsesTestServer(t *testing.T, upstreamURL string, policy *apikey.Policy, serverWriteTimeout ...time.Duration) (*Servers, string) {
 	t.Helper()
+	return newResponsesTestServerWithBroker(t, upstreamURL, policy, nil, serverWriteTimeout...)
+}
+
+func newResponsesTestServerWithBroker(t *testing.T, upstreamURL string, policy *apikey.Policy, customBroker UpstreamBroker, serverWriteTimeout ...time.Duration) (*Servers, string) {
+	t.Helper()
 	timeout := writeTimeout
 	if len(serverWriteTimeout) == 1 {
 		timeout = serverWriteTimeout[0]
@@ -873,27 +999,36 @@ func newResponsesTestServer(t *testing.T, upstreamURL string, policy *apikey.Pol
 	if err != nil {
 		t.Fatal(err)
 	}
-	activeKey, err := envelope.NewKey(1, bytes.Repeat([]byte{7}, envelope.KeySize))
-	if err != nil {
-		t.Fatal(err)
+	if customBroker == nil {
+		activeKey, err := envelope.NewKey(1, bytes.Repeat([]byte{7}, envelope.KeySize))
+		if err != nil {
+			t.Fatal(err)
+		}
+		credentialKeys, err := envelope.NewKeySet(activeKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		credentialPath := filepath.Join(t.TempDir(), "credential.enc")
+		if err := codex.SaveCredential(credentialPath, codex.Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}, credentialKeys); err != nil {
+			t.Fatal(err)
+		}
+		refresher, err := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{Issuer: "https://auth.openai.com", ClientID: "client"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport, err := codex.NewResponsesTransport(codex.ResponsesTransportOptions{Policy: codex.ResponsesTransportSSE, ResponsesURL: upstreamURL, Refresher: refresher})
+		if err != nil {
+			t.Fatal(err)
+		}
+		customBroker, err = NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
+			Account:   codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
+			Responses: transport,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	credentialKeys, err := envelope.NewKeySet(activeKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	credentialPath := filepath.Join(t.TempDir(), "credential.enc")
-	if err := codex.SaveCredential(credentialPath, codex.Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}, credentialKeys); err != nil {
-		t.Fatal(err)
-	}
-	refresher, err := codex.NewRefresher(credentialPath, credentialKeys, codex.RefresherOptions{Issuer: "https://auth.openai.com", ClientID: "client"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	transport, err := codex.NewResponsesTransport(codex.ResponsesTransportOptions{Policy: codex.ResponsesTransportSSE, ResponsesURL: upstreamURL, Refresher: refresher})
-	if err != nil {
-		t.Fatal(err)
-	}
-	servers, err := startWithWriteTimeout(Config{Listen: "127.0.0.1:0", AdminListen: "127.0.0.1:0", Database: database, APIKeyHMACKey: hmacKey, ResponsesTransport: transport}, NewReadiness(), timeout)
+	servers, err := startWithWriteTimeout(Config{Listen: "127.0.0.1:0", AdminListen: "127.0.0.1:0", Database: database, APIKeyHMACKey: hmacKey, UpstreamBroker: customBroker}, NewReadiness(), timeout)
 	if err != nil {
 		t.Fatal(err)
 	}

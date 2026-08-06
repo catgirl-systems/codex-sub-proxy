@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1907,8 +1908,60 @@ func TestSchemaMigratesLegacyAccountsAndContinuationTables(t *testing.T) {
 	if err := db.Exec(`INSERT INTO accounts(id, provider, account_id, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`, "profile-1", "codex", "provider-1", now, now, now.Add(time.Hour)).Error; err != nil {
 		t.Fatalf("insert legacy account: %v", err)
 	}
+	for _, legacy := range []struct {
+		id        string
+		accountID string
+		createdAt time.Time
+	}{
+		{id: "profile-later", accountID: "provider-duplicate", createdAt: now.Add(time.Hour)},
+		{id: "profile-earlier", accountID: "provider-duplicate", createdAt: now.Add(-time.Hour)},
+		{id: "profile-tie-z", accountID: "provider-tie", createdAt: now},
+		{id: "profile-tie-a", accountID: "provider-tie", createdAt: now},
+	} {
+		if err := db.Exec(`INSERT INTO accounts(id, provider, account_id, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			legacy.id, "codex", legacy.accountID, legacy.createdAt, legacy.createdAt, now.Add(time.Hour)).Error; err != nil {
+			t.Fatalf("insert duplicate legacy account %q: %v", legacy.id, err)
+		}
+	}
 	if err := MigrateSchema(db); err != nil {
 		t.Fatalf("migrate schema: %v", err)
+	}
+	var beforeSecondMigration []struct {
+		ID                string `gorm:"column:id"`
+		ProviderAccountID string `gorm:"column:provider_account_id"`
+	}
+	if err := db.Model(&AccountRecord{}).Select("id, provider_account_id").Order("id ASC").Scan(&beforeSecondMigration).Error; err != nil {
+		t.Fatalf("snapshot migrated account identities: %v", err)
+	}
+	if err := MigrateSchema(db); err != nil {
+		t.Fatalf("repeat schema migration: %v", err)
+	}
+	var afterSecondMigration []struct {
+		ID                string `gorm:"column:id"`
+		ProviderAccountID string `gorm:"column:provider_account_id"`
+	}
+	if err := db.Model(&AccountRecord{}).Select("id, provider_account_id").Order("id ASC").Scan(&afterSecondMigration).Error; err != nil {
+		t.Fatalf("load repeated migrated account identities: %v", err)
+	}
+	if !reflect.DeepEqual(afterSecondMigration, beforeSecondMigration) {
+		t.Fatalf("repeated schema migration changed account identities: before=%v after=%v", beforeSecondMigration, afterSecondMigration)
+	}
+	var duplicateAccounts []struct {
+		ID                string `gorm:"column:id"`
+		ProviderAccountID string `gorm:"column:provider_account_id"`
+	}
+	if err := db.Model(&AccountRecord{}).Select("id, provider_account_id").Where("provider_account_id IN ?", []string{"provider-duplicate", "provider-tie"}).Order("provider_account_id ASC").Find(&duplicateAccounts).Error; err != nil {
+		t.Fatalf("load deduplicated account identities: %v", err)
+	}
+	wantDuplicateAccounts := []struct {
+		ID                string `gorm:"column:id"`
+		ProviderAccountID string `gorm:"column:provider_account_id"`
+	}{
+		{ID: "profile-earlier", ProviderAccountID: "provider-duplicate"},
+		{ID: "profile-tie-a", ProviderAccountID: "provider-tie"},
+	}
+	if !reflect.DeepEqual(duplicateAccounts, wantDuplicateAccounts) {
+		t.Fatalf("deduplicated account identities = %v, want %v", duplicateAccounts, wantDuplicateAccounts)
 	}
 	var account AccountRecord
 	if err := db.Where("id = ?", "profile-1").First(&account).Error; err != nil {

@@ -11,6 +11,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
@@ -31,7 +32,7 @@ const (
 	responsesLiteClientMetadataKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
-func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
+func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setJournalAuditContext(ctx, journal, responsesEndpoint)
@@ -87,14 +88,19 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
-		responsesLiteHeader, err := responsesLiteHeaderValue(request.Header.Values(codex.ResponsesLiteHeader))
+		requestHeaders, err := requestHeaderConfig(request.Header)
 		if err != nil {
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
 			return
 		}
+		responsesLiteHeader := requestHeaders.ResponsesLiteRequested
 		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, responsesEndpoint, publicRequest.Model)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
+			return
+		}
+		if broker == nil {
+			writeResponsesError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
 			return
 		}
 		journalInput, err := json.Marshal(publicRequest)
@@ -133,12 +139,6 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 		defer finishJournalRequest(ctx, journal, journalRequestID)
-		if journalMetadata.AccountID != "" && journal != nil {
-			if err := journal.BindAccount(requestContext, journalRequestID.ID, journalMetadata.AccountID, ""); err != nil {
-				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
-				return
-			}
-		}
 		privateRequest, err := privateResponseRequest(publicRequest)
 		if err != nil {
 			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
@@ -149,6 +149,16 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 			return
 		}
 		privateRequest.ResponsesLite = responsesLiteHeader || privateRequest.ResponsesLite
+		selection := codex.SelectionRequest{
+			Endpoint: responsesEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+			Headers: requestHeaders,
+		}
+		bindAccount := func(account codex.Account) error {
+			if journal == nil {
+				return nil
+			}
+			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, "")
+		}
 
 		if publicRequest.Stream {
 			lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
@@ -162,7 +172,7 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 				return
 			}
 			defer func() { _ = lease.release("request ended") }()
-			serveResponsesStream(ctx, requestContext, transport, privateRequest, lease, artifacts, artifactRequired)
+			serveResponsesStream(ctx, requestContext, broker, selection, privateRequest, journalRequestID.AccountID, bindAccount, lease, artifacts, artifactRequired)
 			return
 		}
 		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxOutputTokens))
@@ -182,7 +192,8 @@ func newResponsesHandler(authorizer *apikey.Authorizer, transport *codex.Respons
 		}
 
 		setTransportOutcome(ctx, "http")
-		result, err := transport.Do(requestContext, privateRequest)
+		brokerResult, err := broker.DoResponses(requestContext, selection, privateRequest, journalRequestID.AccountID, bindAccount)
+		result := brokerResult.Result
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
 				return
@@ -299,6 +310,43 @@ func responsesLiteHeaderValue(values []string) (bool, error) {
 		return false, errors.New("Responses Lite header must contain one true value")
 	}
 	return true, nil
+}
+
+func requestHeaderConfig(headers http.Header) (codex.RequestHeaderConfig, error) {
+	lite, err := responsesLiteHeaderValue(headerValuesEqualFold(headers, codex.ResponsesLiteHeader))
+	if err != nil {
+		return codex.RequestHeaderConfig{}, err
+	}
+	sessionID, err := boundedRequestHeader(headers, codex.SessionIDHeader)
+	if err != nil {
+		return codex.RequestHeaderConfig{}, err
+	}
+	threadID, err := boundedRequestHeader(headers, codex.ThreadIDHeader)
+	if err != nil {
+		return codex.RequestHeaderConfig{}, err
+	}
+	return codex.RequestHeaderConfig{SessionID: sessionID, ThreadID: threadID, ResponsesLiteRequested: lite}, nil
+}
+
+func boundedRequestHeader(headers http.Header, name string) (string, error) {
+	values := headerValuesEqualFold(headers, name)
+	if len(values) == 0 {
+		return "", nil
+	}
+	if len(values) != 1 || len(values[0]) > 256 || strings.ContainsAny(values[0], "\r\n") {
+		return "", fmt.Errorf("%s header is invalid", name)
+	}
+	return values[0], nil
+}
+
+func headerValuesEqualFold(headers http.Header, name string) []string {
+	var values []string
+	for key, entries := range headers {
+		if strings.EqualFold(key, name) {
+			values = append(values, entries...)
+		}
+	}
+	return values
 }
 
 func responsesLiteClientMetadataValue(metadata map[string]string) (bool, error) {
@@ -466,7 +514,7 @@ func privateText(text *openai.TextConfig) *codex.CodexTextConfig {
 	return privateText
 }
 
-func serveResponsesStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
+func serveResponsesStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, forcedAccountID string, bindAccount func(codex.Account) error, lease *quotaLease, artifacts *ArtifactStore, artifactRequired bool) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
@@ -495,7 +543,7 @@ func serveResponsesStream(ctx iris.Context, requestContext context.Context, tran
 	terminalWritten := false
 	lastSequence := -1
 	setTransportOutcome(ctx, "websocket")
-	streamErr := transport.Stream(requestContext, privateRequest, func(event codex.CodexResponseStreamEvent) error {
+	_, streamErr := broker.StreamResponses(requestContext, selection, privateRequest, forcedAccountID, bindAccount, func(event codex.CodexResponseStreamEvent) error {
 		if requestContext.Err() != nil {
 			return requestContext.Err()
 		}
@@ -1001,6 +1049,12 @@ func responsesError(err error) (int, openai.Error) {
 		return http.StatusBadRequest, openai.Error{Type: responsesErrorType, Code: "invalid_request", Message: "The request is invalid."}
 	}
 	var safeError *codex.SafeError
+	if errors.Is(err, ErrBrokerUnavailable) || errors.Is(err, codex.ErrNoAvailableAccount) {
+		return http.StatusServiceUnavailable, openai.Error{Type: responsesServerErrorType, Code: "upstream_unavailable", Message: "The upstream service is unavailable."}
+	}
+	if errors.Is(err, ErrBrokerBind) {
+		return http.StatusInternalServerError, openai.Error{Type: responsesServerErrorType, Code: "internal_error", Message: "Internal server error."}
+	}
 	if errors.As(err, &safeError) {
 		status := safeError.StatusCode
 		if status < 400 || status > 599 {

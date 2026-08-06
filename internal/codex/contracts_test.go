@@ -223,6 +223,19 @@ func TestResponsesCompatibilityMatrix(t *testing.T) {
 	}
 }
 
+func TestCodexCompactRequestRejectsOversizedToolsDuringDecode(t *testing.T) {
+	tools := make([]string, maxCodexItemTools+1)
+	for index := range tools {
+		tools[index] = `{"type":"function","name":"fixture"}`
+	}
+	raw := `{"model":"gpt-5.6-sol","input":"fixture","tools":[` + strings.Join(tools, ",") + `]}`
+	var request CodexCompactRequest
+	err := json.Unmarshal([]byte(raw), &request)
+	if err == nil || !strings.Contains(err.Error(), "too many tools") {
+		t.Fatalf("oversized compact tools error = %v", err)
+	}
+}
+
 func TestCodexStreamEventArgumentsRoundTrip(t *testing.T) {
 	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}"}`)
 	var event CodexResponseStreamEvent

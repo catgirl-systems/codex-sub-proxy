@@ -107,6 +107,11 @@ func NewImagesClient(options ImagesClientOptions) (*ImagesClient, error) {
 
 // Generate creates images from a text prompt.
 func (client *ImagesClient) Generate(ctx context.Context, request CodexImageGenerationRequest) (CodexImageResult, error) {
+	return client.GenerateWithHeaders(ctx, request, RequestHeaderConfig{})
+}
+
+// GenerateWithHeaders creates images with bounded per-call header variations.
+func (client *ImagesClient) GenerateWithHeaders(ctx context.Context, request CodexImageGenerationRequest, requestHeaders RequestHeaderConfig) (CodexImageResult, error) {
 	if err := validateCodexImageGenerationRequest(request); err != nil {
 		return CodexImageResult{}, fmt.Errorf("%w: %w", ErrInvalidImageRequest, err)
 	}
@@ -117,11 +122,16 @@ func (client *ImagesClient) Generate(ctx context.Context, request CodexImageGene
 	if len(body) == 0 || len(body) > maxCodexImageRequestBytes {
 		return CodexImageResult{}, errors.New("Codex Images request is too large")
 	}
-	return client.do(ctx, false, body, request.N)
+	return client.do(ctx, false, body, request.N, requestHeaders)
 }
 
 // Edit creates images from one or more source images.
 func (client *ImagesClient) Edit(ctx context.Context, request CodexImageEditRequest) (CodexImageResult, error) {
+	return client.EditWithHeaders(ctx, request, RequestHeaderConfig{})
+}
+
+// EditWithHeaders edits images with bounded per-call header variations.
+func (client *ImagesClient) EditWithHeaders(ctx context.Context, request CodexImageEditRequest, requestHeaders RequestHeaderConfig) (CodexImageResult, error) {
 	if err := validateCodexImageEditRequest(request); err != nil {
 		return CodexImageResult{}, fmt.Errorf("%w: %w", ErrInvalidImageRequest, err)
 	}
@@ -132,12 +142,15 @@ func (client *ImagesClient) Edit(ctx context.Context, request CodexImageEditRequ
 	if len(body) == 0 || len(body) > maxCodexImageRequestBytes {
 		return CodexImageResult{}, errors.New("Codex Images request is too large")
 	}
-	return client.do(ctx, true, body, request.N)
+	return client.do(ctx, true, body, request.N, requestHeaders)
 }
 
-func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n *int) (CodexImageResult, error) {
+func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n *int, requestHeaders RequestHeaderConfig) (CodexImageResult, error) {
 	if ctx == nil {
 		return CodexImageResult{}, errors.New("Codex Images context is nil")
+	}
+	if err := requestHeaders.Validate(); err != nil {
+		return CodexImageResult{}, err
 	}
 	operationContext, cancel := codexSSEContext(ctx, client.httpClient.Timeout)
 	defer cancel()
@@ -157,6 +170,7 @@ func (client *ImagesClient) do(ctx context.Context, edit bool, body []byte, n *i
 	response, err := client.refresher.Do(operationContext, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
 		headers := client.headers
 		headers.ImageTurnID = imageTurnID
+		headers = mergeRequestHeaders(headers, requestHeaders)
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
 		if credential.AccountIsFedRAMP {

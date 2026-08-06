@@ -91,6 +91,33 @@ func TestImportCredentialEncryptsWithoutChangingSource(t *testing.T) {
 	}
 }
 
+func TestImportCredentialHonorsCancellationBeforeSave(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "auth.json")
+	source := map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "source-access",
+			"refresh_token": "source-refresh",
+			"account_id":    "source-account",
+			"expires_at":    time.Now().Add(time.Hour).Unix(),
+		},
+	}
+	sourceBytes, err := json.Marshal(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, sourceBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	destinationPath := filepath.Join(t.TempDir(), "credential.enc")
+	ctx := &cancelOnCheckContext{cancelAt: 2}
+	if _, err := ImportCredential(ctx, sourcePath, destinationPath, testCredentialKeys(t)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("import error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(destinationPath); !os.IsNotExist(err) {
+		t.Fatalf("destination stat error = %v, want no destination", err)
+	}
+}
+
 func TestCredentialEncryptionAuthenticatesAndHidesTokens(t *testing.T) {
 	credential := Credential{
 		AccessToken:  "access-secret",
@@ -223,7 +250,7 @@ func TestSaveCredentialCanceledBeforeReplacement(t *testing.T) {
 	replacement.AccessToken = "new-access"
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := saveCredential(ctx, path, replacement, keys)
+	err := SaveCredentialContext(ctx, path, replacement, keys)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("save error = %v, want context.Canceled", err)
 	}
@@ -240,6 +267,85 @@ func TestSaveCredentialCanceledBeforeReplacement(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary credential files remain: %v", matches)
+	}
+}
+
+func TestCredentialRollbackRefusesConcurrentReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.enc")
+	keys := testCredentialKeys(t)
+	original := Credential{AccessToken: "old-access", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}
+	if err := SaveCredential(path, original, keys); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original
+	replacement.AccessToken = "replacement-access"
+	rollback, err := SaveCredentialContextWithRollback(context.Background(), path, replacement, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := replacement
+	concurrent.AccessToken = "concurrent-access"
+	if err := SaveCredential(path, concurrent, keys); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback.Restore(context.Background()); err == nil {
+		t.Fatal("rollback restored over a concurrent replacement")
+	}
+	stored, err := LoadCredential(path, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameCredential(stored, concurrent) {
+		t.Fatalf("stored credential = %#v, want concurrent replacement", stored)
+	}
+}
+
+func TestCredentialRollbackRefusesSymlinkAndDeletionReplacement(t *testing.T) {
+	keys := testCredentialKeys(t)
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "credential.enc")
+	credential := Credential{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), AccountID: "account"}
+	if err := SaveCredential(path, credential, keys); err != nil {
+		t.Fatal(err)
+	}
+	replacement := credential
+	replacement.AccessToken = "replacement"
+	rollback, err := SaveCredentialContextWithRollback(context.Background(), path, replacement, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tempDir, "target")
+	targetBytes := []byte("target")
+	if err := os.WriteFile(target, targetBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback.Restore(context.Background()); err == nil {
+		t.Fatal("rollback followed a swapped credential symlink")
+	}
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, targetBytes) {
+		t.Fatalf("symlink target changed: %q, %v", got, err)
+	}
+
+	deletePath := filepath.Join(tempDir, "delete-credential.enc")
+	deleteRollback, err := SaveCredentialContextWithRollback(context.Background(), deletePath, credential, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrentBytes := []byte("concurrent replacement")
+	if err := os.WriteFile(deletePath, concurrentBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteRollback.Restore(context.Background()); err == nil {
+		t.Fatal("deletion rollback removed a concurrent replacement")
+	}
+	if got, err := os.ReadFile(deletePath); err != nil || !bytes.Equal(got, concurrentBytes) {
+		t.Fatalf("concurrent replacement changed: %q, %v", got, err)
 	}
 }
 

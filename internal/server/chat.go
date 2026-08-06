@@ -125,7 +125,7 @@ type chatNamedToolFunction struct {
 	Name string `json:"name" validate:"required,max=64"`
 }
 
-func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.ResponsesTransport, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
+func newChatCompletionsHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setJournalAuditContext(ctx, journal, chatCompletionsEndpoint)
@@ -190,9 +190,18 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			}
 			return
 		}
+		requestHeaders, err := requestHeaderConfig(request.Header)
+		if err != nil {
+			writeChatError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
+			return
+		}
 		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, chatCompletionsEndpoint, publicRequest.Model)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
+			return
+		}
+		if broker == nil {
+			writeChatError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
 			return
 		}
 		journalInput, err := json.Marshal(publicRequest)
@@ -217,6 +226,16 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			}
 			return
 		}
+		selection := codex.SelectionRequest{
+			Endpoint: chatCompletionsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+			Headers: requestHeaders,
+		}
+		bindAccount := func(account codex.Account) error {
+			if journal == nil {
+				return nil
+			}
+			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, "")
+		}
 		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, publicRequest.MaxCompletionTokens))
 		if err != nil {
 			var quotaErr *apikey.QuotaError
@@ -229,7 +248,7 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 		}
 		defer func() { _ = lease.release("request ended") }()
 		if publicRequest.Stream {
-			serveChatStream(ctx, requestContext, transport, privateRequest, publicRequest.Model, includeUsage, lease)
+			serveChatStream(ctx, requestContext, broker, selection, privateRequest, publicRequest.Model, includeUsage, bindAccount, lease)
 			return
 		}
 
@@ -238,7 +257,8 @@ func newChatCompletionsHandler(authorizer *apikey.Authorizer, transport *codex.R
 			return
 		}
 		setTransportOutcome(ctx, "http")
-		result, err := transport.Do(requestContext, privateRequest)
+		brokerResult, err := broker.DoResponses(requestContext, selection, privateRequest, "", bindAccount)
+		result := brokerResult.Result
 		if err != nil && (result.Response == nil || result.Response.Status != codex.CodexResponseStatusFailed) {
 			if requestContext.Err() != nil {
 				return
@@ -1060,7 +1080,7 @@ func chatResponseUsage(usage *codex.CodexUsage) (chatCompletionUsage, error) {
 	return result, nil
 }
 
-func serveChatStream(ctx iris.Context, requestContext context.Context, transport *codex.ResponsesTransport, privateRequest codex.CodexResponseRequest, model string, includeUsage bool, lease *quotaLease) {
+func serveChatStream(ctx iris.Context, requestContext context.Context, broker UpstreamBroker, selection codex.SelectionRequest, privateRequest codex.CodexResponseRequest, model string, includeUsage bool, bindAccount func(codex.Account) error, lease *quotaLease) {
 	var writer http.ResponseWriter = ctx.ResponseWriter()
 	baseWriter := writer
 	writer.Header().Set("Content-Type", "text/event-stream")
@@ -1101,7 +1121,7 @@ func serveChatStream(ctx iris.Context, requestContext context.Context, transport
 	state := newChatStreamState(model, includeUsage, writer, flusher)
 	setTransportOutcome(ctx, "websocket")
 	state.lease = lease
-	streamErr := transport.Stream(requestContext, privateRequest, state.event)
+	_, streamErr := broker.StreamResponses(requestContext, selection, privateRequest, "", bindAccount, state.event)
 	if requestContext.Err() != nil {
 		return
 	}

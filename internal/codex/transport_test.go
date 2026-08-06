@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,6 +112,127 @@ func TestResponsesTransportWebSocketWireContract(t *testing.T) {
 		t.Fatal("WebSocket request was not received")
 	}
 }
+
+func TestResponsesTransportCompactPostsTypedRequestAndHeaders(t *testing.T) {
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/compact" {
+			t.Errorf("compact request = %s %s", request.Method, request.URL.Path)
+		}
+		if got := request.Header.Get(AuthorizationHeader); got != "Bearer transport-token" {
+			t.Errorf("authorization = %q", got)
+		}
+		if got := request.Header.Get(AccountIDHeader); got != "transport-account" {
+			t.Errorf("account ID = %q", got)
+		}
+		if got := request.Header.Get(ResponsesLiteHeader); got != "true" {
+			t.Errorf("Responses Lite = %q", got)
+		}
+		var compact CodexCompactRequest
+		if err := json.NewDecoder(request.Body).Decode(&compact); err != nil {
+			t.Errorf("decode compact request: %v", err)
+		}
+		if compact.Model != "gpt-5.6-sol" || compact.Input == nil || compact.Input.String == nil || *compact.Input.String != "hello" {
+			t.Errorf("compact request = %#v", compact)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"cmp_1","object":"response.compaction","output":[{"type":"compaction","id":"item_1","encrypted_content":"encrypted","created_by":"codex"}]}`))
+	})
+	defer server.Close()
+
+	transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+	input := "hello"
+	result, err := transport.Compact(context.Background(), CodexCompactRequest{
+		Model:         "gpt-5.6-sol",
+		Input:         &CodexInput{String: &input},
+		ResponsesLite: true,
+	})
+	if err != nil {
+		t.Fatalf("transport.Compact: %v", err)
+	}
+	if result.ID != "cmp_1" || len(result.Output) != 1 || result.Output[0].Type != "compaction" ||
+		result.Output[0].EncryptedContent != "encrypted" {
+		t.Fatalf("compact result = %#v", result)
+	}
+}
+
+func TestResponsesTransportCompactMergesHeaderConfig(t *testing.T) {
+	var mu sync.Mutex
+	var seen [][2]string
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		seen = append(seen, [2]string{request.Header.Get(SessionIDHeader), request.Header.Get(ThreadIDHeader)})
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"cmp_1","object":"response.compaction","output":[{"type":"compaction","id":"item_1","encrypted_content":"encrypted","created_by":"codex"}]}`))
+	})
+	defer server.Close()
+	transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+	transport.headers = HeaderConfig{SessionID: "base-session", ThreadID: "base-thread"}
+	input := "hello"
+	request := CodexCompactRequest{Model: "gpt-5.6-sol", Input: &CodexInput{String: &input}}
+	if _, err := transport.Compact(context.Background(), request); err != nil {
+		t.Fatalf("compact with base headers: %v", err)
+	}
+	if _, err := transport.CompactWithHeaders(context.Background(), request, RequestHeaderConfig{
+		SessionID: "call-session", ThreadID: "call-thread",
+	}); err != nil {
+		t.Fatalf("compact with per-call headers: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := [][2]string{{"base-session", "base-thread"}, {"call-session", "call-thread"}}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("compact request headers = %v, want %v", seen, want)
+	}
+}
+
+func TestResponsesTransportPerCallHeadersDoNotMutateBaseConcurrently(t *testing.T) {
+	fixture := transportSSEFixture(t)
+	var mu sync.Mutex
+	seen := make(map[[2]string]int)
+	server := newTransportServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		key := [2]string{request.Header.Get(SessionIDHeader), request.Header.Get(ThreadIDHeader)}
+		mu.Lock()
+		seen[key]++
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write(fixture)
+	})
+	defer server.Close()
+	transport := newTestResponsesTransport(t, server, ResponsesTransportSSE)
+	transport.headers = HeaderConfig{SessionID: "base-session", ThreadID: "base-thread"}
+	requests := []RequestHeaderConfig{
+		{},
+		{SessionID: "call-session", ThreadID: "call-thread"},
+	}
+	errs := make(chan error, len(requests))
+	var waitGroup sync.WaitGroup
+	for _, requestHeaders := range requests {
+		waitGroup.Add(1)
+		go func(requestHeaders RequestHeaderConfig) {
+			defer waitGroup.Done()
+			_, err := transport.DoWithHeaders(context.Background(), CodexResponseRequest{
+				Model: "gpt-5.6-sol", Stream: true,
+			}, requestHeaders)
+			errs <- err
+		}(requestHeaders)
+	}
+	waitGroup.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Responses request: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen[[2]string{"base-session", "base-thread"}] != 1 ||
+		seen[[2]string{"call-session", "call-thread"}] != 1 ||
+		len(seen) != 2 {
+		t.Fatalf("concurrent request headers = %v", seen)
+	}
+}
+
 func TestResponsesTransportDoPreservesAggregateFailures(t *testing.T) {
 	tests := []struct {
 		name         string

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -430,6 +431,54 @@ func TestImagesClientRejectsInvalidInputBeforeDispatch(t *testing.T) {
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("invalid requests reached upstream: %d", requests.Load())
+	}
+}
+
+func TestImagesClientPerCallHeadersDoNotMutateBaseConcurrently(t *testing.T) {
+	fixture := readImageFixture(t, "images_generation.json")
+	var mu sync.Mutex
+	seen := make(map[[2]string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		key := [2]string{request.Header.Get(SessionIDHeader), request.Header.Get(ThreadIDHeader)}
+		mu.Lock()
+		seen[key]++
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(fixture)
+	}))
+	defer server.Close()
+	client := newTestImagesClient(t, server, "access-token", "account-123")
+	client.headers.SessionID = "base-session"
+	client.headers.ThreadID = "base-thread"
+	requestHeaders := []RequestHeaderConfig{
+		{},
+		{SessionID: "call-session", ThreadID: "call-thread"},
+	}
+	errs := make(chan error, len(requestHeaders))
+	var waitGroup sync.WaitGroup
+	for _, requestHeader := range requestHeaders {
+		waitGroup.Add(1)
+		go func(requestHeader RequestHeaderConfig) {
+			defer waitGroup.Done()
+			_, err := client.GenerateWithHeaders(context.Background(), CodexImageGenerationRequest{
+				Model: "gpt-image-2", Prompt: "rotate",
+			}, requestHeader)
+			errs <- err
+		}(requestHeader)
+	}
+	waitGroup.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Images request: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen[[2]string{"base-session", "base-thread"}] != 1 ||
+		seen[[2]string{"call-session", "call-thread"}] != 1 ||
+		len(seen) != 2 {
+		t.Fatalf("concurrent image request headers = %v", seen)
 	}
 }
 

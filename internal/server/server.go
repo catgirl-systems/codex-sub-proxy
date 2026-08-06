@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/config"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/envelope"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
@@ -40,9 +39,8 @@ type Config struct {
 	AdminBootstrapToken  []byte
 	AdminCookieSecure    bool
 	PayloadKeys          envelope.KeySet
-	ResponsesTransport   *codex.ResponsesTransport
+	UpstreamBroker       UpstreamBroker
 	StartupLock          *storage.ApplicationLock
-	ImagesClient         *codex.ImagesClient
 	ArtifactStore        *ArtifactStore
 	ArtifactRequired     bool
 	Retention            RetentionConfig
@@ -231,8 +229,7 @@ func startWithWriteTimeout(cfg Config, readiness *Readiness, serverWriteTimeout 
 			return adminStore != nil && adminStore.Available(context.Background())
 		})
 	}
-	dataHandler, err := newDataApplicationWithPolicy(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.ResponsesTransport, cfg.ImagesClient, journal, quota, cfg.ArtifactStore, cfg.ArtifactRequired, applicationPolicy{
-		listener:       "data",
+	dataHandler, err := newDataApplication(readiness, cfg.Database, cfg.APIKeyHMACKey, cfg.UpstreamBroker, journal, quota, cfg.ArtifactStore, cfg.ArtifactRequired, applicationPolicy{
 		allowedOrigins: allowedOrigins,
 		corsMaxAge:     cfg.CORS.MaxAge,
 		trustedProxies: trustedProxies,

@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
-	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/openai"
 	"github.com/kataras/iris/v12"
 	"gorm.io/gorm"
@@ -25,11 +24,7 @@ type modelsResponse struct {
 	Data   []modelObject `json:"data"`
 }
 
-func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) (*iris.Application, error) {
-	return newDataApplicationWithPolicy(readiness, db, hmacKey, transport, imagesClient, journal, quota, artifacts, artifactRequired, applicationPolicy{listener: "data"})
-}
-
-func newDataApplicationWithPolicy(readiness *Readiness, db *gorm.DB, hmacKey []byte, transport *codex.ResponsesTransport, imagesClient *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool, policy applicationPolicy) (*iris.Application, error) {
+func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool, policy applicationPolicy) (*iris.Application, error) {
 	app := buildHealthApplication(readiness)
 	authorizer := apikey.NewAuthorizer(db, hmacKey)
 	unavailable := func(ctx iris.Context) {
@@ -65,19 +60,19 @@ func newDataApplicationWithPolicy(readiness *Readiness, db *gorm.DB, hmacKey []b
 	} else {
 		app.Any(modelsEndpoint, unavailable)
 	}
-	if authorizer != nil && transport != nil && quota != nil {
-		app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, transport, journal, quota))
+	if authorizer != nil && broker != nil && quota != nil {
+		app.Any(chatCompletionsEndpoint, newChatCompletionsHandler(authorizer, broker, journal, quota))
 	} else {
 		app.Any(chatCompletionsEndpoint, unavailable)
 	}
-	if authorizer != nil && transport != nil && quota != nil {
-		app.Any(responsesEndpoint, newResponsesHandler(authorizer, transport, journal, quota, artifacts, artifactRequired))
+	if authorizer != nil && broker != nil && quota != nil {
+		app.Any(responsesEndpoint, newResponsesHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
 	} else {
 		app.Any(responsesEndpoint, unavailable)
 	}
 	if authorizer != nil && quota != nil {
-		app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
-		app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, imagesClient, journal, quota, artifacts, artifactRequired))
+		app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
+		app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
 	} else {
 		app.Any(imagesGenerationsEndpoint, unavailable)
 		app.Any(imagesEditsEndpoint, unavailable)

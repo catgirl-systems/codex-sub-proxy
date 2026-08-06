@@ -577,7 +577,14 @@ func TestAPIKeyFinalAuthorizationReloadsAfterAdminPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dataApp, err := newDataApplication(NewReadiness(), db, apiHMAC, &codex.ResponsesTransport{}, &codex.ImagesClient{}, nil, quota, nil, false)
+	broker, err := NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
+		Account:   codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
+		Responses: &codex.ResponsesTransport{}, Images: &codex.ImagesClient{},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataApp, err := newDataApplication(NewReadiness(), db, apiHMAC, broker, nil, quota, nil, false, applicationPolicy{listener: "data"})
 	if err != nil {
 		t.Fatal(err)
 	}

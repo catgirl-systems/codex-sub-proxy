@@ -226,10 +226,19 @@ const (
 	ResponsesTransportSSE                ResponsesTransport = "sse"
 )
 
+type AccountSelector string
+
+const (
+	AccountSelectorSingle     AccountSelector = "single"
+	AccountSelectorRoundRobin AccountSelector = "round_robin"
+	AccountSelectorQuotaAware AccountSelector = "quota_aware"
+)
+
 type CodexConfig struct {
 	CredentialFile     string             `toml:"credential_file" validate:"required"`
 	ResponsesTransport ResponsesTransport `toml:"responses_transport" validate:"oneof=websocket_preferred sse"`
 	ResponsesURL       string             `toml:"responses_url"`
+	AccountSelector    AccountSelector    `toml:"account_selector" validate:"oneof=single round_robin quota_aware"`
 }
 
 var configurationValidation = func() *validator.Validate {
@@ -332,6 +341,7 @@ func Default() Config {
 		Codex: CodexConfig{
 			CredentialFile:     defaultCredentialFile,
 			ResponsesTransport: ResponsesTransportWebSocketPreferred,
+			AccountSelector:    AccountSelectorSingle,
 		},
 		Journal: JournalConfig{
 			Mode:          JournalModeDurable,
@@ -1037,6 +1047,9 @@ func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Security.AdminTokenHMACKeyEnv, "CSP_SECURITY_ADMIN_TOKEN_HMAC_KEY_ENV")
 	overrideString(&cfg.Security.AdminBootstrapTokenEnv, "CSP_SECURITY_ADMIN_BOOTSTRAP_TOKEN_ENV")
 	overrideString(&cfg.Codex.ResponsesURL, "CSP_CODEX_RESPONSES_URL")
+	accountSelector := string(cfg.Codex.AccountSelector)
+	overrideString(&accountSelector, "CSP_CODEX_ACCOUNT_SELECTOR")
+	cfg.Codex.AccountSelector = AccountSelector(accountSelector)
 	overrideString(&cfg.Codex.CredentialFile, "CSP_CODEX_CREDENTIAL_FILE")
 	journalMode := string(cfg.Journal.Mode)
 	overrideString(&journalMode, "CSP_JOURNAL_MODE")

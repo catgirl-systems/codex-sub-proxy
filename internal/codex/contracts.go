@@ -113,6 +113,78 @@ type CodexResponseRequest struct {
 	ResponsesLite bool `json:"-"`
 }
 
+// CodexCompactRequest is the private request body for the Responses compact endpoint.
+type CodexCompactRequest struct {
+	Model                string                `json:"model"`
+	Input                *CodexInput           `json:"input,omitempty"`
+	Instructions         string                `json:"instructions,omitempty"`
+	Tools                []CodexTool           `json:"tools,omitempty"`
+	ParallelToolCalls    *bool                 `json:"parallel_tool_calls,omitempty"`
+	Reasoning            *CodexReasoningConfig `json:"reasoning,omitempty"`
+	Text                 *CodexTextConfig      `json:"text,omitempty"`
+	PromptCacheKey       string                `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string                `json:"prompt_cache_retention,omitempty"`
+	ServiceTier          string                `json:"service_tier,omitempty"`
+
+	// ResponsesLite requests the private Lite transport marker and is never
+	// serialized into the private request body.
+	ResponsesLite bool `json:"-"`
+}
+
+func (request *CodexCompactRequest) UnmarshalJSON(data []byte) error {
+	if len(data) > maxCodexContractBytes {
+		return fmt.Errorf("decode private compact request: body exceeds %d bytes", maxCodexContractBytes)
+	}
+	*request = CodexCompactRequest{}
+	type compactRequest CodexCompactRequest
+	wire := struct {
+		*compactRequest
+		Tools json.RawMessage `json:"tools"`
+	}{
+		compactRequest: (*compactRequest)(request),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return fmt.Errorf("decode private compact request: %w", err)
+	}
+	if wire.Tools != nil {
+		if bytes.Equal(bytes.TrimSpace(wire.Tools), []byte("null")) {
+			request.Tools = nil
+		} else {
+			tools, err := decodeCodexTools(wire.Tools, "decode private compact request tools")
+			if err != nil {
+				return err
+			}
+			request.Tools = tools
+		}
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("decode private compact request: multiple JSON values")
+		}
+		return fmt.Errorf("decode private compact request: %w", err)
+	}
+	return nil
+}
+
+func (request CodexCompactRequest) validate() error {
+	if strings.TrimSpace(request.Model) == "" {
+		return errors.New("compact request model is required")
+	}
+	if request.Input == nil {
+		return errors.New("compact request input is required")
+	}
+	if (request.Input.String == nil) == (request.Input.Items == nil) {
+		return errors.New("compact request input must contain exactly one variant")
+	}
+	if len(request.Tools) > maxCodexItemTools {
+		return fmt.Errorf("compact request tools exceed %d items", maxCodexItemTools)
+	}
+	return nil
+}
+
 func (request *CodexResponseRequest) UnmarshalJSON(data []byte) error {
 	if len(data) > maxCodexContractBytes {
 		return fmt.Errorf("decode private Responses request: body exceeds %d bytes", maxCodexContractBytes)
@@ -720,6 +792,36 @@ type CodexResponse struct {
 	ServiceTier        string                  `json:"service_tier,omitempty"`
 	PreviousResponseID string                  `json:"previous_response_id,omitempty"`
 	EndTurn            *bool                   `json:"end_turn,omitempty"`
+}
+
+// CodexCompactResult is the typed private Responses compact result.
+type CodexCompactResult CodexResponse
+
+func (result *CodexCompactResult) UnmarshalJSON(data []byte) error {
+	if len(data) > maxCodexContractBytes {
+		return fmt.Errorf("decode private compact result: body exceeds %d bytes", maxCodexContractBytes)
+	}
+	*result = CodexCompactResult{}
+	type compactResult CodexResponse
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode((*compactResult)(result)); err != nil {
+		return fmt.Errorf("decode private compact result: %w", err)
+	}
+	if result.Output == nil {
+		return errors.New("decode private compact result: output is required")
+	}
+	if len(result.Output) > maxCodexInputItems {
+		return fmt.Errorf("decode private compact result: output exceeds %d items", maxCodexInputItems)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("decode private compact result: multiple JSON values")
+		}
+		return fmt.Errorf("decode private compact result: %w", err)
+	}
+	return nil
 }
 
 // CodexOutputItem is a typed private output item.

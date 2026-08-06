@@ -45,7 +45,7 @@ var (
 	errImagesUnsupportedForm = errors.New("multipart field is not supported")
 )
 
-func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
+func newImagesGenerationHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setJournalAuditContext(ctx, journal, imagesGenerationsEndpoint)
@@ -87,9 +87,18 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
 			return
 		}
+		requestHeaders, err := requestHeaderConfig(request.Header)
+		if err != nil {
+			writeImagesError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
+			return
+		}
 		principal, err = authorizer.AuthorizePrincipal(request.Context(), principal, imagesGenerationsEndpoint, publicRequest.Model)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
+			return
+		}
+		if broker == nil {
+			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
 		}
 		journalInput, err := json.Marshal(publicRequest)
@@ -105,9 +114,15 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			return
 		}
 		defer finishJournalRequest(ctx, journal, journalRequestID)
-		if client == nil {
-			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
-			return
+		selection := codex.SelectionRequest{
+			Endpoint: imagesGenerationsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+			Headers: requestHeaders,
+		}
+		bindAccount := func(account codex.Account) error {
+			if journal == nil {
+				return nil
+			}
+			return journal.BindAccount(request.Context(), journalRequestID.ID, account.ID, "")
 		}
 		lease, err := admitRequestQuota(request.Context(), quota, principal, imageQuotaRequest(principal.Policy, publicRequest.N))
 		if err != nil {
@@ -121,7 +136,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 		}
 		defer func() { _ = lease.release("request ended") }()
 		setTransportOutcome(ctx, "http")
-		result, err := client.Generate(request.Context(), codex.CodexImageGenerationRequest{
+		imageRequest := codex.CodexImageGenerationRequest{
 			Model:             publicRequest.Model,
 			Prompt:            publicRequest.Prompt,
 			N:                 publicRequest.N,
@@ -132,7 +147,9 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 			OutputFormat:      publicRequest.OutputFormat,
 			Moderation:        publicRequest.Moderation,
 			User:              publicRequest.User,
-		})
+		}
+		brokerResult, err := broker.GenerateImage(request.Context(), selection, imageRequest, bindAccount)
+		result := brokerResult.Result
 		if err != nil {
 			writeImagesDispatchError(ctx, err)
 			return
@@ -168,7 +185,7 @@ func newImagesGenerationHandler(authorizer *apikey.Authorizer, client *codex.Ima
 	}
 }
 
-func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesClient, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
+func newImagesEditHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool) iris.Handler {
 	requestValidation := validator.New()
 	return func(ctx iris.Context) {
 		setImagesWriteDeadline(ctx)
@@ -233,9 +250,18 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
 			return
 		}
+		requestHeaders, err := requestHeaderConfig(request.Header)
+		if err != nil {
+			writeImagesError(ctx, http.StatusBadRequest, "invalid_request", "The request is invalid.")
+			return
+		}
 		principal, err = authorizer.AuthorizePrincipal(request.Context(), principal, imagesEditsEndpoint, publicRequest.Model)
 		if err != nil {
 			writeAPIKeyError(ctx, err)
+			return
+		}
+		if broker == nil {
+			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
 			return
 		}
 		journalInput, err := json.Marshal(publicRequest)
@@ -251,10 +277,6 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			return
 		}
 		defer finishJournalRequest(ctx, journal, journalRequestID)
-		if client == nil {
-			writeImagesError(ctx, http.StatusServiceUnavailable, "upstream_unavailable", "The upstream service is unavailable.")
-			return
-		}
 		files, err := imageFileHeaders(form)
 		if err != nil {
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_image", "The image files are invalid.")
@@ -264,6 +286,16 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 		if err != nil {
 			writeImagesError(ctx, http.StatusBadRequest, "invalid_image", "The image files are invalid.")
 			return
+		}
+		selection := codex.SelectionRequest{
+			Endpoint: imagesEditsEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+			Headers: requestHeaders,
+		}
+		bindAccount := func(account codex.Account) error {
+			if journal == nil {
+				return nil
+			}
+			return journal.BindAccount(request.Context(), journalRequestID.ID, account.ID, "")
 		}
 		lease, err := admitRequestQuota(request.Context(), quota, principal, imageQuotaRequest(principal.Policy, publicRequest.N))
 		if err != nil {
@@ -277,7 +309,7 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 		}
 		defer func() { _ = lease.release("request ended") }()
 		setTransportOutcome(ctx, "http")
-		result, err := client.Edit(request.Context(), codex.CodexImageEditRequest{
+		imageRequest := codex.CodexImageEditRequest{
 			Model:             publicRequest.Model,
 			Prompt:            publicRequest.Prompt,
 			Images:            imageEditInputs(dataURLs),
@@ -288,7 +320,9 @@ func newImagesEditHandler(authorizer *apikey.Authorizer, client *codex.ImagesCli
 			OutputCompression: publicRequest.OutputCompression,
 			OutputFormat:      publicRequest.OutputFormat,
 			User:              publicRequest.User,
-		})
+		}
+		brokerResult, err := broker.EditImage(request.Context(), selection, imageRequest, bindAccount)
+		result := brokerResult.Result
 		if err != nil {
 			writeImagesDispatchError(ctx, err)
 			return

@@ -109,10 +109,18 @@ func NewResponsesTransport(options ResponsesTransportOptions) (*ResponsesTranspo
 	}, nil
 }
 
-// Do sends one request and returns all validated stream events.
+// Do sends one private Responses request and returns all validated stream events.
 func (transport *ResponsesTransport) Do(ctx context.Context, request CodexResponseRequest) (CodexStreamResult, error) {
+	return transport.DoWithHeaders(ctx, request, RequestHeaderConfig{})
+}
+
+// DoWithHeaders sends one request with bounded per-call header variations.
+func (transport *ResponsesTransport) DoWithHeaders(ctx context.Context, request CodexResponseRequest, requestHeaders RequestHeaderConfig) (CodexStreamResult, error) {
 	if ctx == nil {
 		return CodexStreamResult{}, errors.New("codex transport context is nil")
+	}
+	if err := requestHeaders.Validate(); err != nil {
+		return CodexStreamResult{}, err
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -138,9 +146,10 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 	var state transportResultState
 	response, err := transport.refresher.Do(ctx, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
 		headers := transport.headers
+		headers = mergeRequestHeaders(headers, requestHeaders)
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
-		headers.ResponsesLite = headers.ResponsesLite || request.ResponsesLite
+		headers.ResponsesLite = headers.ResponsesLite || requestHeaders.ResponsesLiteRequested || request.ResponsesLite
 		if credential.AccountIsFedRAMP {
 			headers.FedRAMP = true
 		}
@@ -173,16 +182,130 @@ func (transport *ResponsesTransport) Do(ctx context.Context, request CodexRespon
 		}
 		return CodexStreamResult{}, errors.New("codex transport returned no result")
 	}
+
 	if response != nil {
 		closeHTTPResponse(response)
 	}
 	return state.result, nil
 }
 
+// Compact sends one private Responses compaction request.
+func (transport *ResponsesTransport) Compact(ctx context.Context, request CodexCompactRequest) (CodexCompactResult, error) {
+	return transport.CompactWithHeaders(ctx, request, RequestHeaderConfig{})
+}
+
+// CompactWithHeaders sends one compaction request with bounded per-call header variations.
+func (transport *ResponsesTransport) CompactWithHeaders(ctx context.Context, request CodexCompactRequest, requestHeaders RequestHeaderConfig) (CodexCompactResult, error) {
+	if ctx == nil {
+		return CodexCompactResult{}, errors.New("codex transport context is nil")
+	}
+	if err := requestHeaders.Validate(); err != nil {
+		return CodexCompactResult{}, err
+	}
+	if err := request.validate(); err != nil {
+		return CodexCompactResult{}, err
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return CodexCompactResult{}, fmt.Errorf("encode codex compact request: %w", err)
+	}
+	if len(body) == 0 || len(body) > maxCodexRequestBytes {
+		return CodexCompactResult{}, fmt.Errorf("%w: compact request message exceeds limit", ErrCodexStreamMalformed)
+	}
+	compactURL, err := appendURLPath(transport.responsesURL, "compact")
+	if err != nil {
+		return CodexCompactResult{}, fmt.Errorf("build compact URL: %w", err)
+	}
+
+	operationContext, cancel := codexSSEContext(ctx, transport.httpClient.Timeout)
+	defer cancel()
+	response, err := transport.refresher.Do(operationContext, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
+		headers := mergeRequestHeaders(transport.headers, requestHeaders)
+		headers.AccessToken = credential.AccessToken
+		headers.AccountID = credential.AccountID
+		headers.ResponsesLite = headers.ResponsesLite || requestHeaders.ResponsesLiteRequested || request.ResponsesLite
+		if credential.AccountIsFedRAMP {
+			headers.FedRAMP = true
+		}
+		request, requestErr := NewRequest(
+			attemptContext,
+			http.MethodPost,
+			compactURL,
+			bytes.NewReader(body),
+			headers,
+		)
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Content-Type", "application/json")
+		response, requestErr := transport.httpClient.Do(request)
+		if requestErr != nil {
+			if contextErr := context.Cause(ctx); contextErr != nil {
+				return nil, contextErr
+			}
+			if contextErr := context.Cause(attemptContext); contextErr != nil {
+				return nil, contextErr
+			}
+			return nil, fmt.Errorf("%w: compact request failed", ErrCodexTransport)
+		}
+		return response, nil
+	})
+	if err != nil {
+		if response != nil {
+			closeHTTPResponse(response)
+		}
+		if contextErr := context.Cause(ctx); contextErr != nil {
+			return CodexCompactResult{}, contextErr
+		}
+		if contextErr := context.Cause(operationContext); contextErr != nil {
+			return CodexCompactResult{}, contextErr
+		}
+		return CodexCompactResult{}, err
+	}
+	if response == nil {
+		return CodexCompactResult{}, fmt.Errorf("%w: compact response is nil", ErrCodexTransport)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return CodexCompactResult{}, mapHTTPResponseError(response)
+	}
+	defer closeHTTPResponse(response)
+	if response.Body == nil {
+		return CodexCompactResult{}, fmt.Errorf("%w: compact response body is nil", ErrCodexTransport)
+	}
+	reader := &codexContextReader{ctx: operationContext, reader: io.LimitReader(response.Body, maxCodexContractBytes+1)}
+	resultBody, readErr := io.ReadAll(reader)
+	if contextErr := context.Cause(ctx); contextErr != nil {
+		return CodexCompactResult{}, contextErr
+	}
+	if contextErr := context.Cause(operationContext); contextErr != nil {
+		return CodexCompactResult{}, contextErr
+	}
+	if readErr != nil {
+		return CodexCompactResult{}, fmt.Errorf("%w: read compact response: %w", ErrCodexTransport, readErr)
+	}
+	if len(resultBody) == 0 || len(resultBody) > maxCodexContractBytes {
+		return CodexCompactResult{}, fmt.Errorf("%w: compact response body exceeds limit", ErrCodexStreamMalformed)
+	}
+	var result CodexCompactResult
+	if err := json.Unmarshal(resultBody, &result); err != nil {
+		return CodexCompactResult{}, fmt.Errorf("%w: decode compact response: %w", ErrCodexStreamMalformed, err)
+	}
+	return result, nil
+}
+
 // Stream sends one request and delivers validated events in arrival order.
 func (transport *ResponsesTransport) Stream(ctx context.Context, request CodexResponseRequest, onEvent func(CodexResponseStreamEvent) error) error {
+	return transport.StreamWithHeaders(ctx, request, RequestHeaderConfig{}, onEvent)
+}
+
+// StreamWithHeaders streams one request with bounded per-call header variations.
+func (transport *ResponsesTransport) StreamWithHeaders(ctx context.Context, request CodexResponseRequest, requestHeaders RequestHeaderConfig, onEvent func(CodexResponseStreamEvent) error) error {
 	if ctx == nil {
 		return errors.New("codex transport context is nil")
+	}
+	if err := requestHeaders.Validate(); err != nil {
+		return err
 	}
 	if onEvent == nil {
 		return errors.New("codex transport stream callback is nil")
@@ -215,9 +338,10 @@ func (transport *ResponsesTransport) Stream(ctx context.Context, request CodexRe
 	}
 	response, err := transport.refresher.Do(ctx, true, func(attemptContext context.Context, credential Credential) (*http.Response, error) {
 		headers := transport.headers
+		headers = mergeRequestHeaders(headers, requestHeaders)
 		headers.AccessToken = credential.AccessToken
 		headers.AccountID = credential.AccountID
-		headers.ResponsesLite = headers.ResponsesLite || request.ResponsesLite
+		headers.ResponsesLite = headers.ResponsesLite || requestHeaders.ResponsesLiteRequested || request.ResponsesLite
 		if credential.AccountIsFedRAMP {
 			headers.FedRAMP = true
 		}
@@ -841,6 +965,19 @@ func closeHTTPResponse(response *http.Response) {
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
+}
+
+func appendURLPath(raw, suffix string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Host == "" || strings.TrimSpace(suffix) == "" {
+		return "", errors.New("URL path cannot be appended")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/" + strings.TrimLeft(suffix, "/")
+	parsed.RawPath = ""
+	return parsed.String(), nil
 }
 
 func validateHTTPURL(raw string) error {

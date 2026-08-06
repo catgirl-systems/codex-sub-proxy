@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -166,32 +167,122 @@ func DecryptCredential(data []byte, keys envelope.KeySet) (Credential, error) {
 
 // SaveCredential writes an encrypted credential with private-file permissions.
 func SaveCredential(path string, credential Credential, keys envelope.KeySet) error {
-	return saveCredential(context.Background(), path, credential, keys)
+	return SaveCredentialContext(context.Background(), path, credential, keys)
 }
 
-func saveCredential(ctx context.Context, path string, credential Credential, keys envelope.KeySet) error {
+// SaveCredentialContext writes an encrypted credential while honoring ctx.
+func SaveCredentialContext(ctx context.Context, path string, credential Credential, keys envelope.KeySet) error {
+	_, err := SaveCredentialContextWithRollback(ctx, path, credential, keys)
+	return err
+}
+
+// CredentialRollback restores the opaque envelope replaced by a credential save.
+// Restore refuses to overwrite a path changed since the save.
+type CredentialRollback struct {
+	path     string
+	previous []byte
+	expected []byte
+	existed  bool
+}
+
+// SaveCredentialContextWithRollback writes a credential and returns a guarded
+// rollback for callers that must undo a later registry mutation.
+func SaveCredentialContextWithRollback(ctx context.Context, path string, credential Credential, keys envelope.KeySet) (CredentialRollback, error) {
 	if err := checkCredentialContext(ctx, "save credential"); err != nil {
-		return err
+		return CredentialRollback{}, err
 	}
 	if strings.TrimSpace(path) == "" {
-		return errors.New("credential path is empty")
+		return CredentialRollback{}, errors.New("credential path is empty")
 	}
 	if err := credentialValidation.Struct(credential); err != nil {
-		return err
+		return CredentialRollback{}, err
 	}
 	encoded, err := EncryptCredential(credential, keys)
 	if err != nil {
-		return err
+		return CredentialRollback{}, err
 	}
 	if err := checkCredentialContext(ctx, "encode credential"); err != nil {
-		return err
+		return CredentialRollback{}, err
 	}
 	credentialSaveMu.Lock()
 	defer credentialSaveMu.Unlock()
 	if err := checkCredentialContext(ctx, "write credential"); err != nil {
+		return CredentialRollback{}, err
+	}
+	previous, existed, err := credentialSnapshot(path)
+	if err != nil {
+		return CredentialRollback{}, err
+	}
+	if err := writeCredential(ctx, path, encoded); err != nil {
+		return CredentialRollback{}, err
+	}
+	return CredentialRollback{
+		path:     path,
+		previous: append([]byte(nil), previous...),
+		expected: append([]byte(nil), encoded...),
+		existed:  existed,
+	}, nil
+}
+
+// Restore reverts the saved path atomically if no other writer replaced it.
+func (rollback CredentialRollback) Restore(ctx context.Context) error {
+	if err := checkCredentialContext(ctx, "restore credential"); err != nil {
 		return err
 	}
-	return writeCredential(ctx, path, encoded)
+	if strings.TrimSpace(rollback.path) == "" {
+		return errors.New("credential rollback path is empty")
+	}
+	credentialSaveMu.Lock()
+	defer credentialSaveMu.Unlock()
+	current, exists, err := credentialSnapshot(rollback.path)
+	if err != nil {
+		return err
+	}
+	if !exists || !bytes.Equal(current, rollback.expected) {
+		return errors.New("credential path changed before restore")
+	}
+	if !rollback.existed {
+		if err := checkCredentialContext(ctx, "remove credential"); err != nil {
+			return err
+		}
+		if err := os.Remove(rollback.path); err != nil {
+			return fmt.Errorf("remove credential: %w", err)
+		}
+		return nil
+	}
+	if err := checkCredentialContext(ctx, "restore credential"); err != nil {
+		return err
+	}
+	return writeCredential(ctx, rollback.path, rollback.previous)
+}
+
+func saveCredential(ctx context.Context, path string, credential Credential, keys envelope.KeySet) error {
+	_, err := SaveCredentialContextWithRollback(ctx, path, credential, keys)
+	return err
+}
+
+func credentialSnapshot(path string) ([]byte, bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("inspect credential path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, false, errors.New("credential path is a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, errors.New("credential path is not a regular file")
+	}
+	if info.Size() > maxCredentialFileBytes {
+		return nil, false, errors.New("credential file is too large")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("read credential file: %w", err)
+	}
+	return data, true, nil
 }
 
 func saveCredentialIfUnchanged(ctx context.Context, path string, expected, replacement Credential, keys envelope.KeySet) (Credential, bool, error) {
@@ -233,6 +324,9 @@ func saveCredentialIfUnchanged(ctx context.Context, path string, expected, repla
 }
 
 func checkCredentialContext(ctx context.Context, operation string) error {
+	if ctx == nil {
+		return fmt.Errorf("%s context is nil", operation)
+	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%s: %w", operation, err)
 	}
@@ -442,9 +536,31 @@ func CredentialAvailable(path string, keys envelope.KeySet) bool {
 	return !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(time.Now())
 }
 
-// ImportCredential reads a Codex auth.json, a Codex keyring home, or an OMP
+// ImportCredential reads a Codex auth.json, Codex keyring home, or an OMP
 // agent database and writes a new encrypted credential. The source is read only.
 func ImportCredential(ctx context.Context, sourcePath, destinationPath string, keys envelope.KeySet) (Credential, error) {
+	if ctx == nil {
+		return Credential{}, errors.New("credential import context is nil")
+	}
+	destinationPath = strings.TrimSpace(destinationPath)
+	if destinationPath == "" {
+		return Credential{}, errors.New("credential destination path is empty")
+	}
+	if err := ValidateImportDestination(sourcePath, destinationPath); err != nil {
+		return Credential{}, err
+	}
+	credential, err := ExtractCredential(ctx, sourcePath, keys)
+	if err != nil {
+		return Credential{}, err
+	}
+	if err := saveCredential(ctx, destinationPath, credential, keys); err != nil {
+		return Credential{}, err
+	}
+	return credential, nil
+}
+
+// ExtractCredential reads and validates a credential without writing it.
+func ExtractCredential(ctx context.Context, sourcePath string, keys envelope.KeySet) (Credential, error) {
 	if ctx == nil {
 		return Credential{}, errors.New("credential import context is nil")
 	}
@@ -455,36 +571,33 @@ func ImportCredential(ctx context.Context, sourcePath, destinationPath string, k
 		return Credential{}, err
 	}
 	sourcePath = strings.TrimSpace(sourcePath)
-	destinationPath = strings.TrimSpace(destinationPath)
 	if sourcePath == "" {
 		return Credential{}, errors.New("credential source path is empty")
 	}
-	if destinationPath == "" {
-		return Credential{}, errors.New("credential destination path is empty")
-	}
-	if err := rejectCodexHomeAuthDestination(sourcePath, destinationPath); err != nil {
-		return Credential{}, err
-	}
-	credential, sourceFile, err := readImportedCredential(ctx, sourcePath)
+	credential, _, err := readImportedCredential(ctx, sourcePath)
 	if err != nil {
 		return Credential{}, err
 	}
-	if sourceFile != nil {
-		if destinationInfo, statErr := os.Stat(destinationPath); statErr == nil {
-			if os.SameFile(sourceFile, destinationInfo) {
-				return Credential{}, errors.New("credential source and destination are the same file")
-			}
-		} else if !os.IsNotExist(statErr) {
-			return Credential{}, fmt.Errorf("inspect credential destination: %w", statErr)
+	return credential, nil
+}
+
+// ValidateImportDestination rejects writes into a source Codex home and
+// source/destination aliases before any credential is persisted.
+func ValidateImportDestination(sourcePath, destinationPath string) error {
+	if err := rejectCodexHomeAuthDestination(sourcePath, destinationPath); err != nil {
+		return err
+	}
+	sourceInfo, statErr := os.Stat(strings.TrimSpace(sourcePath))
+	if statErr == nil && sourceInfo.Mode().IsRegular() {
+		destinationInfo, destinationErr := os.Stat(destinationPath)
+		if destinationErr == nil && os.SameFile(sourceInfo, destinationInfo) {
+			return errors.New("credential source and destination are the same file")
+		}
+		if destinationErr != nil && !os.IsNotExist(destinationErr) {
+			return fmt.Errorf("inspect credential destination: %w", destinationErr)
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return Credential{}, err
-	}
-	if err := saveCredential(ctx, destinationPath, credential, keys); err != nil {
-		return Credential{}, err
-	}
-	return credential, nil
+	return nil
 }
 
 func rejectCodexHomeAuthDestination(sourcePath, destinationPath string) error {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +25,7 @@ import (
 	sdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
+	"gorm.io/gorm"
 )
 
 type typedImageReader struct {
@@ -257,12 +259,19 @@ func TestImagesOfficialSDKGenerationAndEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	broker, err := NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
+		Account: codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
+		Images:  imagesClient,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	servers, err := Start(Config{
-		Listen:        "127.0.0.1:0",
-		AdminListen:   "127.0.0.1:0",
-		Database:      database,
-		APIKeyHMACKey: hmacKey,
-		ImagesClient:  imagesClient,
+		Listen:         "127.0.0.1:0",
+		AdminListen:    "127.0.0.1:0",
+		Database:       database,
+		APIKeyHMACKey:  hmacKey,
+		UpstreamBroker: broker,
 	}, NewReadiness())
 	if err != nil {
 		t.Fatal(err)
@@ -480,13 +489,20 @@ func TestImagesFailClosedArtifactStoreMarksLifecycleFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	broker, err := NewProfileBroker(codex.SingleSelector{}, []BrokerProfile{{
+		Account: codex.Account{ID: "default", IsDefault: true, Enabled: true, Available: true},
+		Images:  imagesClient,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, err := NewArtifactStore(database, filepath.Join(t.TempDir(), "artifacts"), credentialKeys, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	servers, err := Start(Config{
 		Listen: "127.0.0.1:0", AdminListen: "127.0.0.1:0", Database: database, APIKeyHMACKey: hmacKey,
-		ImagesClient: imagesClient, ArtifactStore: store, ArtifactRequired: true,
+		UpstreamBroker: broker, ArtifactStore: store, ArtifactRequired: true,
 	}, NewReadiness())
 	if err != nil {
 		t.Fatal(err)
@@ -534,5 +550,134 @@ func TestImagesFailClosedArtifactStoreMarksLifecycleFailed(t *testing.T) {
 	}
 	if artifacts != 0 {
 		t.Fatalf("failed artifact request left %d artifacts", artifacts)
+	}
+}
+
+func TestInvalidRequestHeadersRejectBeforeJournalAndUpstream(t *testing.T) {
+	t.Run("chat", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			upstreamCalls.Add(1)
+			http.NotFound(writer, request)
+		}))
+		defer upstream.Close()
+		policy := &apikey.Policy{
+			Name: "invalid-chat-header", Owner: "invalid-chat-header",
+			AllowedEndpoints: []string{chatCompletionsEndpoint},
+			AllowedModels:    []string{"gpt-5.6-sol"},
+		}
+		servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+		defer shutdownResponsesTestServer(t, servers)
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+chatCompletionsEndpoint, strings.NewReader(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(codex.SessionIDHeader, strings.Repeat("x", 257))
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("chat invalid header status = %d, want 400", response.StatusCode)
+		}
+		assertNoAcceptedRequest(t, servers.journal.db, chatCompletionsEndpoint)
+		if upstreamCalls.Load() != 0 {
+			t.Fatalf("chat upstream calls = %d, want 0", upstreamCalls.Load())
+		}
+	})
+
+	t.Run("image generation", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			upstreamCalls.Add(1)
+			http.NotFound(writer, request)
+		}))
+		defer upstream.Close()
+		policy := &apikey.Policy{
+			Name: "invalid-image-header", Owner: "invalid-image-header",
+			AllowedEndpoints: []string{imagesGenerationsEndpoint},
+			AllowedModels:    []string{"gpt-image-2"},
+		}
+		servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+		defer shutdownResponsesTestServer(t, servers)
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+imagesGenerationsEndpoint, strings.NewReader(`{"model":"gpt-image-2","prompt":"hello"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(codex.SessionIDHeader, strings.Repeat("x", 257))
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("image generation invalid header status = %d, want 400", response.StatusCode)
+		}
+		assertNoAcceptedRequest(t, servers.journal.db, imagesGenerationsEndpoint)
+		if upstreamCalls.Load() != 0 {
+			t.Fatalf("image generation upstream calls = %d, want 0", upstreamCalls.Load())
+		}
+	})
+
+	t.Run("image edit", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			upstreamCalls.Add(1)
+			http.NotFound(writer, request)
+		}))
+		defer upstream.Close()
+		policy := &apikey.Policy{
+			Name: "invalid-edit-header", Owner: "invalid-edit-header",
+			AllowedEndpoints: []string{imagesEditsEndpoint},
+			AllowedModels:    []string{"gpt-image-2"},
+		}
+		servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+		defer shutdownResponsesTestServer(t, servers)
+		var body bytes.Buffer
+		form := multipart.NewWriter(&body)
+		if err := form.WriteField("model", "gpt-image-2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := form.WriteField("prompt", "hello"); err != nil {
+			t.Fatal(err)
+		}
+		if err := form.Close(); err != nil {
+			t.Fatal(err)
+		}
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+imagesEditsEndpoint, &body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", form.FormDataContentType())
+		request.Header.Set(codex.SessionIDHeader, strings.Repeat("x", 257))
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("image edit invalid header status = %d, want 400", response.StatusCode)
+		}
+		assertNoAcceptedRequest(t, servers.journal.db, imagesEditsEndpoint)
+		if upstreamCalls.Load() != 0 {
+			t.Fatalf("image edit upstream calls = %d, want 0", upstreamCalls.Load())
+		}
+	})
+}
+
+func assertNoAcceptedRequest(t *testing.T, db *gorm.DB, endpoint string) {
+	t.Helper()
+	var count int64
+	if err := db.Model(&RequestRecord{}).Where("endpoint = ?", endpoint).Count(&count).Error; err != nil {
+		t.Fatalf("count accepted %s requests: %v", endpoint, err)
+	}
+	if count != 0 {
+		t.Fatalf("accepted %s requests = %d, want 0", endpoint, count)
 	}
 }
