@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,7 +11,7 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/storage"
 )
 
-func TestModelsListsAllowedModelsInPolicyOrder(t *testing.T) {
+func TestModelsWithoutCatalogAreUnavailable(t *testing.T) {
 	db, err := storage.Open(context.Background(), ":memory:", time.Second)
 	if err != nil {
 		t.Fatalf("open database: %v", err)
@@ -28,10 +26,8 @@ func TestModelsListsAllowedModelsInPolicyOrder(t *testing.T) {
 	}
 	hmacKey := []byte("01234567890123456789012345678901")
 	rawKey, _, err := apikey.Create(context.Background(), db, hmacKey, apikey.Policy{
-		Name:             "models",
-		Owner:            "owner",
-		AllowedEndpoints: []string{"/v1/models"},
-		AllowedModels:    []string{"gpt-z", "gpt-a"},
+		Name: "models", Owner: "owner", AllowedEndpoints: []string{modelsEndpoint},
+		AllowedModels: []string{"gpt-z", "gpt-a"},
 	})
 	if err != nil {
 		t.Fatalf("create API key: %v", err)
@@ -41,7 +37,6 @@ func TestModelsListsAllowedModelsInPolicyOrder(t *testing.T) {
 		t.Fatalf("start server: %v", err)
 	}
 	defer shutdownServerTest(t, servers)
-
 	req, err := http.NewRequest(http.MethodGet, "http://"+servers.DataAddr()+modelsEndpoint, nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
@@ -51,25 +46,9 @@ func TestModelsListsAllowedModelsInPolicyOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request models: %v", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("models status = %d, body = %s", response.StatusCode, body)
-	}
-	var result modelsResponse
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		t.Fatalf("decode models response: %v", err)
-	}
-	if result.Object != "list" || len(result.Data) != 2 {
-		t.Fatalf("models response = %+v", result)
-	}
-	if result.Data[0].ID != "gpt-z" || result.Data[1].ID != "gpt-a" {
-		t.Fatalf("model order = %+v", result.Data)
-	}
-	for _, model := range result.Data {
-		if model.Object != "model" || model.OwnedBy != apikey.ModelOwner || model.Created != 0 {
-			t.Fatalf("model metadata = %+v", model)
-		}
+	response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("models status = %d, want unavailable", response.StatusCode)
 	}
 }
 

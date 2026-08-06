@@ -14,6 +14,7 @@ import (
 	"github.com/catgirl-systems/codex-sub-proxy/internal/version"
 	"gorm.io/gorm"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -134,13 +135,16 @@ func run(args []string) error {
 			}
 		}
 	}
+	databaseCloseSafe := true
 	if db != nil {
 		sqlDB, dbErr := db.DB()
 		if dbErr != nil {
 			return fmt.Errorf("get sqlite database: %w", dbErr)
 		}
 		defer func() {
-			_ = sqlDB.Close()
+			if databaseCloseSafe {
+				_ = sqlDB.Close()
+			}
 		}()
 	}
 
@@ -155,6 +159,31 @@ func run(args []string) error {
 			upstreamBroker = nil
 			credentialSnapshot = nil
 		}
+	}
+	if closer, ok := upstreamBroker.(interface{ Close(context.Context) error }); ok {
+		databaseCloseSafe = false
+		closeJoiner, hasCloseDone := upstreamBroker.(interface{ CloseDone() <-chan struct{} })
+		var closeDone <-chan struct{}
+		if hasCloseDone {
+			closeDone = closeJoiner.CloseDone()
+		}
+		defer func() {
+			closeContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			closeErr := closer.Close(closeContext)
+			if closeErr == nil {
+				databaseCloseSafe = true
+				return
+			}
+			if hasCloseDone && closeDone != nil {
+				select {
+				case <-closeDone:
+					databaseCloseSafe = true
+				default:
+				}
+			}
+			processLogger.Warn("upstream_broker_shutdown_failed", "error_class", "account_registry", "error_code", "shutdown", "error", closeErr)
+		}()
 	}
 
 	cleanupTimeout := cfg.Retention.DrainDeadline
@@ -252,6 +281,7 @@ func buildUpstreamBroker(ctx context.Context, cfg config.Config, db *gorm.DB, cr
 	legacyPlaceholder := len(records) == 1 &&
 		records[0].Provider == "codex" &&
 		strings.TrimSpace(records[0].CredentialPath) == "" &&
+		!records[0].Enabled && !records[0].IsDefault &&
 		records[0].ProviderAccountID == historicalCredential.AccountID
 	if historicalErr == nil && (len(records) == 0 || legacyPlaceholder) {
 		if legacyPlaceholder {
@@ -316,6 +346,14 @@ func buildUpstreamBroker(ctx context.Context, cfg config.Config, db *gorm.DB, cr
 		if imagesErr != nil {
 			return nil, nil, fmt.Errorf("build Images client for account %q: %w", record.ID, imagesErr)
 		}
+		modelsClient, modelsErr := codex.NewModelsClient(codex.ModelsClientOptions{
+			ModelsURL: cfg.Codex.ModelsURL, ClientVersion: cfg.Codex.ModelsClientVersion,
+			HTTPClient: &http.Client{Timeout: cfg.Codex.ModelRequestTimeout}, Refresher: refresher,
+			Headers: codex.HeaderConfig{},
+		})
+		if modelsErr != nil {
+			return nil, nil, fmt.Errorf("build models client for account %q: %w", record.ID, modelsErr)
+		}
 		snapshot := refresher.Snapshot()
 		profiles = append(profiles, server.BrokerProfile{
 			Account: codex.Account{
@@ -323,7 +361,7 @@ func buildUpstreamBroker(ctx context.Context, cfg config.Config, db *gorm.DB, cr
 				Enabled: record.Enabled, IsDefault: record.IsDefault, Available: snapshot.Available,
 				CooldownUntil: accountRecordTime(record.CooldownUntil), PlanType: record.PlanType,
 			},
-			Refresher: refresher, Responses: responsesTransport, Images: imagesClient,
+			Refresher: refresher, Responses: responsesTransport, Images: imagesClient, Models: modelsClient,
 		})
 		refreshersByAccount[record.ID] = refresher
 	}
@@ -334,8 +372,25 @@ func buildUpstreamBroker(ctx context.Context, cfg config.Config, db *gorm.DB, cr
 	if err != nil {
 		return nil, nil, err
 	}
+	catalogStore, catalogStoreErr := server.NewModelCatalogStore(db)
+	if catalogStoreErr != nil {
+		return nil, nil, catalogStoreErr
+	}
+	modelCatalog, catalogErr := server.NewModelCatalogManager(catalogStore, broker, server.ModelCatalogOptions{
+		TTL: cfg.Codex.ModelCatalogTTL, RequestTimeout: cfg.Codex.ModelRequestTimeout,
+	})
+	if catalogErr != nil {
+		return nil, nil, catalogErr
+	}
+	if startErr := modelCatalog.Start(ctx); startErr != nil {
+		_ = modelCatalog.Close(ctx)
+		return nil, nil, fmt.Errorf("start model catalog: %w", startErr)
+	}
 	credentialSnapshot := func() server.CredentialSnapshot {
 		var result server.CredentialSnapshot
+		if modelCatalog.OperationalError() != nil {
+			return result
+		}
 		snapshots := make(map[string]codex.CredentialSnapshot, len(refreshersByAccount))
 		for accountID, refresher := range refreshersByAccount {
 			snapshot := refresher.Snapshot()
@@ -348,8 +403,11 @@ func buildUpstreamBroker(ctx context.Context, cfg config.Config, db *gorm.DB, cr
 		if err != nil {
 			return result
 		}
+		if !selected.CatalogConfigured || !selected.CatalogLoaded {
+			return result
+		}
 		snapshot, ok := snapshots[selected.ID]
-		if !ok {
+		if !ok || !snapshot.Available {
 			return result
 		}
 		return server.CredentialSnapshot{Available: true, State: string(snapshot.State)}

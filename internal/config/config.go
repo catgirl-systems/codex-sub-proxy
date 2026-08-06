@@ -38,6 +38,8 @@ const (
 	defaultRetentionBatchSize     = 64
 	defaultRetentionDrainDeadline = 10 * time.Second
 	maxRetentionDuration          = 365 * 24 * time.Hour
+	defaultModelCatalogTTL        = 5 * time.Minute
+	defaultModelRequestTimeout    = 10 * time.Second
 )
 const (
 	defaultTelemetryExportInterval  = 30 * time.Second
@@ -235,10 +237,14 @@ const (
 )
 
 type CodexConfig struct {
-	CredentialFile     string             `toml:"credential_file" validate:"required"`
-	ResponsesTransport ResponsesTransport `toml:"responses_transport" validate:"oneof=websocket_preferred sse"`
-	ResponsesURL       string             `toml:"responses_url"`
-	AccountSelector    AccountSelector    `toml:"account_selector" validate:"oneof=single round_robin quota_aware"`
+	CredentialFile      string             `toml:"credential_file" validate:"required"`
+	ResponsesTransport  ResponsesTransport `toml:"responses_transport" validate:"oneof=websocket_preferred sse"`
+	ResponsesURL        string             `toml:"responses_url"`
+	ModelsURL           string             `toml:"models_url"`
+	ModelsClientVersion string             `toml:"models_client_version"`
+	ModelCatalogTTL     time.Duration      `toml:"model_catalog_ttl" validate:"gte=0,lte=8760000000000000"`
+	ModelRequestTimeout time.Duration      `toml:"model_request_timeout" validate:"gte=0,lte=86400000000000"`
+	AccountSelector     AccountSelector    `toml:"account_selector" validate:"oneof=single round_robin quota_aware"`
 }
 
 var configurationValidation = func() *validator.Validate {
@@ -339,9 +345,11 @@ func Default() Config {
 			AdminCookieSecure:              true,
 		},
 		Codex: CodexConfig{
-			CredentialFile:     defaultCredentialFile,
-			ResponsesTransport: ResponsesTransportWebSocketPreferred,
-			AccountSelector:    AccountSelectorSingle,
+			CredentialFile:      defaultCredentialFile,
+			ResponsesTransport:  ResponsesTransportWebSocketPreferred,
+			ModelCatalogTTL:     defaultModelCatalogTTL,
+			ModelRequestTimeout: defaultModelRequestTimeout,
+			AccountSelector:     AccountSelectorSingle,
 		},
 		Journal: JournalConfig{
 			Mode:          JournalModeDurable,
@@ -1047,6 +1055,14 @@ func applyEnvironment(cfg *Config) error {
 	overrideString(&cfg.Security.AdminTokenHMACKeyEnv, "CSP_SECURITY_ADMIN_TOKEN_HMAC_KEY_ENV")
 	overrideString(&cfg.Security.AdminBootstrapTokenEnv, "CSP_SECURITY_ADMIN_BOOTSTRAP_TOKEN_ENV")
 	overrideString(&cfg.Codex.ResponsesURL, "CSP_CODEX_RESPONSES_URL")
+	overrideString(&cfg.Codex.ModelsURL, "CSP_CODEX_MODELS_URL")
+	overrideString(&cfg.Codex.ModelsClientVersion, "CSP_CODEX_MODELS_CLIENT_VERSION")
+	if err := overrideDuration(&cfg.Codex.ModelCatalogTTL, "CSP_CODEX_MODEL_CATALOG_TTL"); err != nil {
+		return err
+	}
+	if err := overrideDuration(&cfg.Codex.ModelRequestTimeout, "CSP_CODEX_MODEL_REQUEST_TIMEOUT"); err != nil {
+		return err
+	}
 	accountSelector := string(cfg.Codex.AccountSelector)
 	overrideString(&accountSelector, "CSP_CODEX_ACCOUNT_SELECTOR")
 	cfg.Codex.AccountSelector = AccountSelector(accountSelector)

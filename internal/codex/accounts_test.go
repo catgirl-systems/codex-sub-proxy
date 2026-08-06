@@ -33,6 +33,16 @@ func TestAccountSelectorsRespectAvailabilityAndOrdering(t *testing.T) {
 	}
 }
 
+func TestConfiguredCatalogWithoutLoadedModelsIsNotEligible(t *testing.T) {
+	account := Account{
+		ID: "uncached", Enabled: true, Available: true,
+		CatalogConfigured: true,
+	}
+	if account.Usable("") {
+		t.Fatal("configured account without a loaded catalog was eligible")
+	}
+}
+
 func TestQuotaAwareSelectorUsesUnknownQuotaAsZeroAndRotatesTies(t *testing.T) {
 	accounts := []Account{
 		{ID: "known", Enabled: true, Available: true, Quota: &QuotaSnapshot{Known: true, UsedPercent: 50}},

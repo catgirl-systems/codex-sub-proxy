@@ -1,10 +1,12 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 
 	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
+	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/openai"
 	"github.com/kataras/iris/v12"
 	"gorm.io/gorm"
@@ -13,15 +15,22 @@ import (
 const modelsEndpoint = "/v1/models"
 
 type modelObject struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID            string                  `json:"id"`
+	Object        string                  `json:"object"`
+	Created       int64                   `json:"created"`
+	OwnedBy       string                  `json:"owned_by"`
+	DisplayName   string                  `json:"display_name,omitempty"`
+	Description   string                  `json:"description,omitempty"`
+	ContextWindow int64                   `json:"context_window,omitempty"`
+	MaxOutput     int64                   `json:"max_output_tokens,omitempty"`
+	Capabilities  codex.ModelCapabilities `json:"capabilities,omitempty"`
+	ModelMessages json.RawMessage         `json:"model_messages,omitempty"`
 }
 
 type modelsResponse struct {
-	Object string        `json:"object"`
-	Data   []modelObject `json:"data"`
+	Object string            `json:"object"`
+	Data   []modelObject     `json:"data"`
+	Models []codex.ModelInfo `json:"models"`
 }
 
 func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore, artifacts *ArtifactStore, artifactRequired bool, policy applicationPolicy) (*iris.Application, error) {
@@ -31,6 +40,10 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, broke
 		writeJSON(ctx, http.StatusServiceUnavailable, openai.ErrorResponse{Error: openai.Error{
 			Type: "server_error", Code: "service_unavailable", Message: "The service is unavailable.",
 		}})
+	}
+	var catalog *ModelCatalogManager
+	if provider, ok := broker.(interface{ ModelCatalog() *ModelCatalogManager }); ok {
+		catalog = provider.ModelCatalog()
 	}
 	if authorizer != nil {
 		app.Get(modelsEndpoint, func(ctx iris.Context) {
@@ -49,13 +62,22 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, broke
 				writeAPIKeyError(ctx, err)
 				return
 			}
-			models := make([]modelObject, 0, len(principal.AllowedModels))
-			for _, id := range principal.AllowedModels {
-				models = append(models, modelObject{
-					ID: id, Object: "model", Created: 0, OwnedBy: apikey.ModelOwner,
-				})
+			if catalog == nil {
+				unavailable(ctx)
+				return
 			}
-			writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models})
+			models, fullModels, ready := catalog.PublicModels(principal.AllowedModels)
+			if !ready {
+				unavailable(ctx)
+				return
+			}
+			etag := modelCatalogETag(fullModels)
+			ctx.Header("ETag", etag)
+			if modelETagMatches(ctx.Request().Header.Get("If-None-Match"), etag) {
+				ctx.StatusCode(http.StatusNotModified)
+				return
+			}
+			writeJSON(ctx, http.StatusOK, modelsResponse{Object: "list", Data: models, Models: fullModels})
 		})
 	} else {
 		app.Any(modelsEndpoint, unavailable)

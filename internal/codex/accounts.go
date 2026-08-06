@@ -56,19 +56,22 @@ type QuotaSnapshot struct {
 
 // Account is the non-secret profile state exposed to selectors and brokers.
 type Account struct {
-	ID                string
-	ProviderAccountID string
-	CredentialPath    string
-	Enabled           bool
-	IsDefault         bool
-	Available         bool
-	CooldownUntil     time.Time
-	PlanType          string
-	Models            []string
-	ResponsesLite     bool
-	Quota             *QuotaSnapshot
-	UsedPercent       float64
-	QuotaKnown        bool
+	ID                  string
+	ProviderAccountID   string
+	CredentialPath      string
+	Enabled             bool
+	IsDefault           bool
+	Available           bool
+	CooldownUntil       time.Time
+	PlanType            string
+	Models              []string
+	CatalogConfigured   bool
+	CatalogLoaded       bool
+	ResponsesLite       bool
+	ResponsesLiteModels map[string]bool
+	Quota               *QuotaSnapshot
+	UsedPercent         float64
+	QuotaKnown          bool
 }
 
 // Usable reports whether the account can serve model now.
@@ -168,12 +171,20 @@ func eligibleAccounts(accounts []Account, model string) []Account {
 func accountUsable(account Account, model string) bool {
 	return accountUsableAt(account, model, time.Now())
 }
-
 func accountUsableAt(account Account, model string, now time.Time) bool {
 	if !account.Enabled || !account.Available || (!account.CooldownUntil.IsZero() && account.CooldownUntil.After(now)) {
 		return false
 	}
-	if model == "" || len(account.Models) == 0 {
+	if account.CatalogConfigured && !account.CatalogLoaded {
+		return false
+	}
+	if model == "" {
+		return true
+	}
+	if account.CatalogLoaded && len(account.Models) == 0 {
+		return false
+	}
+	if len(account.Models) == 0 {
 		return true
 	}
 	for _, candidate := range account.Models {
@@ -220,6 +231,12 @@ func CloneAccounts(accounts []Account) []Account {
 	result := append([]Account(nil), accounts...)
 	for index := range result {
 		result[index].Models = append([]string(nil), result[index].Models...)
+		if result[index].ResponsesLiteModels != nil {
+			result[index].ResponsesLiteModels = make(map[string]bool, len(result[index].ResponsesLiteModels))
+			for model, enabled := range accounts[index].ResponsesLiteModels {
+				result[index].ResponsesLiteModels[model] = enabled
+			}
+		}
 		if result[index].Quota != nil {
 			quota := *result[index].Quota
 			result[index].Quota = &quota

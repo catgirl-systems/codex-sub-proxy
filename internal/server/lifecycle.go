@@ -67,6 +67,16 @@ type AccountRecord struct {
 
 func (AccountRecord) TableName() string { return "accounts" }
 
+// ModelCatalogRecord stores one validated provider catalog per account.
+type ModelCatalogRecord struct {
+	AccountID   string    `gorm:"column:account_id;primaryKey;size:255"`
+	CatalogJSON string    `gorm:"column:catalog_json;not null;type:text"`
+	ETag        string    `gorm:"column:etag;size:512"`
+	FetchedAt   time.Time `gorm:"column:fetched_at;not null;index"`
+}
+
+func (ModelCatalogRecord) TableName() string { return "model_catalogs" }
+
 // ConversationRecord stores one stable conversation identity.
 type ConversationRecord struct {
 	ID           string     `gorm:"column:id;primaryKey;size:36"`
@@ -307,6 +317,7 @@ func migrateLifecycle(db *gorm.DB) error {
 		return err
 	}
 	if err := db.AutoMigrate(
+		&ModelCatalogRecord{},
 		&ConversationRecord{},
 		&RequestRecord{},
 		&ResponseLinkRecord{},

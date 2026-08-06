@@ -2186,14 +2186,14 @@ func TestSchemaMigratesLegacyAccountsAndContinuationTables(t *testing.T) {
 			t.Fatalf("legacy account column %q remains", column.Name)
 		}
 	}
-	if !db.Migrator().HasTable(&ResponseLinkRecord{}) || !db.Migrator().HasTable(&SessionAffinityRecord{}) {
-		t.Fatal("continuation tables were not migrated")
+	if !db.Migrator().HasTable(&ResponseLinkRecord{}) || !db.Migrator().HasTable(&SessionAffinityRecord{}) || !db.Migrator().HasTable(&ModelCatalogRecord{}) {
+		t.Fatal("continuation/model catalog tables were not migrated")
 	}
 	var migration schemaMigration
 	if err := db.Order("version DESC").First(&migration).Error; err != nil {
 		t.Fatalf("load schema migration: %v", err)
 	}
-	if migration.Version != currentSchemaVersion || migration.Name != "accounts_and_continuations" {
+	if migration.Version != currentSchemaVersion || migration.Name != "model_catalogs" {
 		t.Fatalf("schema migration = %+v", migration)
 	}
 }

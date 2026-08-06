@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm"
 )
 
-const currentSchemaVersion uint = 2
+const currentSchemaVersion uint = 3
 
 type schemaMigration struct {
 	Version uint   `gorm:"column:version;primaryKey"`
@@ -47,7 +47,7 @@ func MigrateSchema(db *gorm.DB) error {
 		if err := MigrateJournal(tx); err != nil {
 			return fmt.Errorf("apply journal schema migration: %w", err)
 		}
-		if err := tx.Create(&schemaMigration{Version: currentSchemaVersion, Name: "accounts_and_continuations"}).Error; err != nil {
+		if err := tx.Create(&schemaMigration{Version: currentSchemaVersion, Name: "model_catalogs"}).Error; err != nil {
 			return fmt.Errorf("record schema migration: %w", err)
 		}
 		return nil

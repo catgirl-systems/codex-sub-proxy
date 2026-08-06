@@ -145,7 +145,7 @@ func (store *AccountStore) MaterializeLegacyDefault(ctx context.Context, legacyI
 			return fmt.Errorf("load legacy account profile: %w", err)
 		}
 		if existing.Provider != "codex" || existing.ProviderAccountID != credential.AccountID ||
-			strings.TrimSpace(existing.CredentialPath) != "" {
+			strings.TrimSpace(existing.CredentialPath) != "" || existing.Enabled || existing.IsDefault {
 			return errors.New("legacy account profile is not an empty-path default placeholder")
 		}
 		var conflict AccountRecord

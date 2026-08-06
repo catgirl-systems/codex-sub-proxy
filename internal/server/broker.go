@@ -50,13 +50,14 @@ type BrokerProfile struct {
 	Refresher *codex.Refresher
 	Responses *codex.ResponsesTransport
 	Images    *codex.ImagesClient
+	Models    *codex.ModelsClient
 }
 
-// ProfileBroker selects among immutable per-profile clients.
 type ProfileBroker struct {
 	selector codex.AccountSelector
 	mu       sync.RWMutex
 	profiles map[string]BrokerProfile
+	catalog  *ModelCatalogManager
 }
 
 // NewProfileBroker validates and creates a broker for profile clients.
@@ -79,6 +80,9 @@ func NewProfileBroker(selector codex.AccountSelector, profiles []BrokerProfile) 
 			return nil, fmt.Errorf("upstream broker profile %q is duplicated", profile.Account.ID)
 		}
 		profile.Account.Models = append([]string(nil), profile.Account.Models...)
+		if profile.Account.ResponsesLiteModels != nil {
+			profile.Account.ResponsesLiteModels = cloneBoolMap(profile.Account.ResponsesLiteModels)
+		}
 		if profile.Account.Quota != nil {
 			quota := *profile.Account.Quota
 			profile.Account.Quota = &quota
@@ -159,9 +163,16 @@ func currentProfileAccount(profile BrokerProfile) codex.Account {
 
 func (broker *ProfileBroker) requestHeaders(request codex.SelectionRequest, account codex.Account, private *codex.CodexResponseRequest) codex.RequestHeaderConfig {
 	headers := request.Headers
-	headers.ResponsesLiteRequested = headers.ResponsesLiteRequested || account.ResponsesLite || private.ResponsesLite
+	headers.ResponsesLiteRequested = headers.ResponsesLiteRequested || accountResponsesLite(account, private.Model, private.ResponsesLite)
 	private.ResponsesLite = private.ResponsesLite || headers.ResponsesLiteRequested
 	return headers
+}
+
+func accountResponsesLite(account codex.Account, model string, requested bool) bool {
+	if requested || account.ResponsesLite {
+		return true
+	}
+	return account.ResponsesLiteModels != nil && account.ResponsesLiteModels[model]
 }
 
 func bindSelected(bind func(codex.Account) error, account codex.Account) error {
@@ -218,7 +229,7 @@ func (broker *ProfileBroker) Compact(ctx context.Context, request codex.Selectio
 		return BrokerCompactResult{Account: profile.Account}, err
 	}
 	headers := request.Headers
-	headers.ResponsesLiteRequested = headers.ResponsesLiteRequested || profile.Account.ResponsesLite || private.ResponsesLite
+	headers.ResponsesLiteRequested = headers.ResponsesLiteRequested || accountResponsesLite(profile.Account, private.Model, private.ResponsesLite)
 	private.ResponsesLite = private.ResponsesLite || headers.ResponsesLiteRequested
 	result, err := profile.Responses.CompactWithHeaders(ctx, private, headers)
 	return BrokerCompactResult{Result: result, Account: profile.Account}, err
@@ -262,4 +273,105 @@ func (broker *ProfileBroker) Accounts() []codex.Account {
 		accounts = append(accounts, currentProfileAccount(profile))
 	}
 	return codex.CloneAccounts(accounts)
+}
+
+func cloneBoolMap(values map[string]bool) map[string]bool {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]bool, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+// UpdateModelCatalog installs one validated account catalog atomically.
+func (broker *ProfileBroker) UpdateModelCatalog(accountID string, models []codex.ModelInfo, loaded bool) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return errors.New("model catalog account ID is empty")
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	profile, ok := broker.profiles[accountID]
+	if !ok {
+		return fmt.Errorf("model catalog account %q is unavailable", accountID)
+	}
+	profile.Account.Models = make([]string, 0, len(models))
+	profile.Account.ResponsesLiteModels = make(map[string]bool, len(models))
+	profile.Account.CatalogConfigured = true
+	for _, model := range models {
+		modelID := strings.TrimSpace(model.Slug)
+		if modelID == "" {
+			modelID = strings.TrimSpace(model.ID)
+		}
+		if modelID == "" || !model.CatalogUsable() {
+			continue
+		}
+		profile.Account.Models = append(profile.Account.Models, modelID)
+		if model.SupportsResponsesLite() {
+			profile.Account.ResponsesLiteModels[modelID] = true
+		}
+	}
+	profile.Account.CatalogLoaded = loaded
+	if len(profile.Account.ResponsesLiteModels) == 0 {
+		profile.Account.ResponsesLiteModels = nil
+	}
+	broker.profiles[accountID] = profile
+	return nil
+}
+
+func (broker *ProfileBroker) attachModelCatalog(catalog *ModelCatalogManager) {
+	broker.mu.Lock()
+	broker.catalog = catalog
+	broker.mu.Unlock()
+}
+
+// ModelCatalog returns the dynamic model registry when configured.
+func (broker *ProfileBroker) ModelCatalog() *ModelCatalogManager {
+	broker.mu.RLock()
+	defer broker.mu.RUnlock()
+	return broker.catalog
+}
+
+// Ready reports whether at least one enabled credential has a usable catalog.
+func (broker *ProfileBroker) Ready() bool {
+	broker.mu.RLock()
+	catalog := broker.catalog
+	accounts := make([]codex.Account, 0, len(broker.profiles))
+	for _, profile := range broker.profiles {
+		accounts = append(accounts, currentProfileAccount(profile))
+	}
+	broker.mu.RUnlock()
+	if catalog != nil {
+		return catalog.Ready(accounts)
+	}
+	for _, account := range accounts {
+		if account.Usable("") {
+			return true
+		}
+	}
+	return false
+}
+
+func (broker *ProfileBroker) Close(ctx context.Context) error {
+	broker.mu.RLock()
+	catalog := broker.catalog
+	broker.mu.RUnlock()
+	if catalog == nil {
+		return nil
+	}
+	return catalog.Close(ctx)
+}
+
+// CloseDone is closed when the dynamic catalog has joined all workers.
+func (broker *ProfileBroker) CloseDone() <-chan struct{} {
+	broker.mu.RLock()
+	catalog := broker.catalog
+	broker.mu.RUnlock()
+	if catalog == nil {
+		return nil
+	}
+	return catalog.CloseDone()
 }

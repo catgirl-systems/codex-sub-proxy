@@ -141,8 +141,8 @@ func TestAdminAPIKeyIssuePatchRevokeAndDataAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataResponse.Body.Close()
-	if dataResponse.StatusCode != http.StatusOK {
-		t.Fatalf("issued key data status = %d", dataResponse.StatusCode)
+	if dataResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("issued key data status = %d, want unavailable without catalog", dataResponse.StatusCode)
 	}
 
 	const patchWorkers = 16
