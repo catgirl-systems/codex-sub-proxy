@@ -15,7 +15,7 @@ import (
 type UpstreamBroker interface {
 	DoResponses(ctx context.Context, request codex.SelectionRequest, private codex.CodexResponseRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerResponsesResult, error)
 	StreamResponses(ctx context.Context, request codex.SelectionRequest, private codex.CodexResponseRequest, forcedAccountID string, bind func(codex.Account) error, onEvent func(codex.CodexResponseStreamEvent) error) (BrokerResponsesResult, error)
-	Compact(ctx context.Context, request codex.SelectionRequest, private codex.CodexCompactRequest, bind func(codex.Account) error) (BrokerCompactResult, error)
+	Compact(ctx context.Context, request codex.SelectionRequest, private codex.CodexCompactRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerCompactResult, error)
 	GenerateImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageGenerationRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerImageResult, error)
 	EditImage(ctx context.Context, request codex.SelectionRequest, private codex.CodexImageEditRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerImageResult, error)
 }
@@ -105,7 +105,8 @@ func (broker *ProfileBroker) profile(ctx context.Context, request codex.Selectio
 	}
 	if forcedAccountID == "" {
 		affinityAccountID := strings.TrimSpace(request.AffinityAccountID)
-		if account, exists := accountByID[affinityAccountID]; exists && account.Usable(request.Model) {
+		if account, exists := accountByID[affinityAccountID]; exists &&
+			(request.PreviousResponseID != "" || account.Usable(request.Model)) {
 			forcedAccountID = affinityAccountID
 		}
 	}
@@ -205,8 +206,8 @@ func (broker *ProfileBroker) StreamResponses(ctx context.Context, request codex.
 	return BrokerResponsesResult{Account: profile.Account}, err
 }
 
-func (broker *ProfileBroker) Compact(ctx context.Context, request codex.SelectionRequest, private codex.CodexCompactRequest, bind func(codex.Account) error) (BrokerCompactResult, error) {
-	profile, err := broker.profile(ctx, request, "")
+func (broker *ProfileBroker) Compact(ctx context.Context, request codex.SelectionRequest, private codex.CodexCompactRequest, forcedAccountID string, bind func(codex.Account) error) (BrokerCompactResult, error) {
+	profile, err := broker.profile(ctx, request, forcedAccountID)
 	if err != nil {
 		return BrokerCompactResult{}, err
 	}

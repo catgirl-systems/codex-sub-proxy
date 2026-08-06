@@ -236,6 +236,21 @@ func TestCodexCompactRequestRejectsOversizedToolsDuringDecode(t *testing.T) {
 	}
 }
 
+func TestCodexCompactRequestPreservesPrivateControlsAndServiceTier(t *testing.T) {
+	raw := `{"model":"gpt-5.6-sol","input":"fixture","tools":[{"type":"function","name":"fixture"}],"parallel_tool_calls":true,"reasoning":{"effort":"high"},"text":{"format":{"type":"text"}},"service_tier":"scale"}`
+	var request CodexCompactRequest
+	if err := json.Unmarshal([]byte(raw), &request); err != nil {
+		t.Fatalf("decode private compact request: %v", err)
+	}
+	if err := request.validate(); err != nil {
+		t.Fatalf("validate private compact request: %v", err)
+	}
+	if len(request.Tools) != 1 || request.ParallelToolCalls == nil || !*request.ParallelToolCalls ||
+		request.Reasoning == nil || request.Text == nil || request.ServiceTier != "scale" {
+		t.Fatalf("private compact request = %#v", request)
+	}
+}
+
 func TestCodexStreamEventArgumentsRoundTrip(t *testing.T) {
 	raw := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fixture-call","output_index":0,"arguments":"{\"value\":1}"}`)
 	var event CodexResponseStreamEvent
@@ -883,5 +898,12 @@ func TestCodexFixturesContainNoCredentialPatterns(t *testing.T) {
 				t.Fatalf("fixture %s matches forbidden pattern %q", name, match)
 			}
 		}
+	}
+}
+
+func TestCodexContentPartDecoderRejectsUnknownFields(t *testing.T) {
+	var part CodexContentPart
+	if err := json.Unmarshal([]byte(`{"type":"input_file","file_id":"file-123","unexpected":"value"}`), &part); err == nil {
+		t.Fatal("unknown private output content field accepted")
 	}
 }

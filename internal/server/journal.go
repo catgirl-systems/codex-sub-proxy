@@ -40,6 +40,10 @@ var (
 
 	// ErrSessionAffinityConflict indicates that another request owns a new session.
 	ErrSessionAffinityConflict = errors.New("session affinity account conflict")
+
+	// ErrConversationInputBounds indicates that reconstructed history exceeds
+	// the bounded continuation contract.
+	ErrConversationInputBounds = errors.New("conversation input bounds exceeded")
 )
 
 // JournalRequestRecord stores the next sequence number and safe metadata for one request.
@@ -153,6 +157,7 @@ type Journal struct {
 	workerStopOnce sync.Once
 
 	requestsMu sync.Mutex
+	replayMu   sync.Mutex
 	requests   map[string]*journalRequestState
 
 	errorMu   sync.Mutex
@@ -337,6 +342,7 @@ func (j *Journal) ResolvePreviousResponse(ctx context.Context, responseID, apiKe
 	return JournalRequestMetadata{
 		Endpoint: request.Endpoint, Model: request.Model, APIKeyID: link.APIKeyID,
 		ConversationID: link.ConversationID, AccountID: link.AccountID,
+		SourceRequestID: link.RequestID,
 	}, nil
 }
 
@@ -372,25 +378,118 @@ func (j *Journal) ResolveSessionAffinity(ctx context.Context, apiKeyID, sessionH
 // LoadConversationInput reconstructs bounded input and output items from the
 // encrypted journal records for one conversation.
 func (j *Journal) LoadConversationInput(ctx context.Context, conversationID string) ([]json.RawMessage, error) {
+	return j.LoadConversationInputThrough(ctx, conversationID, "")
+}
+
+// LoadConversationInputThrough reconstructs history up to and including the
+// request identified by cutoffRequestID. An empty cutoff includes the full
+// conversation.
+func (j *Journal) LoadConversationInputThrough(ctx context.Context, conversationID, cutoffRequestID string) ([]json.RawMessage, error) {
 	if ctx == nil {
 		return nil, errors.New("conversation input context is nil")
 	}
 	if conversationID == "" {
 		return nil, errors.New("conversation ID is empty")
 	}
-	var requestCount int64
-	if err := j.db.WithContext(ctx).Model(&RequestRecord{}).Where("conversation_id = ?", conversationID).Count(&requestCount).Error; err != nil {
-		return nil, fmt.Errorf("count conversation requests: %w", err)
+	type conversationRequest struct {
+		record     RequestRecord
+		acceptedAt time.Time
 	}
-	if requestCount > maxConversationInputItems {
-		return nil, errors.New("conversation input item limit exceeded")
+	var cutoffAcceptedAt time.Time
+	if cutoffRequestID != "" {
+		if len(cutoffRequestID) > 36 {
+			return nil, ErrPreviousResponseNotFound
+		}
+		var cutoff RequestRecord
+		err := j.db.WithContext(ctx).Where("request_id = ?", cutoffRequestID).First(&cutoff).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			var journalCutoff JournalRequestRecord
+			if fallbackErr := j.db.WithContext(ctx).Where("request_id = ?", cutoffRequestID).First(&journalCutoff).Error; fallbackErr != nil {
+				if errors.Is(fallbackErr, gorm.ErrRecordNotFound) {
+					return nil, ErrPreviousResponseNotFound
+				}
+				return nil, fmt.Errorf("load conversation cutoff journal request: %w", fallbackErr)
+			}
+			cutoff = RequestRecord{
+				ID: journalCutoff.RequestID, ConversationID: journalCutoff.ConversationID,
+				AcceptedAt: journalCutoff.CreatedAt,
+			}
+		} else if err != nil {
+			return nil, fmt.Errorf("load conversation cutoff request: %w", err)
+		}
+		if cutoff.ConversationID != conversationID || cutoff.AcceptedAt.IsZero() {
+			return nil, ErrPreviousResponseNotFound
+		}
+		cutoffAcceptedAt = cutoff.AcceptedAt
 	}
-	var requests []RequestRecord
-	if err := j.db.WithContext(ctx).Model(&RequestRecord{}).Where("conversation_id = ?", conversationID).Order("accepted_at ASC, request_id ASC").Limit(maxConversationInputItems + 1).Find(&requests).Error; err != nil {
+	requestsByID := make(map[string]conversationRequest, maxConversationInputItems+1)
+	lifecycleQuery := j.db.WithContext(ctx).Where("conversation_id = ?", conversationID)
+	if cutoffRequestID != "" {
+		lifecycleQuery = lifecycleQuery.Where(
+			"(accepted_at < ? OR (accepted_at = ? AND request_id <= ?))",
+			cutoffAcceptedAt, cutoffAcceptedAt, cutoffRequestID,
+		)
+	}
+	var lifecycleRequests []RequestRecord
+	if err := lifecycleQuery.Order("accepted_at ASC, request_id ASC").Limit(maxConversationInputItems + 1).Find(&lifecycleRequests).Error; err != nil {
 		return nil, fmt.Errorf("load conversation requests: %w", err)
 	}
+	if len(lifecycleRequests) > maxConversationInputItems {
+		return nil, fmt.Errorf("%w: conversation input item limit exceeded", ErrConversationInputBounds)
+	}
+	for _, request := range lifecycleRequests {
+		requestsByID[request.ID] = conversationRequest{record: request, acceptedAt: request.AcceptedAt}
+	}
+	journalQuery := j.db.WithContext(ctx).Where("conversation_id = ?", conversationID)
+	if cutoffRequestID != "" {
+		journalQuery = journalQuery.Where(
+			"(created_at < ? OR (created_at = ? AND request_id <= ?))",
+			cutoffAcceptedAt, cutoffAcceptedAt, cutoffRequestID,
+		)
+	}
+	var journalRequests []JournalRequestRecord
+	if err := journalQuery.Order("created_at ASC, request_id ASC").Limit(maxConversationInputItems + 1).Find(&journalRequests).Error; err != nil {
+		return nil, fmt.Errorf("load conversation journal requests: %w", err)
+	}
+	if len(journalRequests) > maxConversationInputItems {
+		return nil, fmt.Errorf("%w: conversation input item limit exceeded", ErrConversationInputBounds)
+	}
+	for _, journalRequest := range journalRequests {
+		if existing, ok := requestsByID[journalRequest.RequestID]; ok {
+			if existing.acceptedAt.IsZero() {
+				existing.acceptedAt = journalRequest.CreatedAt
+				existing.record.AcceptedAt = journalRequest.CreatedAt
+				requestsByID[journalRequest.RequestID] = existing
+			}
+			continue
+		}
+		requestsByID[journalRequest.RequestID] = conversationRequest{
+			record: RequestRecord{
+				ID: journalRequest.RequestID, ConversationID: journalRequest.ConversationID,
+				APIKeyID: journalRequest.APIKeyID, AccountID: journalRequest.AccountID,
+				Endpoint: journalRequest.Endpoint, Model: journalRequest.Model, Mode: journalRequest.Mode,
+				AcceptedAt: journalRequest.CreatedAt,
+			},
+			acceptedAt: journalRequest.CreatedAt,
+		}
+	}
+	requests := make([]RequestRecord, 0, len(requestsByID))
+	for _, candidate := range requestsByID {
+		if cutoffRequestID != "" &&
+			(candidate.acceptedAt.After(cutoffAcceptedAt) ||
+				(candidate.acceptedAt.Equal(cutoffAcceptedAt) && candidate.record.ID > cutoffRequestID)) {
+			continue
+		}
+		requests = append(requests, candidate.record)
+	}
+	sort.Slice(requests, func(left, right int) bool {
+		if requests[left].AcceptedAt.Equal(requests[right].AcceptedAt) {
+			return requests[left].ID < requests[right].ID
+		}
+		return requests[left].AcceptedAt.Before(requests[right].AcceptedAt)
+	})
 	if len(requests) > maxConversationInputItems {
-		return nil, errors.New("conversation input item limit exceeded")
+		return nil, fmt.Errorf("%w: conversation input item limit exceeded", ErrConversationInputBounds)
 	}
 	var records []json.RawMessage
 	totalBytes := 0
@@ -400,16 +499,27 @@ func (j *Journal) LoadConversationInput(ctx context.Context, conversationID stri
 			return errors.New("conversation input item is invalid JSON")
 		}
 		if len(records) >= maxConversationInputItems || totalBytes+len(item) > maxConversationInputBytes {
-			return errors.New("conversation input bounds exceeded")
+			return fmt.Errorf("%w: conversation input bounds exceeded", ErrConversationInputBounds)
 		}
 		records = append(records, append(json.RawMessage(nil), item...))
 		totalBytes += len(item)
 		return nil
 	}
+	validateOutputItem := func(item []byte) (json.RawMessage, error) {
+		item = bytes.TrimSpace(item)
+		if len(item) == 0 || !json.Valid(item) {
+			return nil, errors.New("conversation input item is invalid JSON")
+		}
+		return append(json.RawMessage(nil), item...), nil
+	}
 	eventCount := 0
 	eventBytes := 0
 	for _, request := range requests {
-		rows, err := j.db.WithContext(ctx).Model(&JournalRecord{}).Where("request_id = ? AND event_type IN ?", request.ID, []string{"request.input", "response.json", "response.output_item.done"}).Order("sequence ASC").Rows()
+		var terminalOutput []json.RawMessage
+		var terminalFound bool
+		var streamedOutput []json.RawMessage
+		requestSucceeded := false
+		rows, err := j.db.WithContext(ctx).Model(&JournalRecord{}).Where("request_id = ? AND event_type IN ?", request.ID, []string{"request.input", "request.terminal", "response.json", "response.output_item.done"}).Order("sequence ASC").Rows()
 		if err != nil {
 			return nil, fmt.Errorf("load conversation journal events: %w", err)
 		}
@@ -427,7 +537,7 @@ func (j *Journal) LoadConversationInput(ctx context.Context, conversationID stri
 			eventBytes += len(event.Payload)
 			if eventCount > maxConversationJournalEvents || eventBytes > maxConversationJournalBytes {
 				_ = rows.Close()
-				return nil, errors.New("conversation journal bounds exceeded")
+				return nil, fmt.Errorf("%w: conversation journal bounds exceeded", ErrConversationInputBounds)
 			}
 			plain, err := j.decryptJournalPayload(event)
 			if err != nil {
@@ -463,28 +573,49 @@ func (j *Journal) LoadConversationInput(ctx context.Context, conversationID stri
 					_ = rows.Close()
 					return nil, err
 				}
+			case "request.terminal":
+				var terminal lifecycleTerminalPayload
+				if err := decodeLifecycleJSON(plain, &terminal, lifecycleMaxDetail); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("decode conversation terminal event: %w", err)
+				}
+				if err := validateLifecycleTerminal(terminal); err != nil {
+					_ = rows.Close()
+					return nil, fmt.Errorf("validate conversation terminal event: %w", err)
+				}
+				if terminal.State == requestStatusSucceeded {
+					requestSucceeded = true
+				}
 			case "response.json":
 				var response struct {
 					Status string            `json:"status"`
+					Object string            `json:"object"`
 					Output []json.RawMessage `json:"output"`
 				}
 				if err := json.Unmarshal(plain, &response); err != nil {
 					_ = rows.Close()
 					return nil, fmt.Errorf("decode conversation response: %w", err)
 				}
-				if response.Status != "completed" && response.Status != "incomplete" {
+				if response.Object != "response.compaction" &&
+					response.Status != "completed" && response.Status != "incomplete" {
 					continue
 				}
+				if response.Output == nil {
+					_ = rows.Close()
+					return nil, errors.New("conversation terminal response output is missing")
+				}
+				var validatedOutput []json.RawMessage
 				for _, item := range response.Output {
-					if err := appendItem(item); err != nil {
+					validated, err := validateOutputItem(item)
+					if err != nil {
 						_ = rows.Close()
 						return nil, err
 					}
+					validatedOutput = append(validatedOutput, validated)
 				}
+				terminalFound = true
+				terminalOutput = validatedOutput
 			case "response.output_item.done":
-				if request.Status != requestStatusSucceeded {
-					continue
-				}
 				data := bytes.TrimSpace(plain)
 				if bytes.HasPrefix(data, []byte("data:")) {
 					data = bytes.TrimSpace(bytes.TrimPrefix(data, []byte("data:")))
@@ -499,10 +630,12 @@ func (j *Journal) LoadConversationInput(ctx context.Context, conversationID stri
 					_ = rows.Close()
 					return nil, fmt.Errorf("decode conversation output event: %w", err)
 				}
-				if err := appendItem(event.Item); err != nil {
+				validated, err := validateOutputItem(event.Item)
+				if err != nil {
 					_ = rows.Close()
 					return nil, err
 				}
+				streamedOutput = append(streamedOutput, validated)
 			}
 		}
 		if err := rows.Err(); err != nil {
@@ -511,6 +644,19 @@ func (j *Journal) LoadConversationInput(ctx context.Context, conversationID stri
 		}
 		if err := rows.Close(); err != nil {
 			return nil, fmt.Errorf("close conversation journal events: %w", err)
+		}
+		if terminalFound {
+			for _, item := range terminalOutput {
+				if err := appendItem(item); err != nil {
+					return nil, err
+				}
+			}
+		} else if requestSucceeded {
+			for _, item := range streamedOutput {
+				if err := appendItem(item); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	return records, nil
@@ -688,6 +834,7 @@ func responseLinkPayload(eventType string, payload []byte) (string, bool, error)
 	}
 	var envelope struct {
 		Type     string `json:"type"`
+		Object   string `json:"object"`
 		ID       string `json:"id"`
 		Status   string `json:"status"`
 		Response *struct {
@@ -716,6 +863,15 @@ func responseLinkPayload(eventType string, payload []byte) (string, bool, error)
 			return "", false, nil
 		}
 		status = expectedStatus
+	}
+	if eventType == "response.json" && envelope.Object == "response.compaction" {
+		if id == "" {
+			return "", false, nil
+		}
+		if len(id) > 256 {
+			return "", false, errors.New("terminal response link ID is too long")
+		}
+		return id, true, nil
 	}
 	if id == "" || (status != "completed" && status != "incomplete") {
 		return "", false, nil
@@ -1365,6 +1521,8 @@ func (j *Journal) Replay(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("journal replay context is nil")
 	}
+	j.replayMu.Lock()
+	defer j.replayMu.Unlock()
 	for {
 		var records []JournalRecord
 		result := j.db.WithContext(ctx).Where("NOT EXISTS (SELECT 1 FROM journal_receipts WHERE journal_receipts.replay_id = journal_records.replay_id AND journal_receipts.materialized = ?)", true).

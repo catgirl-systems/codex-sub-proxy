@@ -200,6 +200,166 @@ func (request *ResponseRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// CompactRequest is the public OpenAI Responses compaction request.
+// Fields not representable by the private Codex compact contract are decoded
+// explicitly so callers receive unsupported_parameter instead of silently
+// losing them.
+type CompactRequest struct {
+	Model                string           `json:"model" validate:"required,max=256"`
+	Input                *Input           `json:"input,omitempty"`
+	Instructions         string           `json:"instructions,omitempty" validate:"max=65536"`
+	Tools                []Tool           `json:"tools,omitempty" validate:"max=128"`
+	ParallelToolCalls    *bool            `json:"parallel_tool_calls,omitempty"`
+	Reasoning            *ReasoningConfig `json:"reasoning,omitempty"`
+	Text                 *TextConfig      `json:"text,omitempty"`
+	PreviousResponseID   string           `json:"previous_response_id,omitempty" validate:"max=256"`
+	PromptCacheKey       string           `json:"prompt_cache_key,omitempty" validate:"max=512"`
+	PromptCacheRetention string           `json:"prompt_cache_retention,omitempty" validate:"omitempty,oneof=in_memory 24h"`
+	ServiceTier          string           `json:"service_tier,omitempty" validate:"omitempty,oneof=auto default fast flex priority"`
+}
+
+func (request *CompactRequest) UnmarshalJSON(data []byte) error {
+	if len(data) > maxResponsesContractBytes {
+		return fmt.Errorf("decode public compact request: body exceeds %d bytes", maxResponsesContractBytes)
+	}
+	*request = CompactRequest{}
+	type compactRequest CompactRequest
+	wire := struct {
+		*compactRequest
+		Tools              json.RawMessage `json:"tools"`
+		ParallelToolCalls  json.RawMessage `json:"parallel_tool_calls"`
+		Reasoning          json.RawMessage `json:"reasoning"`
+		Text               json.RawMessage `json:"text"`
+		Store              json.RawMessage `json:"store"`
+		Stream             json.RawMessage `json:"stream"`
+		ToolChoice         json.RawMessage `json:"tool_choice"`
+		ClientMetadata     json.RawMessage `json:"client_metadata"`
+		Generate           json.RawMessage `json:"generate"`
+		StreamOptions      json.RawMessage `json:"stream_options"`
+		MaxOutputTokens    json.RawMessage `json:"max_output_tokens"`
+		Include            json.RawMessage `json:"include"`
+		Metadata           json.RawMessage `json:"metadata"`
+		PromptCacheOptions json.RawMessage `json:"prompt_cache_options"`
+		Background         json.RawMessage `json:"background"`
+		Conversation       json.RawMessage `json:"conversation"`
+		ContextManagement  json.RawMessage `json:"context_management"`
+		MaxToolCalls       json.RawMessage `json:"max_tool_calls"`
+		Moderation         json.RawMessage `json:"moderation"`
+		Prompt             json.RawMessage `json:"prompt"`
+		SafetyIdentifier   json.RawMessage `json:"safety_identifier"`
+		Temperature        json.RawMessage `json:"temperature"`
+		TopLogprobs        json.RawMessage `json:"top_logprobs"`
+		TopP               json.RawMessage `json:"top_p"`
+		Truncation         json.RawMessage `json:"truncation"`
+		User               json.RawMessage `json:"user"`
+	}{
+		compactRequest: (*compactRequest)(request),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if wire.Tools != nil && !bytes.Equal(bytes.TrimSpace(wire.Tools), []byte("null")) {
+		tools, err := decodeResponsesTools(wire.Tools, "decode public compact request tools")
+		if err != nil {
+			return err
+		}
+		request.Tools = tools
+	}
+	if wire.ParallelToolCalls != nil && !bytes.Equal(bytes.TrimSpace(wire.ParallelToolCalls), []byte("null")) {
+		var parallelToolCalls bool
+		if err := json.Unmarshal(wire.ParallelToolCalls, &parallelToolCalls); err != nil {
+			return fmt.Errorf("decode public compact request parallel_tool_calls: %w", err)
+		}
+		request.ParallelToolCalls = &parallelToolCalls
+	}
+	if wire.Reasoning != nil && !bytes.Equal(bytes.TrimSpace(wire.Reasoning), []byte("null")) {
+		var reasoning ReasoningConfig
+		if err := json.Unmarshal(wire.Reasoning, &reasoning); err != nil {
+			return fmt.Errorf("decode public compact request reasoning: %w", err)
+		}
+		request.Reasoning = &reasoning
+	}
+	if wire.Text != nil && !bytes.Equal(bytes.TrimSpace(wire.Text), []byte("null")) {
+		var text TextConfig
+		if err := json.Unmarshal(wire.Text, &text); err != nil {
+			return fmt.Errorf("decode public compact request text: %w", err)
+		}
+		request.Text = &text
+	}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("decode public compact request: multiple JSON values")
+		}
+		return fmt.Errorf("decode public compact request: %w", err)
+	}
+	unsupported := []struct {
+		field string
+		value json.RawMessage
+	}{
+		{"store", wire.Store},
+		{"stream", wire.Stream},
+		{"tool_choice", wire.ToolChoice},
+		{"client_metadata", wire.ClientMetadata},
+		{"generate", wire.Generate},
+		{"stream_options", wire.StreamOptions},
+		{"max_output_tokens", wire.MaxOutputTokens},
+		{"include", wire.Include},
+		{"metadata", wire.Metadata},
+		{"prompt_cache_options", wire.PromptCacheOptions},
+		{"background", wire.Background},
+		{"conversation", wire.Conversation},
+		{"context_management", wire.ContextManagement},
+		{"max_tool_calls", wire.MaxToolCalls},
+		{"moderation", wire.Moderation},
+		{"prompt", wire.Prompt},
+		{"safety_identifier", wire.SafetyIdentifier},
+		{"temperature", wire.Temperature},
+		{"top_logprobs", wire.TopLogprobs},
+		{"top_p", wire.TopP},
+		{"truncation", wire.Truncation},
+		{"user", wire.User},
+	}
+	for _, parameter := range unsupported {
+		if parameter.value != nil {
+			return fmt.Errorf("%w: %s", ErrUnsupportedParameter, parameter.field)
+		}
+	}
+	return nil
+}
+
+// CompactedResponse is the complete public result returned by Responses
+// compaction. Unlike Response, its output and usage fields are required.
+type CompactedResponse struct {
+	ID        string         `json:"id"`
+	CreatedAt int64          `json:"created_at"`
+	Object    string         `json:"object"`
+	Output    []OutputItem   `json:"output"`
+	Usage     CompactedUsage `json:"usage"`
+}
+
+// CompactedUsage contains the required usage fields of a compacted response.
+type CompactedUsage struct {
+	InputTokens         int                         `json:"input_tokens"`
+	InputTokensDetails  CompactedInputTokenDetails  `json:"input_tokens_details"`
+	OutputTokens        int                         `json:"output_tokens"`
+	OutputTokensDetails CompactedOutputTokenDetails `json:"output_tokens_details"`
+	TotalTokens         int                         `json:"total_tokens"`
+}
+
+// CompactedInputTokenDetails contains the required input cache breakdown.
+type CompactedInputTokenDetails struct {
+	CacheWriteTokens int `json:"cache_write_tokens"`
+	CachedTokens     int `json:"cached_tokens"`
+}
+
+// CompactedOutputTokenDetails contains the required reasoning-token breakdown.
+type CompactedOutputTokenDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
 // Input is the public Responses input string-or-array union.
 type Input struct {
 	String *string     `json:"-"`
@@ -473,6 +633,7 @@ type InputItem struct {
 	Status                   string          `json:"status,omitempty"`
 	Content                  json.RawMessage `json:"content,omitempty"`
 	ID                       string          `json:"id,omitempty"`
+	Input                    string          `json:"input,omitempty"`
 	CallID                   string          `json:"call_id,omitempty"`
 	Name                     string          `json:"name,omitempty"`
 	Arguments                string          `json:"arguments,omitempty"`
@@ -481,6 +642,8 @@ type InputItem struct {
 	Actions                  json.RawMessage `json:"actions,omitempty"`
 	PendingSafetyChecks      []SafetyCheck   `json:"pending_safety_checks,omitempty" validate:"max=128,dive"`
 	AcknowledgedSafetyChecks []SafetyCheck   `json:"acknowledged_safety_checks,omitempty" validate:"max=128,dive"`
+	EncryptedContent         string          `json:"encrypted_content,omitempty"`
+	CreatedBy                string          `json:"created_by,omitempty"`
 	Tools                    []Tool          `json:"tools,omitempty" validate:"max=128,dive"`
 }
 
@@ -764,10 +927,12 @@ type OutputItem struct {
 	Role                     string          `json:"role,omitempty"`
 	Status                   string          `json:"status,omitempty"`
 	Content                  []ContentPart   `json:"content,omitempty"`
+	Phase                    string          `json:"phase,omitempty"`
 	CallID                   string          `json:"call_id,omitempty"`
 	Name                     string          `json:"name,omitempty"`
 	Arguments                string          `json:"arguments,omitempty"`
 	Input                    string          `json:"input,omitempty"`
+	Output                   json.RawMessage `json:"output,omitempty"`
 	Result                   string          `json:"result,omitempty"`
 	RevisedPrompt            string          `json:"revised_prompt,omitempty"`
 	Action                   json.RawMessage `json:"action,omitempty"`
@@ -777,15 +942,41 @@ type OutputItem struct {
 	CreatedBy                string          `json:"created_by,omitempty"`
 }
 
-// ContentPart is one public output content part.
+// ContentPart is one public Responses message content part.
 type ContentPart struct {
 	Type        string            `json:"type"`
 	Text        string            `json:"text,omitempty"`
 	Refusal     string            `json:"refusal,omitempty"`
 	ImageURL    string            `json:"image_url,omitempty"`
+	FileID      string            `json:"file_id,omitempty"`
+	FileData    string            `json:"file_data,omitempty"`
+	FileURL     string            `json:"file_url,omitempty"`
+	Filename    string            `json:"filename,omitempty"`
 	Detail      string            `json:"detail,omitempty"`
 	Annotations []json.RawMessage `json:"annotations,omitempty"`
 	Logprobs    []TextLogprob     `json:"logprobs,omitempty"`
+}
+
+func (part *ContentPart) UnmarshalJSON(data []byte) error {
+	*part = ContentPart{}
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || value[0] != '{' {
+		return errors.New("public output content part must be a JSON object")
+	}
+	type contentPart ContentPart
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode((*contentPart)(part)); err != nil {
+		return fmt.Errorf("decode public output content part: %w", err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("decode public output content part: multiple JSON values")
+		}
+		return fmt.Errorf("decode public output content part: %w", err)
+	}
+	return nil
 }
 
 // IncompleteDetails explains why a response stopped early.

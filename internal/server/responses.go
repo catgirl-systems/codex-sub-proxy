@@ -11,6 +11,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 
 const (
 	responsesEndpoint        = "/v1/responses"
+	responsesCompactEndpoint = "/v1/responses/compact"
 	maxResponsesBodyBytes    = 4 * 1024 * 1024
 	maxResponsesEventBytes   = 256 * 1024
 	maxResponsesJSONBytes    = 4 * 1024 * 1024
@@ -270,6 +272,246 @@ func newResponsesHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, j
 		}
 	}
 }
+func newResponsesCompactHandler(authorizer *apikey.Authorizer, broker UpstreamBroker, journal *Journal, quota *apikey.QuotaStore) iris.Handler {
+	requestValidation := validator.New()
+	return func(ctx iris.Context) {
+		setJournalAuditContext(ctx, journal, responsesCompactEndpoint)
+		request := ctx.Request()
+		requestContext := request.Context()
+		if request.Method != http.MethodPost {
+			ctx.Header("Allow", http.MethodPost)
+			writeResponsesError(ctx, http.StatusMethodNotAllowed, responsesErrorType, "method_not_allowed", "Only POST is allowed for this endpoint.")
+			return
+		}
+		headers := request.Header.Values("Authorization")
+		if len(headers) != 1 {
+			writeAPIKeyError(ctx, apikey.ErrInvalidKey)
+			return
+		}
+		principal, err := authorizer.AuthenticateHeader(requestContext, headers[0])
+		setJournalAuditPrincipal(ctx, principal.ID)
+		if err != nil {
+			writeAPIKeyError(ctx, err)
+			return
+		}
+		mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/json" {
+			writeResponsesError(ctx, http.StatusUnsupportedMediaType, responsesErrorType, "invalid_media_type", "Content-Type must be application/json.")
+			return
+		}
+		if request.ContentLength > maxResponsesBodyBytes {
+			writeResponsesError(ctx, http.StatusRequestEntityTooLarge, responsesErrorType, "request_too_large", "Request body is too large.")
+			return
+		}
+		request.Body = http.MaxBytesReader(ctx.ResponseWriter(), request.Body, maxResponsesBodyBytes)
+		defer request.Body.Close()
+		var publicRequest openai.CompactRequest
+		decoder := json.NewDecoder(request.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&publicRequest); err != nil {
+			writeResponsesDecodeError(ctx, err, "Request body is not valid JSON.")
+			return
+		}
+		var extra json.RawMessage
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err == nil {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_json", "Request body must contain one JSON object.")
+			} else {
+				writeResponsesDecodeError(ctx, err, "Request body must contain one JSON object.")
+			}
+			return
+		}
+		if err := requestValidation.Struct(publicRequest); err != nil {
+			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
+			return
+		}
+		requestHeaders, err := requestHeaderConfig(request.Header)
+		if err != nil {
+			writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
+			return
+		}
+		if !requestHeaders.ResponsesLiteRequested {
+			switch {
+			case publicRequest.Tools != nil:
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "unsupported_parameter", "The request uses an unsupported parameter.")
+				return
+			case publicRequest.ParallelToolCalls != nil:
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "unsupported_parameter", "The request uses an unsupported parameter.")
+				return
+			case publicRequest.Reasoning != nil:
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "unsupported_parameter", "The request uses an unsupported parameter.")
+				return
+			case publicRequest.Text != nil:
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "unsupported_parameter", "The request uses an unsupported parameter.")
+				return
+			}
+		}
+		principal, err = authorizer.AuthorizePrincipal(requestContext, principal, responsesCompactEndpoint, publicRequest.Model)
+		if err != nil {
+			writeAPIKeyError(ctx, err)
+			return
+		}
+		if broker == nil {
+			writeResponsesError(ctx, http.StatusServiceUnavailable, responsesServerErrorType, "upstream_unavailable", "The upstream service is unavailable.")
+			return
+		}
+
+		journalInput, err := json.Marshal(publicRequest)
+		if err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		journalMetadata := JournalRequestMetadata{
+			Endpoint: responsesCompactEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+		}
+		var history []json.RawMessage
+		var sessionHash, affinityAccountID string
+		if publicRequest.PreviousResponseID != "" {
+			if journal == nil {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+				return
+			}
+			resolved, resolveErr := journal.ResolvePreviousResponse(requestContext, publicRequest.PreviousResponseID, principal.ID)
+			if resolveErr != nil {
+				if errors.Is(resolveErr, ErrPreviousResponseNotFound) {
+					writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+				} else {
+					writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				}
+				return
+			}
+			history, err = journal.LoadConversationInputThrough(requestContext, resolved.ConversationID, resolved.SourceRequestID)
+			if err != nil {
+				switch {
+				case errors.Is(err, ErrPreviousResponseNotFound):
+					writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+				case errors.Is(err, ErrConversationInputBounds):
+					writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The conversation history exceeds the supported limit.")
+				default:
+					writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				}
+				return
+			}
+			journalMetadata.ConversationID = resolved.ConversationID
+			journalMetadata.AccountID = resolved.AccountID
+			journalMetadata.PreviousResponseID = publicRequest.PreviousResponseID
+			affinityAccountID = resolved.AccountID
+		} else {
+			sessionHash, affinityAccountID, err = resolveSessionAffinity(requestContext, journal, principal.ID, requestHeaders)
+			if err != nil {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+				return
+			}
+		}
+		privateRequest, err := privateCompactRequest(publicRequest, history)
+		if err != nil {
+			if errors.Is(err, openai.ErrUnsupportedParameter) {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "unsupported_parameter", "The request uses an unsupported parameter.")
+			} else {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_request", "The request is invalid.")
+			}
+			return
+		}
+		privateRequest.ResponsesLite = requestHeaders.ResponsesLiteRequested
+		journalRequestID, err := startJournalRequestWithMetadata(ctx, journal, journalMetadata, journalInput)
+		if err != nil {
+			if errors.Is(err, ErrPreviousResponseNotFound) {
+				writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "previous_response_not_found", "The previous response was not found.")
+			} else {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			}
+			return
+		}
+		defer finishJournalRequest(ctx, journal, journalRequestID)
+		bindAccount := func(account codex.Account) error {
+			if journal == nil {
+				return nil
+			}
+			return journal.BindAccount(requestContext, journalRequestID.ID, account.ID, sessionAffinityHashForAccount(sessionHash, affinityAccountID, account.ID))
+		}
+		selection := codex.SelectionRequest{
+			Endpoint: responsesCompactEndpoint, Model: publicRequest.Model, APIKeyID: principal.ID,
+			PreviousResponseID: publicRequest.PreviousResponseID, Headers: requestHeaders,
+			AffinityAccountID: affinityAccountID,
+		}
+		lease, err := admitRequestQuota(requestContext, quota, principal, responseQuotaRequest(principal.Policy, nil))
+		if err != nil {
+			var quotaErr *apikey.QuotaError
+			if errors.As(err, &quotaErr) {
+				writeQuotaResponsesError(ctx, err)
+			} else {
+				writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			}
+			return
+		}
+		defer func() { _ = lease.release("request ended") }()
+		if err := http.NewResponseController(ctx.ResponseWriter().Naive()).SetWriteDeadline(time.Now().Add(imagesWriteTimeout)); err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		setTransportOutcome(ctx, "http")
+		forcedAccountID := ""
+		retriedAffinity := false
+		var brokerResult BrokerCompactResult
+		for {
+			attemptContext, cancel := context.WithCancel(requestContext)
+			brokerResult, err = broker.Compact(attemptContext, selection, privateRequest, forcedAccountID, bindAccount)
+			retry := !retriedAffinity && canRetrySessionAffinity(err, sessionHash, forcedAccountID, false) && journal != nil
+			cancel()
+			if !retry {
+				break
+			}
+			retriedAffinity = true
+			winner, resolveErr := journal.ResolveSessionAffinity(requestContext, principal.ID, sessionHash)
+			if resolveErr != nil {
+				err = resolveErr
+				break
+			}
+			forcedAccountID = winner
+		}
+		if err != nil {
+			if requestContext.Err() != nil {
+				return
+			}
+			status, responseError := responsesError(err)
+			writeResponsesError(ctx, status, responseError.Type, responseError.Code, responseError.Message)
+			return
+		}
+		if err := validateCompactResult(brokerResult.Result); err != nil {
+			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_contract_error", "The upstream response did not satisfy the compaction contract.")
+			return
+		}
+		var payload []byte
+		if requestHeaders.ResponsesLiteRequested {
+			payload, err = json.Marshal(brokerResult.Result)
+		} else {
+			payload, err = publicCompactedResponsePayload(brokerResult.Result)
+		}
+		if err != nil {
+			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_contract_error", "The upstream response did not satisfy the compaction contract.")
+			return
+		}
+		if len(payload) > maxResponsesJSONBytes {
+			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_response_too_large", "The upstream response is too large.")
+			return
+		}
+		if err := validateQuotaUsageFromCodex(brokerResult.Result.Usage); err != nil {
+			writeResponsesError(ctx, http.StatusBadGateway, responsesServerErrorType, "upstream_contract_error", "The upstream response did not satisfy the compaction contract.")
+			return
+		}
+		if err := lease.reconcile(quotaUsageFromCodex(brokerResult.Result.Usage, 0)); err != nil {
+			writeResponsesError(ctx, http.StatusInternalServerError, responsesServerErrorType, "internal_error", "Internal server error.")
+			return
+		}
+		journalUsage := journalUsageFromCodex(brokerResult.Result.Usage, 0)
+		journalUsage.ResolvedModel = brokerResult.Result.Model
+		recordJournalUsageDetails(ctx, journalUsage)
+		if err := writeJournalJSON(ctx, http.StatusOK, "response.json", payload); err != nil {
+			handleJournalResponseError(ctx, err)
+		}
+	}
+}
+
 func writeResponsesDecodeError(ctx iris.Context, err error, message string) {
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
@@ -281,6 +523,352 @@ func writeResponsesDecodeError(ctx iris.Context, err error, message string) {
 		return
 	}
 	writeResponsesError(ctx, http.StatusBadRequest, responsesErrorType, "invalid_json", message)
+}
+
+func privateCompactRequest(publicRequest openai.CompactRequest, history []json.RawMessage) (codex.CodexCompactRequest, error) {
+	privateRequest := codex.CodexCompactRequest{
+		Model:                publicRequest.Model,
+		Instructions:         publicRequest.Instructions,
+		ParallelToolCalls:    publicRequest.ParallelToolCalls,
+		PromptCacheKey:       publicRequest.PromptCacheKey,
+		PromptCacheRetention: publicRequest.PromptCacheRetention,
+		ServiceTier:          publicRequest.ServiceTier,
+	}
+	var err error
+	privateRequest.Tools, err = privateTools(publicRequest.Tools)
+	if err != nil {
+		return codex.CodexCompactRequest{}, err
+	}
+	privateRequest.Reasoning = privateReasoning(publicRequest.Reasoning)
+	privateRequest.Text = privateText(publicRequest.Text)
+	if publicRequest.PreviousResponseID != "" || history != nil {
+		items, err := privateCompactHistory(history)
+		if err != nil {
+			return codex.CodexCompactRequest{}, err
+		}
+		if publicRequest.Input != nil {
+			current, err := privateInput(publicRequest.Input)
+			if err != nil {
+				return codex.CodexCompactRequest{}, err
+			}
+			if current.String != nil {
+				content, err := json.Marshal(*current.String)
+				if err != nil {
+					return codex.CodexCompactRequest{}, fmt.Errorf("encode compact input: %w", err)
+				}
+				items = append(items, codex.CodexInputItem{
+					Type: "message", Role: "user", Content: content,
+				})
+			} else {
+				items = append(items, current.Items...)
+			}
+			if len(items) > 1024 {
+				return codex.CodexCompactRequest{}, errors.New("compact input exceeds item limit")
+			}
+		}
+		privateRequest.Input = &codex.CodexInput{Items: items}
+	} else if publicRequest.Input != nil {
+		privateRequest.Input, err = privateInput(publicRequest.Input)
+		if err != nil {
+			return codex.CodexCompactRequest{}, err
+		}
+	} else {
+		privateRequest.Input = &codex.CodexInput{Items: []codex.CodexInputItem{}}
+	}
+	if privateRequest.Input == nil {
+		return codex.CodexCompactRequest{}, errors.New("compact input is required")
+	}
+	return privateRequest, nil
+}
+
+func privateCompactHistory(history []json.RawMessage) ([]codex.CodexInputItem, error) {
+	if len(history) > 1024 {
+		return nil, errors.New("compact history exceeds item limit")
+	}
+	items := make([]codex.CodexInputItem, 0, len(history))
+	totalBytes := 0
+	for _, raw := range history {
+		raw = bytes.TrimSpace(raw)
+		if len(raw) == 0 || !json.Valid(raw) {
+			return nil, errors.New("compact history item is invalid JSON")
+		}
+		totalBytes += len(raw)
+		if len(items) >= 1024 || totalBytes > maxResponsesBodyBytes {
+			return nil, errors.New("compact history exceeds bounds")
+		}
+		if raw[0] == '{' {
+			var item codex.CodexInputItem
+			if err := json.Unmarshal(raw, &item); err != nil {
+				return nil, fmt.Errorf("decode compact history item: %w", err)
+			}
+			items = append(items, item)
+			continue
+		}
+		items = append(items, codex.CodexInputItem{
+			Type: "message", Role: "user", Content: append(json.RawMessage(nil), raw...),
+		})
+	}
+	return items, nil
+}
+
+func validateCompactResult(result codex.CodexCompactResult) error {
+	if result.Output == nil {
+		return errors.New("compact result output is missing")
+	}
+	if len(result.Output) > 1024 {
+		return errors.New("compact result output exceeds item limit")
+	}
+	return nil
+}
+
+func validatePublicCompactedOutput(items []codex.CodexOutputItem) error {
+	compactionCount := 0
+	for index, item := range items {
+		invalid := func(reason string) error {
+			return fmt.Errorf("compact output item %d: %s", index, reason)
+		}
+		switch item.Type {
+		case "message":
+			if !compactMessageFieldsOnly(item) {
+				return invalid("message contains unsupported fields")
+			}
+			if item.ID == "" || !compactMessageRole(item.Role) || len(item.Content) == 0 {
+				return invalid("message fields are incomplete")
+			}
+			switch item.Role {
+			case "assistant":
+				if !compactOutputStatus(item.Status) {
+					return invalid("assistant message status is invalid")
+				}
+				if item.Phase != "" && !compactMessagePhase(item.Phase) {
+					return invalid("assistant message phase is invalid")
+				}
+				for _, part := range item.Content {
+					switch part.Type {
+					case "output_text":
+						if part.Text == "" || part.Refusal != "" || part.ImageURL != "" || part.FileID != "" || part.FileData != "" || part.FileURL != "" || part.Filename != "" || part.Detail != "" {
+							return invalid("output_text content is incomplete")
+						}
+					case "refusal":
+						if part.Refusal == "" || part.Text != "" || part.ImageURL != "" || part.FileID != "" || part.FileData != "" || part.FileURL != "" || part.Filename != "" || part.Detail != "" || len(part.Annotations) != 0 || len(part.Logprobs) != 0 {
+							return invalid("refusal content is incomplete")
+						}
+					default:
+						return invalid("assistant message content type is unsupported")
+					}
+				}
+			case "user", "developer", "system":
+				if item.Status != "" && !compactOutputStatus(item.Status) {
+					return invalid("input message status is invalid")
+				}
+				if item.Phase != "" {
+					return invalid("input message phase is unsupported")
+				}
+				for _, part := range item.Content {
+					switch part.Type {
+					case "input_text":
+						if !compactInputTextPart(part) {
+							return invalid("input_text content is incomplete")
+						}
+					case "input_image":
+						if !compactInputImagePart(part) {
+							return invalid("input_image content is incomplete")
+						}
+					case "input_file":
+						if !compactInputFilePart(part) {
+							return invalid("input_file content is incomplete")
+						}
+					default:
+						return invalid("input message content type is unsupported")
+					}
+				}
+			default:
+				return invalid("message role is unsupported")
+			}
+		case "compaction":
+			if !compactCompactionFieldsOnly(item) {
+				return invalid("compaction contains unsupported fields")
+			}
+			compactionCount++
+			if compactionCount > 1 {
+				return invalid("multiple compaction items")
+			}
+			if index != len(items)-1 {
+				return invalid("compaction item is not final")
+			}
+			if item.ID == "" || item.EncryptedContent == "" {
+				return invalid("compaction fields are incomplete")
+			}
+		default:
+			return invalid("output item type is unsupported")
+		}
+	}
+	if compactionCount != 1 {
+		return errors.New("compact output must have one final compaction item")
+	}
+	return nil
+}
+
+func compactOutputStatus(status string) bool {
+	switch status {
+	case "in_progress", "completed", "incomplete":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactMessageRole(role string) bool {
+	switch role {
+	case "assistant", "developer", "system", "user":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactMessagePhase(phase string) bool {
+	switch phase {
+	case "commentary", "final_answer":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactMessageFieldsOnly(item codex.CodexOutputItem) bool {
+	return item.CallID == "" &&
+		item.Name == "" &&
+		item.Arguments == "" &&
+		item.Input == "" &&
+		len(item.Output) == 0 &&
+		item.Result == "" &&
+		item.RevisedPrompt == "" &&
+		len(item.Action) == 0 &&
+		len(item.Actions) == 0 &&
+		len(item.PendingSafetyChecks) == 0 &&
+		len(item.AcknowledgedSafetyChecks) == 0 &&
+		item.EncryptedContent == "" &&
+		item.CreatedBy == ""
+}
+
+func compactCompactionFieldsOnly(item codex.CodexOutputItem) bool {
+	return item.Role == "" &&
+		item.Status == "" &&
+		len(item.Content) == 0 &&
+		item.CallID == "" &&
+		item.Name == "" &&
+		item.Arguments == "" &&
+		item.Input == "" &&
+		len(item.Output) == 0 &&
+		item.Result == "" &&
+		item.RevisedPrompt == "" &&
+		len(item.Action) == 0 &&
+		len(item.Actions) == 0 &&
+		len(item.PendingSafetyChecks) == 0 &&
+		len(item.AcknowledgedSafetyChecks) == 0 &&
+		item.Phase == ""
+
+}
+func compactImageDetail(detail string) bool {
+	switch detail {
+	case "auto", "low", "high", "original":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactInputTextPart(part codex.CodexContentPart) bool {
+	return part.Text != "" &&
+		part.Refusal == "" &&
+		part.ImageURL == "" &&
+		part.FileID == "" &&
+		part.FileData == "" &&
+		part.FileURL == "" &&
+		part.Filename == "" &&
+		part.Detail == "" &&
+		len(part.Annotations) == 0 &&
+		len(part.Logprobs) == 0
+}
+
+func compactInputImagePart(part codex.CodexContentPart) bool {
+	if part.Text != "" || part.Refusal != "" || part.FileData != "" || part.FileURL != "" || part.Filename != "" || len(part.Annotations) != 0 || len(part.Logprobs) != 0 || !compactImageDetail(part.Detail) {
+		return false
+	}
+	if part.FileID != "" && part.ImageURL != "" {
+		return false
+	}
+	if part.FileID == "" && part.ImageURL == "" {
+		return false
+	}
+	if part.ImageURL != "" {
+		return compactResourceURL(part.ImageURL, true)
+	}
+	return true
+}
+
+func compactInputFilePart(part codex.CodexContentPart) bool {
+	if part.Text != "" || part.Refusal != "" || part.ImageURL != "" || len(part.Annotations) != 0 || len(part.Logprobs) != 0 {
+		return false
+	}
+	sources := 0
+	if strings.TrimSpace(part.FileID) != "" {
+		sources++
+	}
+	if strings.TrimSpace(part.FileData) != "" {
+		sources++
+	}
+	if strings.TrimSpace(part.FileURL) != "" {
+		sources++
+	}
+	if sources != 1 || (part.Detail != "" && !compactFileDetail(part.Detail)) {
+		return false
+	}
+	if part.Filename != "" && strings.TrimSpace(part.Filename) == "" {
+		return false
+	}
+	if part.FileData != "" && strings.TrimSpace(part.Filename) == "" {
+		return false
+	}
+	return part.FileURL == "" || compactResourceURL(part.FileURL, false)
+}
+
+func compactFileDetail(detail string) bool {
+	switch detail {
+	case "auto", "low", "high":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactResourceURL(value string, allowDataURL bool) bool {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Scheme == "" {
+		return false
+	}
+	if parsed.Scheme == "data" {
+		return allowDataURL && strings.Contains(value, ",")
+	}
+	return parsed.Host != ""
+}
+
+func publicCompactedResponsePayload(result codex.CodexCompactResult) ([]byte, error) {
+	if result.ID == "" || result.CreatedAt <= 0 || result.Object != "response.compaction" || result.Usage == nil {
+		return nil, errors.New("compact result metadata is incomplete")
+	}
+	if err := validatePublicCompactedOutput(result.Output); err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(openai.CompactedResponse{
+		ID: result.ID, CreatedAt: result.CreatedAt, Object: result.Object,
+		Output: publicCompactOutputItems(result.Output), Usage: publicCompactedUsage(result.Usage),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode public compact response: %w", err)
+	}
+	return payload, nil
 }
 
 func privateResponseRequest(publicRequest openai.ResponseRequest) (codex.CodexResponseRequest, error) {
@@ -546,12 +1134,15 @@ func privateInput(input *openai.Input) (*codex.CodexInput, error) {
 				ID:                       item.ID,
 				CallID:                   item.CallID,
 				Name:                     item.Name,
+				Input:                    item.Input,
 				Arguments:                arguments,
 				Output:                   item.Output,
 				Action:                   item.Action,
 				Actions:                  item.Actions,
 				PendingSafetyChecks:      pendingSafetyChecks,
 				AcknowledgedSafetyChecks: acknowledgedSafetyChecks,
+				EncryptedContent:         item.EncryptedContent,
+				CreatedBy:                item.CreatedBy,
 				Tools:                    tools,
 			})
 		}
@@ -1138,6 +1729,14 @@ func publicOutputItems(items []codex.CodexOutputItem) []openai.OutputItem {
 	return output
 }
 
+func publicCompactOutputItems(items []codex.CodexOutputItem) []openai.OutputItem {
+	output := publicOutputItems(items)
+	for index := range output {
+		output[index].Phase = items[index].Phase
+	}
+	return output
+}
+
 func publicOutputItem(item *codex.CodexOutputItem) openai.OutputItem {
 	if item == nil {
 		return openai.OutputItem{}
@@ -1152,6 +1751,7 @@ func publicOutputItem(item *codex.CodexOutputItem) openai.OutputItem {
 		Name:                     item.Name,
 		Arguments:                item.Arguments,
 		Input:                    item.Input,
+		Output:                   item.Output,
 		Result:                   item.Result,
 		RevisedPrompt:            item.RevisedPrompt,
 		Action:                   item.Action,
@@ -1202,6 +1802,10 @@ func publicContentPart(part *codex.CodexContentPart) *openai.ContentPart {
 		Text:        part.Text,
 		Refusal:     part.Refusal,
 		ImageURL:    part.ImageURL,
+		FileID:      part.FileID,
+		FileData:    part.FileData,
+		FileURL:     part.FileURL,
+		Filename:    part.Filename,
 		Detail:      part.Detail,
 		Annotations: part.Annotations,
 		Logprobs:    publicLogprobs(part.Logprobs),
@@ -1249,6 +1853,24 @@ func publicUsage(usage *codex.CodexUsage) *openai.Usage {
 	}
 	if usage.OutputTokensDetails != nil {
 		result.OutputTokensDetails = &openai.OutputTokenDetails{ReasoningTokens: usage.OutputTokensDetails.ReasoningTokens}
+	}
+	return result
+}
+
+func publicCompactedUsage(usage *codex.CodexUsage) openai.CompactedUsage {
+	result := openai.CompactedUsage{}
+	if usage == nil {
+		return result
+	}
+	result.InputTokens = usage.InputTokens
+	result.OutputTokens = usage.OutputTokens
+	result.TotalTokens = usage.TotalTokens
+	if usage.InputTokensDetails != nil {
+		result.InputTokensDetails.CacheWriteTokens = usage.InputTokensDetails.CacheWriteTokens
+		result.InputTokensDetails.CachedTokens = usage.InputTokensDetails.CachedTokens
+	}
+	if usage.OutputTokensDetails != nil {
+		result.OutputTokensDetails.ReasoningTokens = usage.OutputTokensDetails.ReasoningTokens
 	}
 	return result
 }

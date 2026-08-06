@@ -41,7 +41,9 @@ func (config RequestHeaderConfig) Validate() error {
 type SelectionRequest struct {
 	Endpoint, Model, APIKeyID, PreviousResponseID string
 	Headers                                       RequestHeaderConfig
-	// AffinityAccountID is a best-effort session affinity hint. A broker must
+	// AffinityAccountID is a best-effort session affinity hint. For a
+	// continuation, PreviousResponseID makes the hint authoritative so the
+	// response remains bound to its owning account; otherwise the broker must
 	// fall back to its selector when the hinted account is no longer usable.
 	AffinityAccountID string
 }

@@ -45,6 +45,7 @@ type JournalRequestMetadata struct {
 	ConversationID     string
 	AccountID          string
 	PreviousResponseID string
+	SourceRequestID    string
 }
 
 // AccountRecord stores provider identity without credentials.

@@ -1393,6 +1393,211 @@ func TestJournalLoadConversationInputUsesTerminalOutputsAndBounds(t *testing.T) 
 	}
 }
 
+func TestJournalLoadConversationInputUsesOrderedStreamItems(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"stream input"}]}]}`))
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	for _, item := range []string{
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}`,
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}`,
+	} {
+		payload := []byte(fmt.Sprintf(`{"type":"response.output_item.done","item":%s}`, item))
+		if err := journal.Forward(context.Background(), request, "response.output_item.done", payload, func(context.Context, string) error {
+			return nil
+		}); err != nil {
+			t.Fatalf("forward stream item: %v", err)
+		}
+	}
+	if err := journal.RecordTerminal(context.Background(), request, requestStatusSucceeded, nil); err != nil {
+		t.Fatalf("record terminal: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay journal: %v", err)
+	}
+	items, err := journal.LoadConversationInput(context.Background(), request.ConversationID)
+	if err != nil {
+		t.Fatalf("load conversation input: %v", err)
+	}
+	if len(items) != 3 || !bytes.Contains(items[0], []byte("stream input")) ||
+		!bytes.Contains(items[1], []byte("first")) || !bytes.Contains(items[2], []byte("second")) {
+		t.Fatalf("stream conversation items = %s", items)
+	}
+}
+
+func TestJournalLoadConversationInputPrefersTerminalOutputOverStreamItems(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"json input"}]}]}`))
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	donePayload := []byte(`{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"stream duplicate"}]}}`)
+	if err := journal.Forward(context.Background(), request, "response.output_item.done", donePayload, func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward stream item: %v", err)
+	}
+	terminalPayload := []byte(`{"id":"json-response","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"json output"}]}]}`)
+	if err := journal.Forward(context.Background(), request, "response.json", terminalPayload, func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward terminal response: %v", err)
+	}
+	if err := journal.RecordTerminal(context.Background(), request, requestStatusSucceeded, nil); err != nil {
+		t.Fatalf("record terminal: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay journal: %v", err)
+	}
+	items, err := journal.LoadConversationInput(context.Background(), request.ConversationID)
+	if err != nil {
+		t.Fatalf("load conversation input: %v", err)
+	}
+	if len(items) != 2 || !bytes.Contains(items[0], []byte("json input")) ||
+		!bytes.Contains(items[1], []byte("json output")) || bytes.Contains(items[1], []byte("stream duplicate")) {
+		t.Fatalf("terminal conversation items = %s", items)
+	}
+}
+
+func TestJournalLoadConversationInputIgnoresStaleSucceededProjection(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	request, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"stale input"}]}]}`))
+	if err != nil {
+		t.Fatalf("begin request: %v", err)
+	}
+	donePayload := []byte(`{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"stale output"}]}}`)
+	if err := journal.Forward(context.Background(), request, "response.output_item.done", donePayload, func(context.Context, string) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("forward stream item: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("replay journal: %v", err)
+	}
+	if err := db.Model(&RequestRecord{}).Where("request_id = ?", request.ID).Updates(map[string]any{
+		"status": requestStatusSucceeded, "terminal_at": time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatalf("set stale succeeded projection: %v", err)
+	}
+	items, err := journal.LoadConversationInput(context.Background(), request.ConversationID)
+	if err != nil {
+		t.Fatalf("load conversation input: %v", err)
+	}
+	if len(items) != 1 || !bytes.Contains(items[0], []byte("stale input")) {
+		t.Fatalf("stale projection history = %s", items)
+	}
+}
+
+func TestJournalLoadConversationInputStopsAtPreviousResponseRequest(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 8)
+	defer closeTestJournal(t, journal, db)
+
+	begin := func(metadata JournalRequestMetadata, input, responseID, output string) JournalRequest {
+		t.Helper()
+		request, err := journal.BeginRequestWithMetadata(context.Background(), metadata, []byte(fmt.Sprintf(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}`, input)))
+		if err != nil {
+			t.Fatalf("begin request %s: %v", input, err)
+		}
+		payload := []byte(fmt.Sprintf(`{"id":"%s","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"%s"}]}]}`, responseID, output))
+		if err := journal.Forward(context.Background(), request, "response.json", payload, func(context.Context, string) error {
+			return nil
+		}); err != nil {
+			t.Fatalf("forward response %s: %v", responseID, err)
+		}
+		if err := journal.RecordTerminal(context.Background(), request, requestStatusSucceeded, nil); err != nil {
+			t.Fatalf("record terminal %s: %v", responseID, err)
+		}
+		if err := journal.Replay(context.Background()); err != nil {
+			t.Fatalf("replay response %s: %v", responseID, err)
+		}
+		return request
+	}
+	first := begin(JournalRequestMetadata{Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1"}, "first", "branch-first", "first-output")
+	second := begin(JournalRequestMetadata{Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: first.ConversationID}, "second", "branch-second", "second-output")
+	_ = begin(JournalRequestMetadata{Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1", ConversationID: first.ConversationID}, "later", "branch-later", "later-output")
+
+	items, err := journal.LoadConversationInputThrough(context.Background(), first.ConversationID, second.ID)
+	if err != nil {
+		t.Fatalf("load branch history: %v", err)
+	}
+	var history strings.Builder
+	for _, item := range items {
+		history.Write(item)
+		history.WriteByte('\n')
+	}
+	historyText := history.String()
+	if !strings.Contains(historyText, "first") || !strings.Contains(historyText, "second") ||
+		strings.Contains(historyText, "later") || strings.Contains(historyText, "later-output") {
+		t.Fatalf("branch history = %s", historyText)
+	}
+}
+
+func TestJournalLoadConversationInputCutoffIgnoresLaterRequestBounds(t *testing.T) {
+	journal, db := openTestJournal(t, journalModeDurable, 4)
+	defer closeTestJournal(t, journal, db)
+
+	first, err := journal.BeginRequestWithMetadata(context.Background(), JournalRequestMetadata{
+		Endpoint: responsesEndpoint, Model: "gpt-5.6-sol", APIKeyID: "key-1",
+	}, []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"branch root"}]}]}`))
+	if err != nil {
+		t.Fatalf("begin branch root: %v", err)
+	}
+	if err := journal.Replay(context.Background()); err != nil {
+		t.Fatalf("materialize branch root: %v", err)
+	}
+	var root RequestRecord
+	if err := db.Where("request_id = ?", first.ID).First(&root).Error; err != nil {
+		t.Fatalf("load branch root: %v", err)
+	}
+	for index := 0; index <= maxConversationInputItems; index++ {
+		requestID, err := newJournalUUID()
+		if err != nil {
+			t.Fatalf("generate later request ID: %v", err)
+		}
+		replayID, err := newJournalUUID()
+		if err != nil {
+			t.Fatalf("generate later replay ID: %v", err)
+		}
+		acceptedAt := root.AcceptedAt.Add(time.Duration(index+1) * time.Second)
+		if err := db.Create(&JournalRequestRecord{
+			RequestID: requestID, Mode: journalModeDurable, NextSequence: 1,
+			ConversationID: first.ConversationID, Endpoint: responsesEndpoint,
+			Model: "gpt-5.6-sol", APIKeyID: "key-1", CreatedAt: acceptedAt,
+		}).Error; err != nil {
+			t.Fatalf("create later journal request %d: %v", index, err)
+		}
+		if err := db.Create(&RequestRecord{
+			ID: requestID, ReplayID: replayID, ConversationID: first.ConversationID,
+			APIKeyID: "key-1", Endpoint: responsesEndpoint, Model: "gpt-5.6-sol",
+			RequestedModel: "gpt-5.6-sol", Mode: journalModeDurable, Status: requestStatusSucceeded,
+			CreatedAt: acceptedAt, AcceptedAt: acceptedAt, StartedAt: acceptedAt,
+			UpdatedAt: acceptedAt, TerminalAt: &acceptedAt, ExpiresAt: acceptedAt.Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatalf("create later request %d: %v", index, err)
+		}
+	}
+	items, err := journal.LoadConversationInputThrough(context.Background(), first.ConversationID, first.ID)
+	if err != nil {
+		t.Fatalf("load early branch history: %v", err)
+	}
+	if len(items) != 1 || !bytes.Contains(items[0], []byte("branch root")) {
+		t.Fatalf("early branch history = %s", items)
+	}
+}
+
 func TestJournalLoadConversationInputCapsJournalRows(t *testing.T) {
 	journal, db := openTestJournal(t, journalModeDurable, 4)
 	defer closeTestJournal(t, journal, db)

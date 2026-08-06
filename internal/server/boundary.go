@@ -72,6 +72,7 @@ var boundaryRoutePolicies = map[boundaryRouteKey]boundaryRoutePolicy{
 	{listener: "data", route: modelsEndpoint, method: http.MethodGet}:                                      {},
 	{listener: "data", route: chatCompletionsEndpoint, method: http.MethodPost}:                            {contentType: "application/json", maxBodyBytes: maxChatBodyBytes},
 	{listener: "data", route: responsesEndpoint, method: http.MethodPost}:                                  {contentType: "application/json", maxBodyBytes: maxResponsesBodyBytes},
+	{listener: "data", route: responsesCompactEndpoint, method: http.MethodPost}:                           {contentType: "application/json", maxBodyBytes: maxResponsesBodyBytes},
 	{listener: "data", route: imagesGenerationsEndpoint, method: http.MethodPost}:                          {contentType: "application/json", maxBodyBytes: maxImagesJSONBodyBytes},
 	{listener: "data", route: imagesEditsEndpoint, method: http.MethodPost}:                                {contentType: "multipart/form-data", multipart: true, maxBodyBytes: maxImagesMultipartBodyBytes},
 	{listener: "admin", route: "/healthz", method: http.MethodGet}:                                         {},

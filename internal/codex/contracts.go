@@ -367,6 +367,7 @@ type CodexInputItem struct {
 	Status                   string             `json:"status,omitempty"`
 	Content                  json.RawMessage    `json:"content,omitempty"`
 	ID                       string             `json:"id,omitempty"`
+	Input                    string             `json:"input,omitempty"`
 	CallID                   string             `json:"call_id,omitempty"`
 	Name                     string             `json:"name,omitempty"`
 	Arguments                json.RawMessage    `json:"arguments,omitempty"`
@@ -375,6 +376,11 @@ type CodexInputItem struct {
 	Actions                  json.RawMessage    `json:"actions,omitempty"`
 	PendingSafetyChecks      []CodexSafetyCheck `json:"pending_safety_checks,omitempty"`
 	AcknowledgedSafetyChecks []CodexSafetyCheck `json:"acknowledged_safety_checks,omitempty"`
+	EncryptedContent         string             `json:"encrypted_content,omitempty"`
+	Result                   string             `json:"result,omitempty"`
+	RevisedPrompt            string             `json:"revised_prompt,omitempty"`
+	Phase                    string             `json:"phase,omitempty"`
+	CreatedBy                string             `json:"created_by,omitempty"`
 	Tools                    []CodexTool        `json:"tools,omitempty"`
 }
 
@@ -494,16 +500,19 @@ func decodeCodexJSONValue(data []byte, target any, field string) error {
 	return nil
 }
 
-// CodexInputContent is one private input content part.
+// CodexInputContent is one private Responses input content part.
 type CodexInputContent struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`
-	FileID   string `json:"file_id,omitempty"`
-	FileData string `json:"file_data,omitempty"`
-	FileURL  string `json:"file_url,omitempty"`
-	Filename string `json:"filename,omitempty"`
-	Detail   string `json:"detail,omitempty"`
+	Type        string             `json:"type"`
+	Text        string             `json:"text,omitempty"`
+	Refusal     string             `json:"refusal,omitempty"`
+	ImageURL    string             `json:"image_url,omitempty"`
+	FileID      string             `json:"file_id,omitempty"`
+	FileData    string             `json:"file_data,omitempty"`
+	FileURL     string             `json:"file_url,omitempty"`
+	Filename    string             `json:"filename,omitempty"`
+	Detail      string             `json:"detail,omitempty"`
+	Annotations []json.RawMessage  `json:"annotations,omitempty"`
+	Logprobs    []CodexTextLogprob `json:"logprobs,omitempty"`
 }
 
 // CodexTool describes a private Responses tool.
@@ -847,15 +856,41 @@ type CodexOutputItem struct {
 	Phase                    string             `json:"phase,omitempty"`
 }
 
-// CodexContentPart is a typed private output content part.
+// CodexContentPart is one private Responses message content part.
 type CodexContentPart struct {
 	Type        string             `json:"type"`
 	Text        string             `json:"text,omitempty"`
 	Refusal     string             `json:"refusal,omitempty"`
 	ImageURL    string             `json:"image_url,omitempty"`
+	FileID      string             `json:"file_id,omitempty"`
+	FileData    string             `json:"file_data,omitempty"`
+	FileURL     string             `json:"file_url,omitempty"`
+	Filename    string             `json:"filename,omitempty"`
 	Detail      string             `json:"detail,omitempty"`
 	Annotations []json.RawMessage  `json:"annotations,omitempty"`
 	Logprobs    []CodexTextLogprob `json:"logprobs,omitempty"`
+}
+
+func (part *CodexContentPart) UnmarshalJSON(data []byte) error {
+	*part = CodexContentPart{}
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || value[0] != '{' {
+		return errors.New("private output content part must be a JSON object")
+	}
+	type contentPart CodexContentPart
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode((*contentPart)(part)); err != nil {
+		return fmt.Errorf("decode private output content part: %w", err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("decode private output content part: multiple JSON values")
+		}
+		return fmt.Errorf("decode private output content part: %w", err)
+	}
+	return nil
 }
 
 // CodexIncompleteDetails explains why a response stopped early.

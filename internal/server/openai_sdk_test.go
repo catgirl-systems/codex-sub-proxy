@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/catgirl-systems/codex-sub-proxy/internal/apikey"
 	"github.com/catgirl-systems/codex-sub-proxy/internal/codex"
 	sdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -482,6 +483,91 @@ func TestOfficialOpenAISDKReceivesTypedPrivateEventError(t *testing.T) {
 	}
 	if bytes.Contains([]byte(safeError.RawJSON()), []byte("private provider message")) {
 		t.Fatal("private provider message leaked through SDK private error")
+	}
+}
+
+func TestOfficialOpenAISDKCompactReturnsTypedCompactedResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/compact" {
+			t.Errorf("compact upstream request = %s %s", request.Method, request.URL.Path)
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read compact upstream body: %v", err)
+		}
+		if !bytes.Contains(body, []byte(`"model":"gpt-5.6-sol"`)) ||
+			!bytes.Contains(body, []byte(`"input":"fixture input"`)) {
+			t.Errorf("compact upstream body = %s", body)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"cmp_1","created_at":1738888890,"object":"response.compaction","output":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"fixture input"}]},{"type":"compaction","id":"cmp_item","encrypted_content":"encrypted","created_by":"codex"}],"usage":{"input_tokens":3,"input_tokens_details":{"cache_write_tokens":2,"cached_tokens":1},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"total_tokens":5}}`))
+	}))
+	defer upstream.Close()
+	policy := &apikey.Policy{
+		Name: "compact", Owner: "compact",
+		AllowedEndpoints: []string{responsesCompactEndpoint},
+		AllowedModels:    []string{"gpt-5.6-sol"},
+	}
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+	defer shutdownResponsesTestServer(t, servers)
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	result, err := client.Responses.Compact(context.Background(), responses.ResponseCompactParams{
+		Model: responses.ResponseCompactParamsModelGPT5_6Sol,
+		Input: responses.ResponseCompactParamsInputUnion{OfString: sdk.String("fixture input")},
+	})
+	if err != nil {
+		t.Fatalf("official SDK compact call: %v", err)
+	}
+	if result == nil || result.ID != "cmp_1" || result.Object != "response.compaction" ||
+		len(result.Output) != 2 || result.Usage.InputTokens != 3 || result.Usage.OutputTokens != 2 ||
+		result.Usage.TotalTokens != 5 || result.Usage.InputTokensDetails.CacheWriteTokens != 2 ||
+		result.Usage.InputTokensDetails.CachedTokens != 1 || result.Usage.OutputTokensDetails.ReasoningTokens != 1 {
+		t.Fatalf("official SDK compact result = %#v", result)
+	}
+	item, ok := result.Output[1].AsAny().(responses.ResponseCompactionItem)
+	if !ok || item.ID != "cmp_item" || item.EncryptedContent != "encrypted" {
+		t.Fatalf("official SDK compact item = %#v (%T)", result.Output[1], result.Output[1].AsAny())
+	}
+}
+
+func TestOfficialOpenAISDKCompactPreservesZeroUsageFields(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"cmp_zero","created_at":1738888890,"object":"response.compaction","output":[{"type":"compaction","id":"cmp_zero_item","encrypted_content":"encrypted","created_by":"codex"}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`))
+	}))
+	defer upstream.Close()
+	policy := &apikey.Policy{
+		Name: "compact-zero", Owner: "compact-zero",
+		AllowedEndpoints: []string{responsesCompactEndpoint},
+		AllowedModels:    []string{"gpt-5.6-sol"},
+	}
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+	defer shutdownResponsesTestServer(t, servers)
+	client := sdk.NewClient(
+		option.WithBaseURL("http://"+servers.DataAddr()+"/v1/"),
+		option.WithAPIKey(rawKey),
+	)
+	result, err := client.Responses.Compact(context.Background(), responses.ResponseCompactParams{
+		Model: responses.ResponseCompactParamsModelGPT5_6Sol,
+		Input: responses.ResponseCompactParamsInputUnion{OfString: sdk.String("zero usage")},
+	})
+	if err != nil {
+		t.Fatalf("official SDK zero-usage compact call: %v", err)
+	}
+	if result == nil || result.Usage.InputTokens != 0 || result.Usage.OutputTokens != 0 ||
+		result.Usage.TotalTokens != 0 || result.Usage.InputTokensDetails.CachedTokens != 0 ||
+		result.Usage.InputTokensDetails.CacheWriteTokens != 0 ||
+		result.Usage.OutputTokensDetails.ReasoningTokens != 0 {
+		t.Fatalf("official SDK zero-usage result = %#v", result)
+	}
+	rawUsage := result.Usage.RawJSON()
+	for _, field := range []string{`"input_tokens":0`, `"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0}`, `"output_tokens":0`, `"output_tokens_details":{"reasoning_tokens":0}`, `"total_tokens":0`} {
+		if !bytes.Contains([]byte(rawUsage), []byte(field)) {
+			t.Fatalf("official SDK zero-usage JSON missing %s: %s", field, rawUsage)
+		}
 	}
 }
 

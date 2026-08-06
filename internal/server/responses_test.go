@@ -57,7 +57,7 @@ func (broker *bindFailureBroker) StreamResponses(_ context.Context, _ codex.Sele
 	return BrokerResponsesResult{}, ErrBrokerBind
 }
 
-func (broker *bindFailureBroker) Compact(_ context.Context, _ codex.SelectionRequest, _ codex.CodexCompactRequest, _ func(codex.Account) error) (BrokerCompactResult, error) {
+func (broker *bindFailureBroker) Compact(_ context.Context, _ codex.SelectionRequest, _ codex.CodexCompactRequest, _ string, _ func(codex.Account) error) (BrokerCompactResult, error) {
 	return BrokerCompactResult{}, ErrBrokerBind
 }
 
@@ -484,7 +484,203 @@ func TestResponsesCompatibilityMatrix(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactContinuationReconstructsHistory(t *testing.T) {
+	var compactBody []byte
+	var compactCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/compact" {
+			var err error
+			compactBody, err = io.ReadAll(request.Body)
+			if err != nil {
+				t.Errorf("read compact request: %v", err)
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			compactID := fmt.Sprintf("compact_%d", compactCalls.Add(1))
+			_, _ = writer.Write([]byte(fmt.Sprintf(`{"id":"%s","created_at":1738888890,"object":"response.compaction","output":[{"type":"message","id":"history-message","role":"user","content":[{"type":"input_text","text":"one"}]},{"type":"message","id":"assistant-message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer"}]},{"type":"message","id":"current-message","role":"user","content":[{"type":"input_text","text":"two"}]},{"type":"compaction","id":"compact-item","encrypted_content":"encrypted","created_by":"codex"}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`, compactID)))
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1738888890,\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"assistant-message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.test\"}]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+	policy := &apikey.Policy{
+		Name: "compact-history", Owner: "compact-history",
+		AllowedEndpoints: []string{responsesEndpoint, responsesCompactEndpoint},
+		AllowedModels:    []string{"gpt-5.6-sol"},
+	}
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+	defer shutdownResponsesTestServer(t, servers)
+	post := func(endpoint, body string) *http.Response {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+endpoint, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	first := post(responsesEndpoint, `{"model":"gpt-5.6-sol","input":"one","instructions":"old"}`)
+	firstPayload, err := io.ReadAll(first.Body)
+	first.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.StatusCode != http.StatusOK || !bytes.Contains(firstPayload, []byte(`"resp_1"`)) {
+		t.Fatalf("first response = %d %s", first.StatusCode, firstPayload)
+	}
+	second := post(responsesCompactEndpoint, `{"model":"gpt-5.6-sol","previous_response_id":"resp_1","input":"two","instructions":"new"}`)
+	secondPayload, err := io.ReadAll(second.Body)
+	second.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.StatusCode != http.StatusOK || !bytes.Contains(secondPayload, []byte(`"compact_1"`)) {
+		t.Fatalf("compact response = %d %s", second.StatusCode, secondPayload)
+	}
+	var compactRequest struct {
+		Input        []json.RawMessage `json:"input"`
+		Instructions string            `json:"instructions"`
+	}
+	if err := json.Unmarshal(compactBody, &compactRequest); err != nil {
+		t.Fatalf("decode compact request: %v", err)
+	}
+	if compactRequest.Instructions != "new" || len(compactRequest.Input) != 3 {
+		t.Fatalf("compact request history = %#v", compactRequest)
+	}
+	if !bytes.Contains(compactRequest.Input[0], []byte(`"one"`)) ||
+		!bytes.Contains(compactRequest.Input[1], []byte(`"answer"`)) ||
+		!bytes.Contains(compactRequest.Input[2], []byte(`"two"`)) {
+		t.Fatalf("compact request input = %s", compactBody)
+	}
+	third := post(responsesCompactEndpoint, `{"model":"gpt-5.6-sol","previous_response_id":"compact_1","input":"three"}`)
+	thirdPayload, err := io.ReadAll(third.Body)
+	third.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.StatusCode != http.StatusOK || !bytes.Contains(thirdPayload, []byte(`"compact_2"`)) {
+		t.Fatalf("second compact response = %d %s", third.StatusCode, thirdPayload)
+	}
+}
+
+func TestPublicCompactedResponsePayloadRequiresFinalCompaction(t *testing.T) {
+	validCompaction := codex.CodexOutputItem{Type: "compaction", ID: "cmp_item", EncryptedContent: "encrypted", CreatedBy: "codex"}
+	message := codex.CodexOutputItem{Type: "message", ID: "msg_item", Role: "assistant", Status: "completed", Phase: "commentary", Content: []codex.CodexContentPart{{Type: "output_text", Text: "fixture"}}}
+	userMessage := codex.CodexOutputItem{Type: "message", ID: "user-item", Role: "user", Content: []codex.CodexContentPart{
+		{Type: "input_text", Text: "fixture input"},
+		{Type: "input_image", ImageURL: "https://example.test/image.png", Detail: "auto"},
+	}}
+	base := func(output []codex.CodexOutputItem) codex.CodexCompactResult {
+		return codex.CodexCompactResult{
+			ID: "cmp", CreatedAt: 1738888890, Object: "response.compaction",
+			Output: output, Usage: &codex.CodexUsage{},
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		output []codex.CodexOutputItem
+	}{
+		{name: "missing", output: []codex.CodexOutputItem{message}},
+		{name: "multiple", output: []codex.CodexOutputItem{message, validCompaction, validCompaction}},
+		{name: "nonfinal", output: []codex.CodexOutputItem{validCompaction, message}},
+		{name: "malformed-function-call", output: []codex.CodexOutputItem{{Type: "function_call", CallID: "call"}}},
+		{name: "unknown", output: []codex.CodexOutputItem{{Type: "private_only"}, validCompaction}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := publicCompactedResponsePayload(base(test.output)); err == nil {
+				t.Fatalf("invalid compact output accepted: %#v", test.output)
+			}
+		})
+	}
+	payload, err := publicCompactedResponsePayload(base([]codex.CodexOutputItem{message, validCompaction}))
+	if err != nil {
+		t.Fatalf("valid preceding-items/final compaction rejected: %v", err)
+	}
+	var response openai.CompactedResponse
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decode compact response: %v", err)
+	}
+	if got := response.Output[0].Phase; got != message.Phase {
+		t.Fatalf("compact message phase = %q, want %q", got, message.Phase)
+	}
+	if _, err := publicCompactedResponsePayload(base([]codex.CodexOutputItem{userMessage, validCompaction})); err != nil {
+		t.Fatalf("valid input message/final compaction rejected: %v", err)
+	}
+}
+
+func TestPublicCompactedResponsePayloadPreservesInputFiles(t *testing.T) {
+	validCompaction := codex.CodexOutputItem{Type: "compaction", ID: "cmp_item", EncryptedContent: "encrypted", CreatedBy: "codex"}
+	base := func(output []codex.CodexOutputItem) codex.CodexCompactResult {
+		return codex.CodexCompactResult{
+			ID: "cmp", CreatedAt: 1738888890, Object: "response.compaction",
+			Output: output, Usage: &codex.CodexUsage{},
+		}
+	}
+	for _, test := range []struct {
+		name string
+		part codex.CodexContentPart
+	}{
+		{name: "file_id", part: codex.CodexContentPart{Type: "input_file", FileID: "file-123"}},
+		{name: "file_data", part: codex.CodexContentPart{Type: "input_file", FileData: "data:application/pdf;base64,AAAA", Filename: "document.pdf", Detail: "high"}},
+		{name: "file_url", part: codex.CodexContentPart{Type: "input_file", FileURL: "https://example.test/document.pdf", Filename: "document.pdf", Detail: "auto"}},
+	} {
+		t.Run("valid-"+test.name, func(t *testing.T) {
+			output, err := publicCompactedResponsePayload(base([]codex.CodexOutputItem{
+				{Type: "message", ID: "file-message", Role: "user", Content: []codex.CodexContentPart{test.part}},
+				validCompaction,
+			}))
+			if err != nil {
+				t.Fatalf("valid input file rejected: %v", err)
+			}
+			var response openai.CompactedResponse
+			if err := json.Unmarshal(output, &response); err != nil {
+				t.Fatalf("decode public compact response: %v", err)
+			}
+			got := response.Output[0].Content[0]
+			if got.Type != test.part.Type || got.FileID != test.part.FileID || got.FileData != test.part.FileData || got.FileURL != test.part.FileURL || got.Filename != test.part.Filename || got.Detail != test.part.Detail {
+				t.Fatalf("input file content changed: got %#v want %#v", got, test.part)
+			}
+		})
+	}
+}
+
+func TestPublicCompactedResponsePayloadRejectsMalformedInputFiles(t *testing.T) {
+	validCompaction := codex.CodexOutputItem{Type: "compaction", ID: "cmp_item", EncryptedContent: "encrypted"}
+	base := func(part codex.CodexContentPart) codex.CodexCompactResult {
+		return codex.CodexCompactResult{
+			ID: "cmp", CreatedAt: 1738888890, Object: "response.compaction",
+			Output: []codex.CodexOutputItem{
+				{Type: "message", ID: "file-message", Role: "user", Content: []codex.CodexContentPart{part}},
+				validCompaction,
+			},
+			Usage: &codex.CodexUsage{},
+		}
+	}
+	for _, test := range []struct {
+		name string
+		part codex.CodexContentPart
+	}{
+		{name: "missing-source", part: codex.CodexContentPart{Type: "input_file"}},
+		{name: "multiple-sources", part: codex.CodexContentPart{Type: "input_file", FileID: "file-123", FileURL: "https://example.test/document.pdf"}},
+		{name: "data-without-filename", part: codex.CodexContentPart{Type: "input_file", FileData: "data:application/pdf;base64,AAAA"}},
+		{name: "invalid-detail", part: codex.CodexContentPart{Type: "input_file", FileID: "file-123", Detail: "original"}},
+		{name: "invalid-url", part: codex.CodexContentPart{Type: "input_file", FileURL: "not-a-url"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := publicCompactedResponsePayload(base(test.part)); err == nil {
+				t.Fatalf("malformed input file accepted: %#v", test.part)
+			}
+		})
+	}
+}
+
 func TestRequestHeaderConfigMatchesCaseInsensitiveKeys(t *testing.T) {
+
 	config, err := requestHeaderConfig(http.Header{
 		"sEsSiOn_Id":                             {"session"},
 		"ThReAd-Id":                              {"thread"},
@@ -504,6 +700,124 @@ func TestRequestHeaderConfigMatchesCaseInsensitiveKeys(t *testing.T) {
 	} {
 		if _, err := requestHeaderConfig(headers); err == nil {
 			t.Fatalf("duplicate case-variant request headers accepted: %#v", headers)
+		}
+	}
+}
+
+func TestResponsesCompactRejectsInvalidPublicOutputShape(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{name: "missing", output: `[{"type":"message","id":"message"}]`},
+		{name: "missing-role", output: `[{"type":"message","id":"message","status":"completed","content":[{"type":"output_text","text":"message"}]}]`},
+		{name: "assistant-missing-status", output: `[{"type":"message","id":"message","role":"assistant","content":[{"type":"output_text","text":"message"}]}]`},
+		{name: "refusal-with-output-fields", output: `[{"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"blocked","annotations":[{"type":"url_citation"}]}]},{"type":"compaction","id":"compaction","encrypted_content":"encrypted"}]`},
+		{name: "message-with-compaction-fields", output: `[{"type":"message","id":"message","role":"assistant","status":"completed","encrypted_content":"unexpected","content":[{"type":"output_text","text":"message"}]},{"type":"compaction","id":"compaction","encrypted_content":"encrypted"}]`},
+		{name: "compaction-with-message-fields", output: `[{"type":"compaction","id":"compaction","role":"assistant","encrypted_content":"encrypted"}]`},
+		{name: "assistant-invalid-phase", output: `[{"type":"message","id":"message","role":"assistant","status":"completed","phase":"other","content":[{"type":"output_text","text":"message"}]},{"type":"compaction","id":"compaction","encrypted_content":"encrypted"}]`},
+		{name: "input-phase", output: `[{"type":"message","id":"message","role":"user","phase":"commentary","content":[{"type":"input_text","text":"message"}]},{"type":"compaction","id":"compaction","encrypted_content":"encrypted"}]`},
+		{name: "multiple", output: `[{"type":"compaction","id":"first","encrypted_content":"encrypted","created_by":"codex"},{"type":"compaction","id":"second","encrypted_content":"encrypted","created_by":"codex"}]`},
+		{name: "nonfinal", output: `[{"type":"compaction","id":"compaction","encrypted_content":"encrypted","created_by":"codex"},{"type":"message","id":"message"}]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(writer, `{"id":"compact-invalid","created_at":1738888890,"object":"response.compaction","output":%s,"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`, test.output)
+			}))
+			defer upstream.Close()
+			policy := &apikey.Policy{
+				Name: "compact-invalid-" + test.name, Owner: "compact-invalid-" + test.name,
+				AllowedEndpoints: []string{responsesCompactEndpoint},
+				AllowedModels:    []string{"gpt-5.6-sol"},
+			}
+			servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+			defer shutdownResponsesTestServer(t, servers)
+			request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+responsesCompactEndpoint, strings.NewReader(`{"model":"gpt-5.6-sol","input":"invalid shape"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer "+rawKey)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusBadGateway || !bytes.Contains(body, []byte(`"upstream_contract_error"`)) {
+				t.Fatalf("invalid compact shape response = %d %s", response.StatusCode, body)
+			}
+		})
+	}
+}
+
+func TestResponsesCompactPublicAndLiteParameterBoundary(t *testing.T) {
+	var liteBody []byte
+	var compactCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		liteBody, _ = io.ReadAll(request.Body)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(writer, `{"id":"compact-boundary-%d","created_at":1738888890,"object":"response.compaction","output":[{"type":"compaction","id":"compact-item","encrypted_content":"encrypted"}],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`, compactCalls.Add(1))
+	}))
+	defer upstream.Close()
+	policy := &apikey.Policy{
+		Name: "compact-boundary", Owner: "compact-boundary",
+		AllowedEndpoints: []string{responsesCompactEndpoint},
+		AllowedModels:    []string{"gpt-5.6-sol"},
+	}
+	servers, rawKey := newResponsesTestServer(t, upstream.URL, policy)
+	defer shutdownResponsesTestServer(t, servers)
+	post := func(body string, lite bool) (int, []byte) {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodPost, "http://"+servers.DataAddr()+responsesCompactEndpoint, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+rawKey)
+		request.Header.Set("Content-Type", "application/json")
+		if lite {
+			request.Header.Set(codex.ResponsesLiteHeader, "true")
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodyBytes, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, bodyBytes
+	}
+	if status, body := post(`{"model":"gpt-5.6-sol","input":"fast","service_tier":"fast"}`, false); status != http.StatusOK {
+		t.Fatalf("public fast compact = %d %s", status, body)
+	}
+	if status, body := post(`{"model":"gpt-5.6-sol","input":"scale","service_tier":"scale"}`, false); status != http.StatusBadRequest {
+		t.Fatalf("public scale compact = %d %s", status, body)
+	}
+	for _, field := range []string{
+		`"tools":[{"type":"function","name":"fixture"}]`,
+		`"parallel_tool_calls":true`,
+		`"reasoning":{"effort":"high"}`,
+		`"text":{"format":{"type":"text"}}`,
+	} {
+		body := `{"model":"gpt-5.6-sol","input":"private","` + strings.Trim(field, `"`) + `}`
+		if status, responseBody := post(body, false); status != http.StatusBadRequest || !bytes.Contains(responseBody, []byte(`"unsupported_parameter"`)) {
+			t.Fatalf("public private-only field %s = %d %s", field, status, responseBody)
+		}
+	}
+	privateBody := `{"model":"gpt-5.6-sol","input":"private","tools":[{"type":"function","name":"fixture"}],"parallel_tool_calls":true,"reasoning":{"effort":"high"},"text":{"format":{"type":"text"}}}`
+	if status, body := post(privateBody, true); status != http.StatusOK {
+		t.Fatalf("private Lite compact = %d %s", status, body)
+	}
+	for _, field := range []string{`"tools"`, `"parallel_tool_calls"`, `"reasoning"`, `"text"`} {
+		if !bytes.Contains(liteBody, []byte(field)) {
+			t.Fatalf("private Lite request omitted %s: %s", field, liteBody)
 		}
 	}
 }

@@ -264,6 +264,26 @@ func TestResponsesCompatibilityMatrix(t *testing.T) {
 	}
 }
 
+func TestCompactRequestRejectsUnsupportedParameters(t *testing.T) {
+	for _, field := range []string{"prompt_cache_options", "stream", "metadata"} {
+		t.Run(field, func(t *testing.T) {
+			var request CompactRequest
+			err := json.Unmarshal([]byte(`{"model":"gpt-5.6-sol","input":"fixture","`+field+`":{}}`), &request)
+			if !errors.Is(err, ErrUnsupportedParameter) {
+				t.Fatalf("decode compact request error = %v, want unsupported_parameter", err)
+			}
+		})
+	}
+	var request CompactRequest
+	if err := json.Unmarshal([]byte(`{"model":"gpt-5.6-sol","input":"fixture","previous_response_id":"resp_1","service_tier":"flex"}`), &request); err != nil {
+		t.Fatalf("decode supported compact request: %v", err)
+	}
+	if request.Input == nil || request.Input.String == nil || *request.Input.String != "fixture" ||
+		request.PreviousResponseID != "resp_1" || request.ServiceTier != "flex" {
+		t.Fatalf("compact request = %#v", request)
+	}
+}
+
 func TestToolChoiceStrictDecoding(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -947,5 +967,12 @@ func TestPublicFixturesContainNoCredentialPatterns(t *testing.T) {
 				t.Fatalf("fixture %s matches forbidden pattern %q", name, match)
 			}
 		}
+	}
+}
+
+func TestContentPartDecoderRejectsUnknownFields(t *testing.T) {
+	var part ContentPart
+	if err := json.Unmarshal([]byte(`{"type":"input_file","file_id":"file-123","unexpected":"value"}`), &part); err == nil {
+		t.Fatal("unknown public output content field accepted")
 	}
 }

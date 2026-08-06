@@ -32,7 +32,7 @@ func TestProfileBrokerUnavailableTransportDoesNotBind(t *testing.T) {
 		t.Fatal(err)
 	}
 	var bound codex.Account
-	result, err := broker.Compact(context.Background(), codex.SelectionRequest{}, codex.CodexCompactRequest{}, func(account codex.Account) error {
+	result, err := broker.Compact(context.Background(), codex.SelectionRequest{}, codex.CodexCompactRequest{}, "", func(account codex.Account) error {
 		bound = account
 		return nil
 	})

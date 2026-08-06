@@ -70,6 +70,11 @@ func newDataApplication(readiness *Readiness, db *gorm.DB, hmacKey []byte, broke
 	} else {
 		app.Any(responsesEndpoint, unavailable)
 	}
+	if authorizer != nil && broker != nil && quota != nil {
+		app.Any(responsesCompactEndpoint, newResponsesCompactHandler(authorizer, broker, journal, quota))
+	} else {
+		app.Any(responsesCompactEndpoint, unavailable)
+	}
 	if authorizer != nil && quota != nil {
 		app.Any(imagesGenerationsEndpoint, newImagesGenerationHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
 		app.Any(imagesEditsEndpoint, newImagesEditHandler(authorizer, broker, journal, quota, artifacts, artifactRequired))
